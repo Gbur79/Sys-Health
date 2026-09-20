@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# EOS Cleaner & System Health v2.4
+# EOS Cleaner & System Health v2.5
 # Safe maintenance + detailed diagnostics + AI Agent-friendly report
 # EndeavourOS / Arch Linux
 # ==============================================================================
 
 set -o pipefail
 
-VERSION="2.4"
+VERSION="2.5"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eos-cleaner"
 LOG_FILE="$STATE_DIR/eos-cleaner.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -930,8 +930,8 @@ check_mirrorlist_age() {
     fi
 
     local max_days=0
-    [[ "$arch_days" =~ ^[0-9]+$]] && (( arch_days > max_days )) && max_days=$arch_days
-    [[ "$eos_days" =~ ^[0-9]+$]] && (( eos_days > max_days )) && max_days=$eos_days
+    [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
+    [[ "$eos_days" =~ ^[0-9]+$ ]] && (( eos_days > max_days )) && max_days=$eos_days
 
     if (( max_days > 90 )); then
         add_row "Mirrorlist age" "WARN ⚠ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
@@ -1048,7 +1048,7 @@ generate_summary_json() {
                 timestamp: $ts,
                 run_id: $run_id,
                 status: $status,
-                counts: {errors: $errors, warnings:$warnings},
+                counts: {errors: $errors, warnings: $warnings},
                 flagged: $flagged,
                 kernel: $kernel,
                 gpu: {drivers_in_use: $drivers}
