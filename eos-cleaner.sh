@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# EOS Cleaner & System Health v2.2
+# EOS Cleaner & System Health v2.3
 # Safe maintenance + detailed diagnostics + AI Agent-friendly report
 # EndeavourOS / Arch Linux
 # ==============================================================================
 
 set -o pipefail
 
-VERSION="2.2"
+VERSION="2.3"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eos-cleaner"
 LOG_FILE="$STATE_DIR/eos-cleaner.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
 STATE_SNAPSHOT="$STATE_DIR/eos-software-state.txt"
 RAW_DIR="$STATE_DIR/runs"
-
-# Optional: Gateway/Router IP for DNS checks (auto-detected if blank)
-GATEWAY_IP="${GATEWAY_IP:-}"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 
@@ -161,12 +158,10 @@ INFO_COUNT=0
 FAILED_SERVICES=""
 FAILED_USER_SERVICES=""
 PACNEWS=""
-ORPHAN_NOTE="Orphan package detection handled dynamically."
 UPDATES_TEXT=""
 ARCH_AUDIT_TEXT=""
 PACMAN_INTEGRITY_TEXT=""
 DKMS_TEXT=""
-NVIDIA_SMI_TEXT=""
 SENSORS_TEXT=""
 
 add_row() {
@@ -179,13 +174,13 @@ add_row() {
             "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending")
                 sec="BOOT"
                 ;;
-            "NVIDIA"*|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer")
+            "GPU runtime"*|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer")
                 sec="HW"
                 ;;
             "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*)
                 sec="SYS"
                 ;;
-            "Gateway DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
+            "System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
                 sec="NET"
                 ;;
             *)
@@ -301,21 +296,29 @@ refresh_state_snapshot() {
             echo '--- 2. Installed Linux Kernels & Headers ---'
             pacman -Q 2>/dev/null | grep -E '^linux'
             echo ''
-            echo '--- 3. NVIDIA Packages & Drivers ---'
-            pacman -Q 2>/dev/null | grep -iE 'nvidia|libva-nvidia|vulkan-nouveau'
+            echo '--- 3. GPU Packages (AMD/Intel/NVIDIA) ---'
+            pacman -Q 2>/dev/null | grep -iE 'nvidia|amdgpu|radeon|vulkan|mesa|xf86-video'
             echo ''
             echo '--- 4. DKMS Status ---'
             dkms status 2>/dev/null || echo '(dkms not available)'
             echo ''
             echo '--- 5. Loaded GPU Kernel Modules ---'
-            lsmod 2>/dev/null | grep -E '^nvidia|^nouveau|^drm'
+            lsmod 2>/dev/null | grep -E '^nvidia|^nouveau|^amdgpu|^radeon|^i915|^xe|^drm'
             echo ''
             echo '--- 6. GPU Hardware & Kernel Driver in Use ---'
             lspci -k 2>/dev/null | grep -A3 -iE 'VGA|3D|Display'
             echo ''
-            echo '--- 7. Dracut Configuration Files ---'
-            ls -la /etc/dracut.conf.d/ 2>/dev/null
-            cat /etc/dracut.conf.d/*.conf 2>/dev/null
+            echo '--- 7. Initramfs Configuration Files (Dracut / Mkinitcpio) ---'
+            if [[ -d /etc/dracut.conf.d ]]; then
+                echo 'Dracut configs:'
+                ls -la /etc/dracut.conf.d/ 2>/dev/null
+                cat /etc/dracut.conf.d/*.conf 2>/dev/null
+            fi
+            if [[ -f /etc/mkinitcpio.conf ]]; then
+                echo 'Mkinitcpio config:'
+                cat /etc/mkinitcpio.conf 2>/dev/null | grep -v '^#' | sed '/^$/d'
+                ls -la /etc/mkinitcpio.d/ 2>/dev/null
+            fi
             echo ''
             echo '--- 8. Boot & Filesystem Mounts ---'
             findmnt --real -o TARGET,SOURCE,FSTYPE,OPTIONS -t vfat 2>/dev/null
@@ -480,435 +483,34 @@ check_initramfs() {
     fi
 }
 
-check_root_space() {
-    local usage
-    usage="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')"
-
-    if [[ -z "$usage" ]]; then
-        add_row "Root disk space" "WARN ⚠ (unable to read)"
-        ((WARNINGS++))
-        log "HEALTH root_space=WARN unreadable"
-    elif (( usage >= 90 )); then
-        add_row "Root disk space" "FAIL ✖ (${usage}%)"
-        ((ERRORS++))
-        log "HEALTH root_space=FAIL usage=${usage}%"
-    elif (( usage >= 80 )); then
-        add_row "Root disk space" "WARN ⚠ (${usage}%)"
-        ((WARNINGS++))
-        log "HEALTH root_space=WARN usage=${usage}%"
-    else
-        add_row "Root disk space" "PASS ✔ (${usage}%)"
-        log "HEALTH root_space=PASS usage=${usage}%"
-    fi
-}
-
-check_nvidia() {
-    if ! command -v nvidia-smi &>/dev/null; then
-        info "NVIDIA runtime not detected or nvidia-smi unavailable."
-        log "HEALTH nvidia=not_applicable"
-        return
-    fi
-
-    local nvidia_out gpu driver gpu_temp
-    nvidia_out="$(nvidia-smi 2>&1 || true)"
-
-    if printf '%s\n' "$nvidia_out" | grep -q 'NVIDIA-SMI'; then
-        gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
-        driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
-        gpu_temp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1)"
-
-        if [[ -n "$gpu_temp" ]]; then
-            add_row "NVIDIA runtime" "PASS ✔ (${gpu:-GPU} | ${gpu_temp}°C)"
-            printf '%s\n' "$nvidia_out" > "$RUN_RAW/nvidia-smi.txt"
-        else
-            add_row "NVIDIA runtime" "PASS ✔ (${gpu:-GPU} / ${driver:-driver unknown})"
-        fi
-    else
-        add_row "NVIDIA runtime" "FAIL ✖"
-        ((ERRORS++))
-        log "HEALTH nvidia=FAIL"
-        {
-            echo "### ERROR: NVIDIA GPU FAILURE"
-            printf '%s\n' "$nvidia_out"
-        } >> "$LOG_FILE"
-    fi
-
-    if lsmod | grep -q '^nouveau'; then
-        add_row "NVIDIA nouveau module" "WARN ⚠ (loaded)"
-        ((WARNINGS++))
-        log "HEALTH nouveau=WARN loaded"
-    else
-        log "HEALTH nouveau=not_loaded"
-    fi
-}
-
-check_gateway_dns() {
-    local target="$GATEWAY_IP"
-
-    if [[ -z "$target" ]]; then
-        target="$(ip route show default 2>/dev/null |
-            awk '/default/ {for (i=1;i<=NF;i++) if ($i=="via") print $(i+1)}' |
-            head -n1)"
-    fi
-    target="${target:-1.1.1.1}"
-
-    if ! command -v dig &>/dev/null; then
-        add_row "Gateway DNS" "INFO ℹ (dig not installed)"
-        ((INFO_COUNT++))
-        log "HEALTH dns_gateway=dig_missing"
-        return
-    fi
-
-    local dig_out qtime_num
-    dig_out="$(dig "@$target" archlinux.org +time=2 +tries=1 2>&1)"
-    printf '%s\n' "$dig_out" > "$RUN_RAW/dig-gateway.txt"
-
-    if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
-        add_row "Gateway DNS" "WARN ⚠ ($target unreachable or query failed)"
-        ((WARNINGS++))
-        log "HEALTH dns_gateway=WARN target=$target"
-        return
-    fi
-
-    qtime_num="$(printf '%s\n' "$dig_out" | grep -oE 'Query time: [0-9]+' | grep -oE '[0-9]+')"
-    qtime_num="${qtime_num:-?}"
-
-    add_row "Gateway DNS" "PASS ✔ (${qtime_num}ms via $target)"
-    log "HEALTH dns_gateway=PASS target=$target qtime=${qtime_num}ms"
-}
-
 check_efi_mount() {
+    if [[ ! -d /sys/firmware/efi ]]; then
+        add_row "EFI partition (ESP)" "INFO ℹ (BIOS / Legacy system)"
+        log "HEALTH efi=INFO bios_legacy"
+        return
+    fi
+
     local efi_mnt
-    efi_mnt="$(findmnt --real -n -o TARGET,FSTYPE /boot/efi 2>/dev/null || true)"
+    efi_mnt="$(findmnt -n -o TARGET -t vfat 2>/dev/null | grep -iE '^/(boot|boot/efi|efi)$' | head -n1 || true)"
 
     if [[ -z "$efi_mnt" ]]; then
-        add_row "EFI partition (/boot/efi)" "FAIL ✖ (not mounted)"
+        add_row "EFI partition (ESP)" "FAIL ✖ (no vfat mounted at /boot, /efi, or /boot/efi)"
         ((ERRORS++))
         log "HEALTH efi=FAIL mounted=NO"
         return
     fi
 
-    if ! printf '%s\n' "$efi_mnt" | grep -qi 'vfat'; then
-        add_row "EFI partition (/boot/efi)" "WARN ⚠ (unexpected filesystem: $efi_mnt)"
-        ((WARNINGS++))
-        log "HEALTH efi=WARN fstype_not_vfat fstype=$efi_mnt"
-        return
-    fi
-
     local avail_mb
-    avail_mb="$(df -BM /boot/efi 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4}')"
+    avail_mb="$(df -BM "$efi_mnt" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4}')"
 
     if [[ -n "$avail_mb" ]] && (( avail_mb < 30 )); then
-        add_row "EFI partition (/boot/efi)" "WARN ⚠ (low free space: ${avail_mb}MB)"
+        add_row "EFI partition ($efi_mnt)" "WARN ⚠ (low free space: ${avail_mb}MB)"
         ((WARNINGS++))
         log "HEALTH efi=WARN low_space=${avail_mb}MB"
     else
-        add_row "EFI partition (/boot/efi)" "PASS ✔ (mounted vfat, free: ${avail_mb:-?}MB)"
+        add_row "EFI partition ($efi_mnt)" "PASS ✔ (mounted vfat, free: ${avail_mb:-?}MB)"
         log "HEALTH efi=PASS free_mb=${avail_mb:-unknown}"
     fi
-}
-
-check_fstrim() {
-    if ! command -v systemctl &>/dev/null; then
-        return
-    fi
-
-    local status
-    status="$(systemctl is-active fstrim.timer 2>/dev/null || true)"
-
-    if [[ "$status" == "active" ]]; then
-        add_row "SSD/NVMe TRIM timer" "PASS ✔ (active)"
-        log "HEALTH fstrim=PASS active=YES"
-    else
-        add_row "SSD/NVMe TRIM timer" "WARN ⚠ (inactive)"
-        ((WARNINGS++))
-        log "HEALTH fstrim=WARN active=NO"
-    fi
-}
-
-check_arch_news() {
-    if ! command -v curl &>/dev/null; then
-        return
-    fi
-
-    local rss_data item_title item_date
-    rss_data="$(curl -fsS --max-time 3 https://archlinux.org/feeds/news/ 2>/dev/null || true)"
-
-    if [[ -z "$rss_data" ]]; then
-        log "HEALTH arch_news=UNAVAILABLE (network/timeout)"
-        return
-    fi
-
-    item_title="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<title>).*?(?=</title>)' | sed '1d' | head -n1 || true)"
-    item_date="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<pubDate>).*?(?=</pubDate>)' | head -n1 || true)"
-
-    if [[ -n "$item_title" ]]; then
-        item_title="$(sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g; s/&quot;/"/g' <<< "$item_title")"
-        printf 'Title: %s\nDate: %s\n' "$item_title" "$item_date" > "$RUN_RAW/latest-arch-news.txt"
-        if printf '%s' "$item_title" | grep -qi 'manual intervention'; then
-            local pkg
-            pkg="$(printf '%s' "$item_title" | awk '{print $1}')"
-            if pacman -Q "$pkg" &>/dev/null; then
-                add_row "Arch News (Latest)" "WARN ⚠ (manual intervention: $pkg)"
-                ((WARNINGS++))
-                log "HEALTH arch_news=WARN manual_intervention=YES affected=YES package=$pkg title=\"$item_title\""
-            else
-                add_row "Arch News (Latest)" "PASS ✔ (not affected: $pkg)"
-                log "HEALTH arch_news=PASS manual_intervention=YES affected=NO package=$pkg title=\"$item_title\""
-            fi
-        else
-            local short_title="$item_title"
-            if (( ${#short_title} > 30 )); then
-                short_title="${short_title:0:29}…"
-            fi
-            add_row "Arch News (Latest)" "PASS ✔ ($short_title)"
-            log "HEALTH arch_news=PASS title=\"$item_title\""
-        fi
-    fi
-}
-
-check_pacman_lock() {
-    if [[ ! -e /var/lib/pacman/db.lck ]]; then
-        add_row "Pacman DB lock" "PASS ✔"
-        log "HEALTH pacman_lock=PASS absent"
-        return
-    fi
-
-    if fuser /var/lib/pacman/db.lck &>/dev/null; then
-        add_row "Pacman DB lock" "INFO ℹ (pacman is using it)"
-        ((INFO_COUNT++))
-        log "HEALTH pacman_lock=ACTIVE"
-    else
-        add_row "Pacman DB lock" "WARN ⚠ (stale lock)"
-        ((WARNINGS++))
-        log "HEALTH pacman_lock=WARN stale"
-    fi
-}
-
-check_dkms() {
-    if ! command -v dkms &>/dev/null; then
-        add_row "DKMS" "INFO ℹ (not installed)"
-        ((INFO_COUNT++))
-        log "HEALTH dkms=not_installed"
-        return
-    fi
-
-    DKMS_TEXT="$(dkms status 2>&1 || true)"
-    printf '%s\n' "$DKMS_TEXT" > "$RUN_RAW/dkms-status.txt"
-
-    if printf '%s\n' "$DKMS_TEXT" | grep -qiE 'broken|error'; then
-        add_row "DKMS modules" "WARN ⚠ (review required)"
-        ((WARNINGS++))
-        log "HEALTH dkms=WARN status=broken_or_error"
-    else
-        add_row "DKMS modules" "PASS ✔"
-        log "HEALTH dkms=PASS"
-    fi
-}
-
-check_failed_services() {
-    FAILED_SERVICES="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
-
-    if [[ -z "$FAILED_SERVICES" ]]; then
-        add_row "Systemd failed (system)" "PASS ✔"
-        log "HEALTH systemd_failed=0"
-    else
-        local count first_svc
-        count="$(printf '%s\n' "$FAILED_SERVICES" | wc -l)"
-        first_svc="$(head -n1 <<< "$FAILED_SERVICES")"
-        add_row "Systemd failed (system)" "WARN ⚠ ($count failed)"
-        ((WARNINGS++))
-        log "HEALTH systemd_failed=WARN count=$count"
-        {
-            echo "### FAILED SYSTEMD UNITS (SYSTEM)"
-            systemctl --failed --no-legend --plain 2>&1
-        } >> "$LOG_FILE"
-    fi
-
-    FAILED_USER_SERVICES="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
-
-    if [[ -z "$FAILED_USER_SERVICES" ]]; then
-        add_row "Systemd failed (user)" "PASS ✔"
-        log "HEALTH systemd_user_failed=0"
-    else
-        local count
-        count="$(printf '%s\n' "$FAILED_USER_SERVICES" | wc -l)"
-        add_row "Systemd failed (user)" "WARN ⚠ ($count failed)"
-        ((WARNINGS++))
-        log "HEALTH systemd_user_failed=WARN count=$count"
-        {
-            echo "### FAILED SYSTEMD UNITS (USER)"
-            systemctl --user --failed --no-legend --plain 2>&1
-        } >> "$LOG_FILE"
-    fi
-}
-
-check_pacnew() {
-    PACNEWS="$(find /etc -type f -name '*.pacnew' 2>/dev/null || true)"
-
-    if [[ -z "$PACNEWS" ]]; then
-        add_row ".pacnew configuration files" "PASS ✔"
-        log "HEALTH pacnew=0"
-    else
-        local count
-        count="$(printf '%s\n' "$PACNEWS" | wc -l)"
-        add_row ".pacnew configuration files" "WARN ⚠ ($count)"
-        ((WARNINGS++))
-        log "HEALTH pacnew=WARN count=$count"
-        {
-            echo "### PACNEW FILES"
-            printf '%s\n' "$PACNEWS"
-        } >> "$LOG_FILE"
-    fi
-}
-
-check_package_integrity() {
-    PACMAN_INTEGRITY_TEXT="$(sudo pacman -Qk 2>&1 || true)"
-    printf '%s\n' "$PACMAN_INTEGRITY_TEXT" > "$RUN_RAW/pacman-integrity.txt"
-
-    local problems
-    problems="$(printf '%s\n' "$PACMAN_INTEGRITY_TEXT" |
-        grep -v 'Permission denied' |
-        grep -E 'warning:|missing files|No such file|not found' |
-        grep -vE '0 missing files' || true)"
-
-    if [[ -z "$problems" ]]; then
-        add_row "Package file integrity" "PASS ✔"
-        log "HEALTH package_integrity=PASS"
-    else
-        add_row "Package file integrity" "WARN ⚠ (review log)"
-        ((WARNINGS++))
-        log "HEALTH package_integrity=WARN"
-        {
-            echo "### PACMAN PACKAGE INTEGRITY"
-            printf '%s\n' "$problems"
-        } >> "$LOG_FILE"
-    fi
-}
-
-check_temperature() {
-    if ! command -v sensors &>/dev/null; then
-        add_row "CPU temperature" "INFO ℹ (lm_sensors unavailable)"
-        ((INFO_COUNT++))
-        log "HEALTH cpu_temperature=unavailable"
-        return
-    fi
-
-    local sensors_out
-    sensors_out="$(sensors 2>&1 || true)"
-    printf '%s\n' "$sensors_out" > "$RUN_RAW/sensors.txt"
-
-    local cpu_temp
-    cpu_temp="$(printf '%s\n' "$sensors_out" |
-        grep -iE 'Package id 0|Tctl|Core 0|temp1' |
-        grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' |
-        head -n1)"
-
-    if [[ -n "$cpu_temp" ]]; then
-        add_row "CPU temperature" "PASS ✔ ($cpu_temp)"
-        log "HEALTH cpu_temperature=PASS value=$cpu_temp"
-    else
-        add_row "CPU temperature" "INFO ℹ (not detected)"
-        ((INFO_COUNT++))
-        log "HEALTH cpu_temperature=not_detected"
-    fi
-}
-
-check_updates() {
-    local update_file="$RUN_RAW/checkupdates.txt"
-
-    spinner "Checking for available updates..." \
-        bash -c 'checkupdates > "$1" 2>/dev/null || true' _ "$update_file"
-
-    UPDATES_TEXT="$(cat "$update_file" 2>/dev/null || true)"
-
-    {
-        echo "### AVAILABLE UPDATES"
-        if [[ -n "$UPDATES_TEXT" ]]; then
-            printf '%s\n' "$UPDATES_TEXT"
-        else
-            echo "No updates reported by checkupdates."
-        fi
-    } >> "$LOG_FILE"
-
-    local count
-    count="$(printf '%s\n' "$UPDATES_TEXT" | sed '/^$/d' | wc -l)"
-
-    if (( count == 0 )); then
-        add_row "Available updates" "PASS ✔ (none)"
-        log "HEALTH updates=0"
-    else
-        local sensitive
-        sensitive="$(printf '%s\n' "$UPDATES_TEXT" |
-            grep -iE '(^|[[:space:]])(linux|linux-headers|nvidia|nvidia-utils|lib32-nvidia|dkms|systemd|glibc|dracut|mesa|xorg)([[:space:]]|$)' || true)"
-
-        if [[ -n "$sensitive" ]]; then
-            add_row "Available updates" "WARN ⚠ ($count; core components included)"
-            ((WARNINGS++))
-            log "HEALTH updates=WARN count=$count sensitive_core_updates=YES"
-        else
-            add_row "Available updates" "INFO ℹ ($count)"
-            ((INFO_COUNT++))
-            log "HEALTH updates=$count sensitive_core_updates=NO"
-        fi
-    fi
-}
-
-check_arch_audit() {
-    if ! command -v arch-audit &>/dev/null; then
-        add_row "Arch security audit" "INFO ℹ (arch-audit unavailable)"
-        ((INFO_COUNT++))
-        log "HEALTH arch_audit=not_installed"
-        return
-    fi
-
-    ARCH_AUDIT_TEXT="$(arch-audit 2>&1 || true)"
-    printf '%s\n' "$ARCH_AUDIT_TEXT" > "$RUN_RAW/arch-audit.txt"
-
-    local high
-    high="$(printf '%s\n' "$ARCH_AUDIT_TEXT" | grep -ic 'High risk' || true)"
-
-    if (( high > 0 )); then
-        add_row "Arch security audit" "WARN ⚠ ($high high-risk entries)"
-        ((WARNINGS++))
-        log "HEALTH arch_audit=WARN high_risk=$high"
-    else
-        add_row "Arch security audit" "PASS ✔"
-        log "HEALTH arch_audit=PASS"
-    fi
-}
-
-check_mirrorlist_age() {
-    local arch_file="/etc/pacman.d/mirrorlist"
-    local eos_file="/etc/pacman.d/endeavouros-mirrorlist"
-    local now arch_days="?" eos_days="?"
-    now=$(date +%s)
-
-    if [[ -f "$arch_file" ]]; then
-        local arch_mtime
-        arch_mtime="$(stat -c %Y "$arch_file" 2>/dev/null || echo 0)"
-        if (( arch_mtime > 0 )); then
-            arch_days=$(( (now - arch_mtime) / 86400 ))
-        fi
-    fi
-
-    if [[ -f "$eos_file" ]]; then
-        local eos_mtime
-        eos_mtime="$(stat -c %Y "$eos_file" 2>/dev/null || echo 0)"
-        if (( eos_mtime > 0 )); then
-            eos_days=$(( (now - eos_mtime) / 86400 ))
-        fi
-    fi
-
-    if [[ "$arch_days" == "?" && "$eos_days" == "?" ]]; then
-        add_row "Mirrorlist age" "WARN ⚠ (mirrorlists missing)"
-        ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN missing_both"
-        return
-    fi
-
-    add_row "Mirrorlist age" "PASS ✔ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
-    log "HEALTH mirrorlist_age=PASS arch_days=$arch_days eos_days=$eos_days"
 }
 
 check_reboot_pending() {
@@ -943,6 +545,99 @@ check_reboot_pending() {
     else
         add_row "Reboot pending" "PASS ✔ (running kernel is current)"
         log "HEALTH reboot_pending=NO"
+    fi
+}
+
+check_gpu() {
+    local vga_info drivers="" driver_list="" gpu_name="GPU"
+    vga_info="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D|Display' || true)"
+
+    if [[ -z "$vga_info" ]]; then
+        add_row "GPU runtime" "INFO ℹ (No GPU detected)"
+        log "HEALTH gpu=not_detected"
+        return
+    fi
+
+    drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u || true)"
+    driver_list="$(echo $drivers | tr '\n' ' ')"
+
+    if [[ "$driver_list" == *"nvidia"* ]]; then
+        if command -v nvidia-smi &>/dev/null; then
+            local gpu_temp
+            gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+            gpu_temp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1)"
+            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_name:-GPU} | ${gpu_temp}°C)"
+            log "HEALTH gpu=NVIDIA driver=nvidia"
+        else
+            add_row "GPU runtime (NVIDIA)" "WARN ⚠ (nvidia-smi missing)"
+            ((WARNINGS++))
+            log "HEALTH gpu=NVIDIA driver=nvidia-smi_missing"
+        fi
+    elif [[ -n "$drivers" ]]; then
+        add_row "GPU runtime" "PASS ✔ (Drivers: $driver_list)"
+        log "HEALTH gpu=PASS drivers=$driver_list"
+    else
+        add_row "GPU runtime" "WARN ⚠ (No kernel driver in use)"
+        ((WARNINGS++))
+        log "HEALTH gpu=WARN no_kernel_driver"
+    fi
+}
+
+check_dkms() {
+    if ! command -v dkms &>/dev/null; then
+        add_row "DKMS" "INFO ℹ (not installed)"
+        ((INFO_COUNT++))
+        log "HEALTH dkms=not_installed"
+        return
+    fi
+
+    DKMS_TEXT="$(dkms status 2>&1 || true)"
+    printf '%s\n' "$DKMS_TEXT" > "$RUN_RAW/dkms-status.txt"
+
+    if printf '%s\n' "$DKMS_TEXT" | grep -qiE 'broken|error'; then
+        add_row "DKMS modules" "WARN ⚠ (review required)"
+        ((WARNINGS++))
+        log "HEALTH dkms=WARN status=broken_or_error"
+    else
+        add_row "DKMS modules" "PASS ✔"
+        log "HEALTH dkms=PASS"
+    fi
+}
+
+check_temperature() {
+    if ! command -v sensors &>/dev/null; then
+        add_row "CPU temperature" "INFO ℹ (lm_sensors unavailable)"
+        ((INFO_COUNT++))
+        log "HEALTH cpu_temperature=unavailable"
+        return
+    fi
+
+    local sensors_out
+    sensors_out="$(sensors 2>&1 || true)"
+    printf '%s\n' "$sensors_out" > "$RUN_RAW/sensors.txt"
+
+    local cpu_temp
+    cpu_temp="$(printf '%s\n' "$sensors_out" |
+        grep -iE 'Package id 0|Tctl|Core 0|temp1' |
+        grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' |
+        head -n1)"
+
+    if [[ -n "$cpu_temp" ]]; then
+        local temp_int="${cpu_temp%%.*}"
+        temp_int="${temp_int//[^0-9]/}"
+
+        if [[ -n "$temp_int" ]] && (( temp_int > 85 )); then
+            add_row "CPU temperature" "WARN ⚠ ($cpu_temp)"
+            ((WARNINGS++))
+            log "HEALTH cpu_temperature=WARN value=$cpu_temp"
+        else
+            add_row "CPU temperature" "PASS ✔ ($cpu_temp)"
+            log "HEALTH cpu_temperature=PASS value=$cpu_temp"
+        fi
+    else
+        add_row "CPU temperature" "INFO ℹ (not detected)"
+        ((INFO_COUNT++))
+        log "HEALTH cpu_temperature=not_detected"
     fi
 }
 
@@ -987,11 +682,337 @@ check_smart() {
     fi
 }
 
+check_fstrim() {
+    if ! command -v systemctl &>/dev/null; then
+        return
+    fi
+
+    local status
+    status="$(systemctl is-active fstrim.timer 2>/dev/null || true)"
+
+    if [[ "$status" == "active" ]]; then
+        add_row "SSD/NVMe TRIM timer" "PASS ✔ (active)"
+        log "HEALTH fstrim=PASS active=YES"
+    else
+        add_row "SSD/NVMe TRIM timer" "WARN ⚠ (inactive)"
+        ((WARNINGS++))
+        log "HEALTH fstrim=WARN active=NO"
+    fi
+}
+
+check_root_space() {
+    local usage
+    usage="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')"
+
+    if [[ -z "$usage" ]]; then
+        add_row "Root disk space" "WARN ⚠ (unable to read)"
+        ((WARNINGS++))
+        log "HEALTH root_space=WARN unreadable"
+    elif (( usage >= 90 )); then
+        add_row "Root disk space" "FAIL ✖ (${usage}%)"
+        ((ERRORS++))
+        log "HEALTH root_space=FAIL usage=${usage}%"
+    elif (( usage >= 80 )); then
+        add_row "Root disk space" "WARN ⚠ (${usage}%)"
+        ((WARNINGS++))
+        log "HEALTH root_space=WARN usage=${usage}%"
+    else
+        add_row "Root disk space" "PASS ✔ (${usage}%)"
+        log "HEALTH root_space=PASS usage=${usage}%"
+    fi
+}
+
+check_failed_services() {
+    FAILED_SERVICES="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
+
+    if [[ -z "$FAILED_SERVICES" ]]; then
+        add_row "Systemd failed (system)" "PASS ✔"
+        log "HEALTH systemd_failed=0"
+    else
+        local count first_svc
+        count="$(printf '%s\n' "$FAILED_SERVICES" | wc -l)"
+        first_svc="$(head -n1 <<< "$FAILED_SERVICES")"
+        add_row "Systemd failed (system)" "WARN ⚠ ($count failed)"
+        ((WARNINGS++))
+        log "HEALTH systemd_failed=WARN count=$count"
+        {
+            echo "### FAILED SYSTEMD UNITS (SYSTEM)"
+            systemctl --failed --no-legend --plain 2>&1
+        } >> "$LOG_FILE"
+    fi
+
+    FAILED_USER_SERVICES="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
+
+    if [[ -z "$FAILED_USER_SERVICES" ]]; then
+        add_row "Systemd failed (user)" "PASS ✔"
+        log "HEALTH systemd_user_failed=0"
+    else
+        local count
+        count="$(printf '%s\n' "$FAILED_USER_SERVICES" | wc -l)"
+        add_row "Systemd failed (user)" "WARN ⚠ ($count failed)"
+        ((WARNINGS++))
+        log "HEALTH systemd_user_failed=WARN count=$count"
+        {
+            echo "### FAILED SYSTEMD UNITS (USER)"
+            systemctl --user --failed --no-legend --plain 2>&1
+        } >> "$LOG_FILE"
+    fi
+}
+
+check_pacman_lock() {
+    if [[ ! -e /var/lib/pacman/db.lck ]]; then
+        add_row "Pacman DB lock" "PASS ✔"
+        log "HEALTH pacman_lock=PASS absent"
+        return
+    fi
+
+    if fuser /var/lib/pacman/db.lck &>/dev/null; then
+        add_row "Pacman DB lock" "INFO ℹ (pacman is using it)"
+        ((INFO_COUNT++))
+        log "HEALTH pacman_lock=ACTIVE"
+    else
+        add_row "Pacman DB lock" "WARN ⚠ (stale lock)"
+        ((WARNINGS++))
+        log "HEALTH pacman_lock=WARN stale"
+    fi
+}
+
+check_package_integrity() {
+    PACMAN_INTEGRITY_TEXT="$(sudo pacman -Qk 2>&1 || true)"
+    printf '%s\n' "$PACMAN_INTEGRITY_TEXT" > "$RUN_RAW/pacman-integrity.txt"
+
+    local problems
+    problems="$(printf '%s\n' "$PACMAN_INTEGRITY_TEXT" |
+        grep -v 'Permission denied' |
+        grep -E 'warning:|missing files|No such file|not found' |
+        grep -vE '0 missing files' || true)"
+
+    if [[ -z "$problems" ]]; then
+        add_row "Package file integrity" "PASS ✔"
+        log "HEALTH package_integrity=PASS"
+    else
+        add_row "Package file integrity" "WARN ⚠ (review log)"
+        ((WARNINGS++))
+        log "HEALTH package_integrity=WARN"
+        {
+            echo "### PACMAN PACKAGE INTEGRITY"
+            printf '%s\n' "$problems"
+        } >> "$LOG_FILE"
+    fi
+}
+
+check_pacnew() {
+    PACNEWS="$(find /etc -type f -name '*.pacnew' 2>/dev/null || true)"
+
+    if [[ -z "$PACNEWS" ]]; then
+        add_row ".pacnew configuration files" "PASS ✔"
+        log "HEALTH pacnew=0"
+    else
+        local count
+        count="$(printf '%s\n' "$PACNEWS" | wc -l)"
+        add_row ".pacnew configuration files" "WARN ⚠ ($count)"
+        ((WARNINGS++))
+        log "HEALTH pacnew=WARN count=$count"
+        {
+            echo "### PACNEW FILES"
+            printf '%s\n' "$PACNEWS"
+        } >> "$LOG_FILE"
+    fi
+}
+
+check_dns() {
+    if ! command -v dig &>/dev/null; then
+        add_row "System DNS" "INFO ℹ (dig not installed)"
+        ((INFO_COUNT++))
+        log "HEALTH dns=dig_missing"
+        return
+    fi
+
+    local dig_out qtime_num
+    dig_out="$(dig archlinux.org +time=2 +tries=1 2>&1)"
+    printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
+
+    if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
+        add_row "System DNS" "WARN ⚠ (query failed or NOERROR not received)"
+        ((WARNINGS++))
+        log "HEALTH dns=WARN resolution_failed"
+        return
+    fi
+
+    qtime_num="$(printf '%s\n' "$dig_out" | grep -oE 'Query time: [0-9]+' | grep -oE '[0-9]+')"
+    qtime_num="${qtime_num:-?}"
+
+    add_row "System DNS" "PASS ✔ (${qtime_num}ms)"
+    log "HEALTH dns=PASS qtime=${qtime_num}ms"
+}
+
+check_updates() {
+    if ! command -v checkupdates &>/dev/null; then
+        add_row "Available updates" "INFO ℹ (pacman-contrib not installed)"
+        ((INFO_COUNT++))
+        log "HEALTH updates=missing_pacman-contrib"
+        return
+    fi
+
+    local update_file="$RUN_RAW/checkupdates.txt"
+
+    spinner "Checking for available updates..." \
+        bash -c 'checkupdates > "$1" 2>/dev/null || true' _ "$update_file"
+
+    UPDATES_TEXT="$(cat "$update_file" 2>/dev/null || true)"
+
+    {
+        echo "### AVAILABLE UPDATES"
+        if [[ -n "$UPDATES_TEXT" ]]; then
+            printf '%s\n' "$UPDATES_TEXT"
+        else
+            echo "No updates reported by checkupdates."
+        fi
+    } >> "$LOG_FILE"
+
+    local count
+    count="$(printf '%s\n' "$UPDATES_TEXT" | sed '/^$/d' | wc -l)"
+
+    if (( count == 0 )); then
+        add_row "Available updates" "PASS ✔ (none)"
+        log "HEALTH updates=0"
+    else
+        local sensitive
+        sensitive="$(printf '%s\n' "$UPDATES_TEXT" |
+            grep -iE '(^|[[:space:]])(linux|linux-headers|nvidia|nvidia-utils|lib32-nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|xorg)([[:space:]]|$)' || true)"
+
+        if [[ -n "$sensitive" ]]; then
+            add_row "Available updates" "WARN ⚠ ($count; core components included)"
+            ((WARNINGS++))
+            log "HEALTH updates=WARN count=$count sensitive_core_updates=YES"
+        else
+            add_row "Available updates" "INFO ℹ ($count)"
+            ((INFO_COUNT++))
+            log "HEALTH updates=$count sensitive_core_updates=NO"
+        fi
+    fi
+}
+
+check_mirrorlist_age() {
+    local arch_file="/etc/pacman.d/mirrorlist"
+    local eos_file="/etc/pacman.d/endeavouros-mirrorlist"
+    local now arch_days="?" eos_days="?"
+    now=$(date +%s)
+
+    if [[ -f "$arch_file" ]]; then
+        local arch_mtime
+        arch_mtime="$(stat -c %Y "$arch_file" 2>/dev/null || echo 0)"
+        if (( arch_mtime > 0 )); then
+            arch_days=$(( (now - arch_mtime) / 86400 ))
+        fi
+    fi
+
+    if [[ -f "$eos_file" ]]; then
+        local eos_mtime
+        eos_mtime="$(stat -c %Y "$eos_file" 2>/dev/null || echo 0)"
+        if (( eos_mtime > 0 )); then
+            eos_days=$(( (now - eos_mtime) / 86400 ))
+        fi
+    fi
+
+    if [[ "$arch_days" == "?" && "$eos_days" == "?" ]]; then
+        add_row "Mirrorlist age" "WARN ⚠ (mirrorlists missing)"
+        ((WARNINGS++))
+        log "HEALTH mirrorlist_age=WARN missing_both"
+        return
+    fi
+
+    local max_days=0
+    [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
+    [[ "$eos_days" =~ ^[0-9]+$ ]] && (( eos_days > max_days )) && max_days=$eos_days
+
+    if (( max_days > 90 )); then
+        add_row "Mirrorlist age" "WARN ⚠ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        ((WARNINGS++))
+        log "HEALTH mirrorlist_age=WARN arch_days=$arch_days eos_days=$eos_days max_days=$max_days"
+    elif (( max_days > 45 )); then
+        add_row "Mirrorlist age" "INFO ℹ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        ((INFO_COUNT++))
+        log "HEALTH mirrorlist_age=INFO arch_days=$arch_days eos_days=$eos_days"
+    else
+        add_row "Mirrorlist age" "PASS ✔ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        log "HEALTH mirrorlist_age=PASS arch_days=$arch_days eos_days=$eos_days"
+    fi
+}
+
+check_arch_news() {
+    if ! command -v curl &>/dev/null; then
+        return
+    fi
+
+    local rss_data item_title item_date
+    rss_data="$(curl -fsS --max-time 3 https://archlinux.org/feeds/news/ 2>/dev/null || true)"
+
+    if [[ -z "$rss_data" ]]; then
+        log "HEALTH arch_news=UNAVAILABLE (network/timeout)"
+        return
+    fi
+
+    item_title="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<title>).*?(?=</title>)' | sed '1d' | head -n1 || true)"
+    item_date="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<pubDate>).*?(?=</pubDate>)' | head -n1 || true)"
+
+    if [[ -n "$item_title" ]]; then
+        item_title="$(sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g; s/&quot;/"/g' <<< "$item_title")"
+        if printf '%s' "$item_title" | grep -qi 'manual intervention'; then
+            local pkg
+            pkg="$(printf '%s' "$item_title" | awk '{print $1}')"
+            if pacman -Q "$pkg" &>/dev/null; then
+                add_row "Arch News (Latest)" "WARN ⚠ (manual intervention: $pkg)"
+                ((WARNINGS++))
+                log "HEALTH arch_news=WARN manual_intervention=YES affected=YES package=$pkg title=\"$item_title\""
+            else
+                add_row "Arch News (Latest)" "PASS ✔ (not affected: $pkg)"
+                log "HEALTH arch_news=PASS manual_intervention=YES affected=NO package=$pkg title=\"$item_title\""
+            fi
+        else
+            local short_title="$item_title"
+            if (( ${#short_title} > 30 )); then
+                short_title="${short_title:0:29}…"
+            fi
+            add_row "Arch News (Latest)" "PASS ✔ ($short_title)"
+            log "HEALTH arch_news=PASS title=\"$item_title\""
+        fi
+    fi
+}
+
+check_arch_audit() {
+    if ! command -v arch-audit &>/dev/null; then
+        add_row "Arch security audit" "INFO ℹ (arch-audit unavailable)"
+        ((INFO_COUNT++))
+        log "HEALTH arch_audit=not_installed"
+        return
+    fi
+
+    ARCH_AUDIT_TEXT="$(arch-audit 2>&1 || true)"
+    printf '%s\n' "$ARCH_AUDIT_TEXT" > "$RUN_RAW/arch-audit.txt"
+
+    local high
+    high="$(printf '%s\n' "$ARCH_AUDIT_TEXT" | grep -ic 'High risk' || true)"
+
+    if (( high > 0 )); then
+        add_row "Arch security audit" "WARN ⚠ ($high high-risk entries)"
+        ((WARNINGS++))
+        log "HEALTH arch_audit=WARN high_risk=$high"
+    else
+        add_row "Arch security audit" "PASS ✔"
+        log "HEALTH arch_audit=PASS"
+    fi
+}
+
 generate_summary_json() {
-    local running_k gpu_name driver_ver gpu_t
+    local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
-    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || echo 'unknown')"
-    driver_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo 'unknown')"
+    
+    local vga_info
+    vga_info="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D|Display' || true)"
+    if [[ -n "$vga_info" ]]; then
+        drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+    fi
 
     local status_str="ALL_CLEAR"
     if (( ERRORS > 0 )); then
@@ -1000,23 +1021,26 @@ generate_summary_json() {
         status_str="REVIEW_WARNINGS"
     fi
 
-    jq -n \
-        --arg ts "$(date --iso-8601=seconds)" \
-        --arg run_id "$RUN_ID" \
-        --arg status "$status_str" \
-        --argjson errors "$ERRORS" \
-        --argjson warnings "$WARNINGS" \
-        --arg kernel "$running_k" \
-        --arg gpu "$gpu_name" \
-        --arg driver "$driver_ver" \
-        '{
-            timestamp: $ts,
-            run_id: $run_id,
-            status: $status,
-            counts: {errors: $errors, warnings: $warnings},
-            kernel: $kernel,
-            nvidia: {gpu: $gpu, driver: $driver}
-        }' > "$SUMMARY_FILE" 2>/dev/null || true
+    if command -v jq &>/dev/null; then
+        jq -n \
+            --arg ts "$(date --iso-8601=seconds)" \
+            --arg run_id "$RUN_ID" \
+            --arg status "$status_str" \
+            --argjson errors "$ERRORS" \
+            --argjson warnings "$WARNINGS" \
+            --arg kernel "$running_k" \
+            --arg drivers "$drivers" \
+            '{
+                timestamp: $ts,
+                run_id: $run_id,
+                status: $status,
+                counts: {errors: $errors, warnings: $warnings},
+                kernel: $kernel,
+                gpu: {drivers_in_use: $drivers}
+            }' > "$SUMMARY_FILE" 2>/dev/null || true
+    else
+        echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS'}' > "$SUMMARY_FILE"
+    fi
 }
 
 run_health_check() {
@@ -1041,7 +1065,7 @@ run_health_check() {
     check_efi_mount
     check_reboot_pending
 
-    check_nvidia
+    check_gpu
     check_dkms
     check_temperature
     check_smart
@@ -1053,7 +1077,7 @@ run_health_check() {
     check_package_integrity
     check_pacnew
 
-    check_gateway_dns
+    check_dns
     check_updates
     check_mirrorlist_age
     check_arch_news
