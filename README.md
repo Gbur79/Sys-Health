@@ -60,3 +60,9 @@ Analyze any reported warnings or errors. Propose minimal, safe, and reversible c
 License
 
 MIT License. Free for community use and modification.
+
+<img width="570" height="383" alt="image" src="https://github.com/user-attachments/assets/910b0eae-1dea-443c-a189-81d0314476a4" />
+
+<img width="636" height="1050" alt="image" src="https://github.com/user-attachments/assets/6b4fb39d-c67c-4d21-855a-fc5f212510f7" />
+
+
