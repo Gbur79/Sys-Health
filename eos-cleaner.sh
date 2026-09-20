@@ -26,8 +26,14 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 if ! command -v gum &>/dev/null; then
-    echo "gum is required. Installing it..."
-    sudo pacman -S --needed gum || exit 1
+    echo "gum is required for the interactive UI but is not installed."
+    read -r -p "Would you like to install gum now via sudo pacman -S gum? [y/N] " _gum_resp
+    if [[ "$_gum_resp" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        sudo pacman -S --needed gum || exit 1
+    else
+        echo "Exiting. Please install gum manually: sudo pacman -S gum"
+        exit 1
+    fi
 fi
 
 RUN_ID="$(date '+%Y%m%d-%H%M%S')"
@@ -254,7 +260,7 @@ render_audit_section() {
 
 collect_system_snapshot() {
     : > "$LOG_FILE"
-    
+
     log "============================================================"
     log "EOS CLEANER REPORT"
     log "============================================================"
@@ -790,8 +796,10 @@ check_pacman_lock() {
 }
 
 check_package_integrity() {
-    PACMAN_INTEGRITY_TEXT="$(sudo pacman -Qk 2>&1 || true)"
-    printf '%s\n' "$PACMAN_INTEGRITY_TEXT" > "$RUN_RAW/pacman-integrity.txt"
+    local integrity_file="$RUN_RAW/pacman-integrity.txt"
+    spinner "Checking package file integrity (pacman -Qk)..." \
+        bash -c 'sudo pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    PACMAN_INTEGRITY_TEXT="$(cat "$integrity_file" 2>/dev/null || true)"
 
     local problems
     problems="$(printf '%s\n' "$PACMAN_INTEGRITY_TEXT" |
@@ -1017,6 +1025,10 @@ check_arch_audit() {
         add_row "Arch security audit" "WARN ⚠ ($high high-risk entries)"
         ((WARNINGS++))
         log "HEALTH arch_audit=WARN high_risk=$high"
+        {
+            echo "### ARCH SECURITY AUDIT (VULNERABLE PACKAGES)"
+            printf '%s\n' "$ARCH_AUDIT_TEXT"
+        } >> "$LOG_FILE"
     else
         add_row "Arch security audit" "PASS ✔"
         log "HEALTH arch_audit=PASS"
@@ -1026,7 +1038,7 @@ check_arch_audit() {
 generate_summary_json() {
     local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
-    
+
     local vga_info
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
     if [[ -n "$vga_info" ]]; then
