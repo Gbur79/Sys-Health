@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# EOS Cleaner & System Health v2.3
+# EOS Cleaner & System Health v2.4
 # Safe maintenance + detailed diagnostics + AI Agent-friendly report
 # EndeavourOS / Arch Linux
 # ==============================================================================
 
 set -o pipefail
 
-VERSION="2.3"
+VERSION="2.4"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eos-cleaner"
 LOG_FILE="$STATE_DIR/eos-cleaner.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -38,8 +38,6 @@ PREVIOUS_RUN_SUMMARY=""
 if [[ -s "$LOG_FILE" ]]; then
     PREVIOUS_RUN_SUMMARY="$(grep '^Summary:' "$LOG_FILE" | tail -n1)"
 fi
-
-: > "$LOG_FILE"
 
 # Keep sudo credentials alive while this script is running.
 sudo -v || exit 1
@@ -252,6 +250,8 @@ render_audit_section() {
 # ------------------------------------------------------------------------------
 
 collect_system_snapshot() {
+    : > "$LOG_FILE"
+    
     log "============================================================"
     log "EOS CLEANER REPORT"
     log "============================================================"
@@ -306,7 +306,7 @@ refresh_state_snapshot() {
             lsmod 2>/dev/null | grep -E '^nvidia|^nouveau|^amdgpu|^radeon|^i915|^xe|^drm'
             echo ''
             echo '--- 6. GPU Hardware & Kernel Driver in Use ---'
-            lspci -k 2>/dev/null | grep -A3 -iE 'VGA|3D|Display'
+            lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display'
             echo ''
             echo '--- 7. Initramfs Configuration Files (Dracut / Mkinitcpio) ---'
             if [[ -d /etc/dracut.conf.d ]]; then
@@ -477,9 +477,16 @@ check_initramfs() {
             log "HEALTH initramfs=WARN normal=present fallback=missing pkgbase=$pkgbase"
         fi
     else
-        add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing: $normal)"
-        ((ERRORS++))
-        log "HEALTH initramfs=FAIL normal_missing=$normal pkgbase=$pkgbase"
+        local alt
+        alt="$(find /boot /efi -maxdepth 3 \( -name "*${pkgbase}*.img" -o -name "*${pkgbase}*.efi" -o -name "initrd*" \) 2>/dev/null | head -n1)"
+        if [[ -n "$alt" ]]; then
+            add_row "Initramfs ($pkgbase)" "PASS ✔ (detected: $(basename "$alt"))"
+            log "HEALTH initramfs=PASS custom_path=$alt pkgbase=$pkgbase"
+        else
+            add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing: $normal)"
+            ((ERRORS++))
+            log "HEALTH initramfs=FAIL normal_missing=$normal pkgbase=$pkgbase"
+        fi
     fi
 }
 
@@ -550,7 +557,7 @@ check_reboot_pending() {
 
 check_gpu() {
     local vga_info drivers="" driver_list="" gpu_name="GPU"
-    vga_info="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D|Display' || true)"
+    vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
 
     if [[ -z "$vga_info" ]]; then
         add_row "GPU runtime" "INFO ℹ (No GPU detected)"
@@ -923,8 +930,8 @@ check_mirrorlist_age() {
     fi
 
     local max_days=0
-    [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
-    [[ "$eos_days" =~ ^[0-9]+$ ]] && (( eos_days > max_days )) && max_days=$eos_days
+    [[ "$arch_days" =~ ^[0-9]+$]] && (( arch_days > max_days )) && max_days=$arch_days
+    [[ "$eos_days" =~ ^[0-9]+$]] && (( eos_days > max_days )) && max_days=$eos_days
 
     if (( max_days > 90 )); then
         add_row "Mirrorlist age" "WARN ⚠ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
@@ -1009,7 +1016,7 @@ generate_summary_json() {
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
     
     local vga_info
-    vga_info="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D|Display' || true)"
+    vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
     if [[ -n "$vga_info" ]]; then
         drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
     fi
@@ -1021,6 +1028,12 @@ generate_summary_json() {
         status_str="REVIEW_WARNINGS"
     fi
 
+    local warn_list_json="[]"
+    if (( WARNINGS > 0 || ERRORS > 0 )); then
+        warn_list_json="$(grep -E '^HEALTH .*=(WARN|FAIL)' "$LOG_FILE" 2>/dev/null |
+            awk '{print $2}' | cut -d= -f1 | sort -u | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+    fi
+
     if command -v jq &>/dev/null; then
         jq -n \
             --arg ts "$(date --iso-8601=seconds)" \
@@ -1028,13 +1041,15 @@ generate_summary_json() {
             --arg status "$status_str" \
             --argjson errors "$ERRORS" \
             --argjson warnings "$WARNINGS" \
+            --argjson flagged "$warn_list_json" \
             --arg kernel "$running_k" \
             --arg drivers "$drivers" \
             '{
                 timestamp: $ts,
                 run_id: $run_id,
                 status: $status,
-                counts: {errors: $errors, warnings: $warnings},
+                counts: {errors: $errors, warnings:$warnings},
+                flagged: $flagged,
                 kernel: $kernel,
                 gpu: {drivers_in_use: $drivers}
             }' > "$SUMMARY_FILE" 2>/dev/null || true
@@ -1082,6 +1097,10 @@ run_health_check() {
     check_mirrorlist_age
     check_arch_news
     check_arch_audit
+
+    log ""
+    log "### END OF REPORT"
+    log "Summary: errors=$ERRORS warnings=$WARNINGS info=$INFO_COUNT"
 
     refresh_state_snapshot
     generate_summary_json
