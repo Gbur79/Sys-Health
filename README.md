@@ -1,5 +1,17 @@
 <img width="708" height="1067" alt="image" src="https://github.com/user-attachments/assets/3e349a4a-a570-43d8-9aee-de5ef588e01c" />
 
+## EndeavourOS maintenance toolkit that safely cleans system cache/rubbish and generates structured health reports for AI agents. Designed to be highly conservative—it avoids aggressive package removal and prioritizes system stability over reclaiming every last byte.
+```bash
+sudo pacman -S --needed pacman-contrib jq bind smartmontools lm_sensors
+```
+
+## Dependencies
+
+The script utilizes standard tools to generate its audits. While `gum` is installed automatically, ensure you have the following optional diagnostic packages for the best results:
+
+```bash
+sudo pacman -S --needed pacman-contrib jq bind smartmontools lm_sensors
+
 ## Installation
 
 Download the script to your local bin directory and make it executable:
