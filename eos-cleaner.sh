@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# EOS Cleaner & System Health v2.5
+# EOS Cleaner & System Health v2.6
 # Safe maintenance + detailed diagnostics + AI Agent-friendly report
 # EndeavourOS / Arch Linux
 # ==============================================================================
 
 set -o pipefail
 
-VERSION="2.5"
+VERSION="2.6"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eos-cleaner"
 LOG_FILE="$STATE_DIR/eos-cleaner.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -33,6 +33,9 @@ fi
 RUN_ID="$(date '+%Y%m%d-%H%M%S')"
 RUN_RAW="$RAW_DIR/$RUN_ID"
 mkdir -p "$RUN_RAW"
+
+# Retain only the last 20 run directories in $RAW_DIR
+find "$RAW_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | tail -n +21 | xargs -r rm -rf 2>/dev/null || true
 
 PREVIOUS_RUN_SUMMARY=""
 if [[ -s "$LOG_FILE" ]]; then
@@ -372,11 +375,11 @@ run_maintenance() {
     fi
 
     if command -v yay &>/dev/null; then
-        spinner "Cleaning unused AUR build/cache data..." yay -Sc --noconfirm
+        spinner "Cleaning unused AUR build/cache data..." yay -Sc --aur --noconfirm
         ok "AUR cache cleanup completed."
         log "MAINTENANCE aur_cache=cleaned"
     elif command -v paru &>/dev/null; then
-        spinner "Cleaning unused AUR build/cache data..." paru -Sc --noconfirm
+        spinner "Cleaning unused AUR build/cache data..." paru -Sc --aur --noconfirm
         ok "AUR cache cleanup completed."
         log "MAINTENANCE aur_cache=cleaned"
     else
@@ -400,14 +403,16 @@ run_maintenance() {
         section "DEEP CLEAN"
 
         rm -rf -- \
-            "$HOME/.local/share/Trash/files/"* \
-            "$HOME/.local/share/Trash/info/"* 2>/dev/null || true
+            "$HOME/.local/share/Trash/files"/* \
+            "$HOME/.local/share/Trash/files"/.[!.]* \
+            "$HOME/.local/share/Trash/info"/* \
+            "$HOME/.local/share/Trash/info"/.[!.]* 2>/dev/null || true
         ok "Desktop trash cleaned."
         log "MAINTENANCE trash=cleaned"
 
         if [[ -d "$HOME/.cache/mozilla/firefox" ]]; then
             spinner "Cleaning Firefox cache..." \
-                bash -c 'find "$HOME/.cache/mozilla/firefox/" -type d -name "cache2" -exec rm -rf -- {}/* \; 2>/dev/null || true'
+                bash -c 'find "$HOME/.cache/mozilla/firefox/" -type d -name "cache2" -exec rm -rf -- "{}" + 2>/dev/null || true'
             ok "Firefox cache cleaned."
             log "MAINTENANCE firefox_cache=cleaned"
         fi
@@ -633,7 +638,7 @@ check_temperature() {
         local temp_int="${cpu_temp%%.*}"
         temp_int="${temp_int//[^0-9]/}"
 
-        if [[ -n "$temp_int" ]] && (( temp_int > 85 )); then
+        if [[ -n "$temp_int" ]] && (( 10#${temp_int:-0} > 85 )); then
             add_row "CPU temperature" "WARN ⚠ ($cpu_temp)"
             ((WARNINGS++))
             log "HEALTH cpu_temperature=WARN value=$cpu_temp"
@@ -659,7 +664,7 @@ check_smart() {
     local -a disks=()
     while IFS= read -r dev; do
         disks+=("$dev")
-    done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk" {print "/dev/"$1}')
+    done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 !~ /^(zram|loop)/ {print "/dev/"$1}')
 
     if [[ ${#disks[@]} -eq 0 ]]; then
         add_row "SMART disk health" "INFO ℹ (no disks detected)"
@@ -773,7 +778,7 @@ check_pacman_lock() {
         return
     fi
 
-    if fuser /var/lib/pacman/db.lck &>/dev/null; then
+    if sudo fuser /var/lib/pacman/db.lck &>/dev/null || pgrep -x pacman &>/dev/null; then
         add_row "Pacman DB lock" "INFO ℹ (pacman is using it)"
         ((INFO_COUNT++))
         log "HEALTH pacman_lock=ACTIVE"
@@ -886,7 +891,7 @@ check_updates() {
     else
         local sensitive
         sensitive="$(printf '%s\n' "$UPDATES_TEXT" |
-            grep -iE '(^|[[:space:]])(linux|linux-headers|nvidia|nvidia-utils|lib32-nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|xorg)([[:space:]]|$)' || true)"
+            grep -iE '^(linux|nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|xorg)' || true)"
 
         if [[ -n "$sensitive" ]]; then
             add_row "Available updates" "WARN ⚠ ($count; core components included)"
@@ -933,16 +938,23 @@ check_mirrorlist_age() {
     [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
     [[ "$eos_days" =~ ^[0-9]+$ ]] && (( eos_days > max_days )) && max_days=$eos_days
 
+    local status_label=""
+    if [[ -f "$eos_file" ]]; then
+        status_label="Arch: ${arch_days}d │ EOS: ${eos_days}d"
+    else
+        status_label="Arch: ${arch_days}d"
+    fi
+
     if (( max_days > 90 )); then
-        add_row "Mirrorlist age" "WARN ⚠ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        add_row "Mirrorlist age" "WARN ⚠ ($status_label)"
         ((WARNINGS++))
         log "HEALTH mirrorlist_age=WARN arch_days=$arch_days eos_days=$eos_days max_days=$max_days"
     elif (( max_days > 45 )); then
-        add_row "Mirrorlist age" "INFO ℹ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        add_row "Mirrorlist age" "INFO ℹ ($status_label)"
         ((INFO_COUNT++))
         log "HEALTH mirrorlist_age=INFO arch_days=$arch_days eos_days=$eos_days"
     else
-        add_row "Mirrorlist age" "PASS ✔ (Arch: ${arch_days}d │ EOS: ${eos_days}d)"
+        add_row "Mirrorlist age" "PASS ✔ ($status_label)"
         log "HEALTH mirrorlist_age=PASS arch_days=$arch_days eos_days=$eos_days"
     fi
 }
@@ -960,8 +972,8 @@ check_arch_news() {
         return
     fi
 
-    item_title="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<title>).*?(?=</title>)' | sed '1d' | head -n1 || true)"
-    item_date="$(printf '%s' "$rss_data" | grep -m 1 -oP '(?<=<pubDate>).*?(?=</pubDate>)' | head -n1 || true)"
+    item_title="$(printf '%s' "$rss_data" | awk -v RS='</?item>' 'NR==2' | grep -m 1 -oP '(?<=<title>).*?(?=</title>)' || true)"
+    item_date="$(printf '%s' "$rss_data" | awk -v RS='</?item>' 'NR==2' | grep -m 1 -oP '(?<=<pubDate>).*?(?=</pubDate>)' || true)"
 
     if [[ -n "$item_title" ]]; then
         item_title="$(sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g; s/&quot;/"/g' <<< "$item_title")"
@@ -1179,13 +1191,15 @@ live_monitor() {
     section "LIVE MONITOR"
 
     if command -v btop &>/dev/null; then
-        exec btop
+        btop
     elif command -v glances &>/dev/null; then
-        exec glances
+        glances
     else
         warn "Neither btop nor glances found."
         if gum confirm "Install btop?"; then
-            sudo pacman -S --needed --noconfirm btop && exec btop
+            sudo pacman -S --needed --noconfirm btop && btop
+        else
+            pause_screen
         fi
     fi
 }
