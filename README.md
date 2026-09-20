@@ -1,6 +1,6 @@
 # eos-cleaner
 
-A fast, safe, and terminal-driven maintenance tool for **EndeavourOS / Arch Linux**. 
+A fast, safe, and terminal-driven maintenance tool for **EndeavourOS / Arch Linux**.
 
 `eos-cleaner` combines safe package cache cleanup with a comprehensive TUI system health dashboard built with `gum`. It also exports an ultra-compact JSON health report designed specifically for AI system administration agents (like Google Antigravity or Goose CLI) to analyze problems without burning through API tokens.
 
@@ -35,7 +35,7 @@ Run the following commands in your terminal:
 
 ```bash
 # Clone the repository
-git clone [https://github.com/Gbur79/eos-cleaner.git](https://github.com/Gbur79/eos-cleaner.git)
+git clone https://github.com/Gbur79/eos-cleaner.git
 
 # Navigate to directory
 cd eos-cleaner
@@ -46,12 +46,9 @@ chmod +x eos-cleaner.sh
 # Run the cleaner
 ./eos-cleaner.sh
 
-
 AI Agent Integration
 
 After running a Health Check, feed the generated JSON file directly to your AI Assistant:
-Plaintext
-
 Read the EOS Health report at:
 ~/.local/state/eos-cleaner/eos-health-report.json
 
@@ -60,9 +57,3 @@ Analyze any reported warnings or errors. Propose minimal, safe, and reversible c
 License
 
 MIT License. Free for community use and modification.
-
-<img width="570" height="383" alt="image" src="https://github.com/user-attachments/assets/910b0eae-1dea-443c-a189-81d0314476a4" />
-
-<img width="636" height="1050" alt="image" src="https://github.com/user-attachments/assets/6b4fb39d-c67c-4d21-855a-fc5f212510f7" />
-
-
