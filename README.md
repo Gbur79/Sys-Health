@@ -13,7 +13,7 @@ sudo pacman -S --needed pacman-contrib jq bind smartmontools lm_sensors
 Download the script to your local bin directory and make it executable:
 ```bash
 mkdir -p ~/bin
-curl -o ~/bin/eos-cleaner.sh [https://raw.githubusercontent.com/Gbur79/eos-cleaner/main/eos-cleaner.sh](https://raw.githubusercontent.com/Gbur79/eos-cleaner/main/eos-cleaner.sh)
+curl -fsSL https://raw.githubusercontent.com/Gbur79/eos-cleaner/main/eos-cleaner.sh -o ~/bin/eos-cleaner.sh
 chmod +x ~/bin/eos-cleaner.sh
 ```
 
