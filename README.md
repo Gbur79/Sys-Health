@@ -6,6 +6,14 @@ A fast, safe, and terminal-driven maintenance tool for **EndeavourOS / Arch Linu
 
 ---
 
+## Preview
+
+<div align="center">
+  <img width="632" alt="EOS Cleaner Health Check Dashboard" src="https://github.com/user-attachments/assets/6f13efac-ba8f-43d9-ad7e-250a785df0af" />
+</div>
+
+---
+
 ## Key Features
 
 * **Safe Maintenance:** Cleans pacman & AUR caches (retaining the last 2 versions), vacuums systemd journal logs (>14 days), and clears thumbnail/trash data.
