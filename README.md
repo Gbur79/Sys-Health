@@ -65,3 +65,9 @@ Analyze any reported warnings or errors. Propose minimal, safe, and reversible c
 License
 
 MIT License. Free for community use and modification.
+
+ ____ _               _____ ___  
+ / ___| |__  _   _ _ _|___  / _ \ 
+| |  _| '_ \| | | | '__| / / (_) |
+| |_| | |_) | |_| | |   / / \__, |
+ \____|_.__/ \__,_|_|  /_/    /_/ 
