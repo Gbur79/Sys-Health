@@ -167,6 +167,10 @@ FAILED_USER_SERVICES=""
 PACNEWS=""
 UPDATES_TEXT=""
 ARCH_AUDIT_TEXT=""
+ARCH_AUDIT_ACTIONABLE=""
+ARCH_AUDIT_ALL=""
+ARCH_AUDIT_ACTIONABLE_COUNT=0
+ARCH_AUDIT_TRACKER_COUNT=0
 PACMAN_INTEGRITY_TEXT=""
 DKMS_TEXT=""
 SENSORS_TEXT=""
@@ -1015,24 +1019,115 @@ check_arch_audit() {
         return
     fi
 
-    ARCH_AUDIT_TEXT="$(arch-audit 2>&1 || true)"
-    printf '%s\n' "$ARCH_AUDIT_TEXT" > "$RUN_RAW/arch-audit.txt"
+    local act_file="$RUN_RAW/arch-audit-actionable.txt"
+    local all_file="$RUN_RAW/arch-audit-tracker.txt"
 
-    local high
-    high="$(printf '%s\n' "$ARCH_AUDIT_TEXT" | grep -ic 'High risk' || true)"
+    spinner "Checking security advisories (arch-audit)..." \
+        bash -c 'arch-audit -u -c > "$1" 2>&1 || true; arch-audit -c > "$2" 2>&1 || true' _ "$act_file" "$all_file"
 
-    if (( high > 0 )); then
-        add_row "Arch security audit" "WARN ⚠ ($high high-risk entries)"
-        ((WARNINGS++))
-        log "HEALTH arch_audit=WARN high_risk=$high"
-        {
-            echo "### ARCH SECURITY AUDIT (VULNERABLE PACKAGES)"
-            printf '%s\n' "$ARCH_AUDIT_TEXT"
-        } >> "$LOG_FILE"
-    else
-        add_row "Arch security audit" "PASS ✔"
-        log "HEALTH arch_audit=PASS"
+    ARCH_AUDIT_ACTIONABLE="$(cat "$act_file" 2>/dev/null || true)"
+    ARCH_AUDIT_ALL="$(cat "$all_file" 2>/dev/null || true)"
+    ARCH_AUDIT_TEXT="$ARCH_AUDIT_ALL"
+    printf '%s\n' "$ARCH_AUDIT_ALL" > "$RUN_RAW/arch-audit.txt"
+
+    if [[ "$ARCH_AUDIT_ALL" =~ (Error:|failed to) ]]; then
+        add_row "Arch security audit" "INFO ℹ (tracker unreachable)"
+        ((INFO_COUNT++))
+        log "HEALTH arch_audit=INFO offline=YES"
+        return
     fi
+
+    local act_count=0 act_high=0
+    if [[ -n "$ARCH_AUDIT_ACTIONABLE" ]]; then
+        act_count="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | sed '/^$/d' | wc -l)"
+        act_high="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | grep -ic 'High risk' || true)"
+    fi
+    ARCH_AUDIT_ACTIONABLE_COUNT="$act_count"
+
+    local open_count=0 open_high=0 open_med=0
+    if [[ -n "$ARCH_AUDIT_ALL" ]]; then
+        open_count="$(printf '%s\n' "$ARCH_AUDIT_ALL" | sed '/^$/d' | wc -l)"
+        open_high="$(printf '%s\n' "$ARCH_AUDIT_ALL" | grep -ic 'High risk' || true)"
+        open_med="$(printf '%s\n' "$ARCH_AUDIT_ALL" | grep -ic 'Medium risk' || true)"
+    fi
+    ARCH_AUDIT_TRACKER_COUNT="$open_count"
+
+    local aur_count=0
+    if command -v pacman &>/dev/null; then
+        pacman -Qm > "$RUN_RAW/foreign-packages.txt" 2>/dev/null || true
+        aur_count="$(wc -l < "$RUN_RAW/foreign-packages.txt" 2>/dev/null || echo 0)"
+    fi
+
+    if (( act_count > 0 )); then
+        if (( act_high > 0 )); then
+            add_row "Arch security audit" "WARN ⚠ ($act_high actionable High risk)"
+        else
+            add_row "Arch security audit" "WARN ⚠ ($act_count actionable update(s))"
+        fi
+        ((WARNINGS++))
+        log "HEALTH arch_audit=WARN actionable=$act_count actionable_high=$act_high tracker_open=$open_count"
+    else
+        add_row "Arch security audit" "PASS ✔ (0 actionable; $open_count tracker backlog)"
+        log "HEALTH arch_audit=PASS actionable=0 tracker_open=$open_count tracker_high=$open_high"
+    fi
+
+    {
+        echo "### ARCH SECURITY AUDIT"
+        echo "Actionable updates in repositories: $act_count"
+        echo "Arch Security Tracker open advisories: $open_count (High: $open_high, Medium: $open_med)"
+        echo "Foreign (AUR) packages detected: $aur_count (arch-audit covers official repos only)"
+        echo ""
+        if (( act_count > 0 )); then
+            echo "ACTIONABLE SECURITY UPDATES AVAILABLE IN REPOS:"
+            printf '%s\n' "$ARCH_AUDIT_ACTIONABLE"
+            echo ""
+            echo "Recommendation: Run 'eos-update' or 'sudo pacman -Syu' to apply security updates."
+            echo ""
+        else
+            echo "No pending security package upgrades found in official repositories."
+            echo ""
+        fi
+
+        if (( open_count > 0 )); then
+            echo "ARCH SECURITY TRACKER OPEN ADVISORIES (INFORMATIONAL / TRACKER BACKLOG):"
+            echo "Note: Advisories where no 'Fixed' version is recorded on security.archlinux.org"
+            echo "remain open indefinitely. On an updated rolling release, these are typically"
+            echo "upstream/tracker bookkeeping backlog (e.g. 5.15 LTS kernel CVEs on 6.18 LTS,"
+            echo "OpenSSL 1.1.1 issues on OpenSSL 3.x, pam 1.7.0 on 1.7.2) rather than live vulnerabilities."
+            echo ""
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local p ver note=""
+                p="$(echo "$line" | awk '{print $1}')"
+                ver="$(pacman -Q "$p" 2>/dev/null | awk '{print $2}' || echo 'unknown')"
+                if [[ "$p" =~ ^linux && "$line" =~ CVE-202[0-3] ]]; then
+                    note=" [stale advisory: targets older kernel series]"
+                elif [[ "$p" == "openssl" && "$line" =~ CVE-2022-2068 ]]; then
+                    note=" [stale advisory: CVE-2022-2068 affected OpenSSL 1.1.1 branch]"
+                elif [[ "$p" == "pam" && "$line" =~ CVE-2025-6020 ]]; then
+                    note=" [upstream fixed in 1.7.1; unclosed tracker ticket]"
+                elif [[ "$p" == "djvulibre" && "$line" =~ CVE-2025-53367 ]]; then
+                    note=" [upstream fixed in 3.5.29; unclosed tracker ticket]"
+                elif [[ "$p" == "libxml2" && "$line" =~ CVE-2025- ]]; then
+                    note=" [upstream fixed in 2.14.5+/2.15.x; unclosed tracker ticket]"
+                elif [[ "$p" == "cpio" && "$line" =~ CVE-2021-38185 ]]; then
+                    note=" [upstream fixed in 2.14; unclosed tracker ticket]"
+                elif [[ "$p" == "grub" && "$line" =~ CVE-202[1-2] ]]; then
+                    note=" [stale advisory: targets GRUB 2.06; unclosed tracker ticket]"
+                fi
+                echo "  • $p ($ver): ${line#*is affected by }${note}"
+            done <<< "$ARCH_AUDIT_ALL"
+            echo ""
+        fi
+
+        if (( aur_count > 0 )); then
+            echo "AUR / FOREIGN PACKAGES NOTICE:"
+            echo "Official-repo arch-audit does not track foreign / AUR packages."
+            echo "Detected $aur_count foreign package(s) on host (see $RUN_RAW/foreign-packages.txt)."
+            echo "Audit and update foreign packages via your AUR helper (yay/paru)."
+            echo ""
+        fi
+    } >> "$LOG_FILE"
 }
 
 generate_summary_json() {
@@ -1058,6 +1153,11 @@ generate_summary_json() {
             awk '{print $2}' | cut -d= -f1 | sort -u | jq -R . | jq -s . 2>/dev/null || echo '[]')"
     fi
 
+    local aur_pkg_count=0
+    if [[ -f "$RUN_RAW/foreign-packages.txt" ]]; then
+        aur_pkg_count="$(wc -l < "$RUN_RAW/foreign-packages.txt" 2>/dev/null || echo 0)"
+    fi
+
     if command -v jq &>/dev/null; then
         jq -n \
             --arg ts "$(date --iso-8601=seconds)" \
@@ -1068,6 +1168,9 @@ generate_summary_json() {
             --argjson flagged "$warn_list_json" \
             --arg kernel "$running_k" \
             --arg drivers "$drivers" \
+            --argjson sec_actionable "${ARCH_AUDIT_ACTIONABLE_COUNT:-0}" \
+            --argjson sec_tracker "${ARCH_AUDIT_TRACKER_COUNT:-0}" \
+            --argjson aur_pkgs "$aur_pkg_count" \
             '{
                 timestamp: $ts,
                 run_id: $run_id,
@@ -1075,7 +1178,12 @@ generate_summary_json() {
                 counts: {errors: $errors, warnings: $warnings},
                 flagged: $flagged,
                 kernel: $kernel,
-                gpu: {drivers_in_use: $drivers}
+                gpu: {drivers_in_use: $drivers},
+                security: {
+                    actionable_fixes: $sec_actionable,
+                    tracker_open: $sec_tracker,
+                    aur_packages: $aur_pkgs
+                }
             }' > "$SUMMARY_FILE" 2>/dev/null || true
     else
         echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS'}' > "$SUMMARY_FILE"
