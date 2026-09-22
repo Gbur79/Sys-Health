@@ -1,105 +1,146 @@
-<img width="708" height="1067" alt="EOS Cleaner & System Health UI" src="https://github.com/user-attachments/assets/3e349a4a-a570-43d8-9aee-de5ef588e01c" />
+<img width="569" height="372" alt="image" src="https://github.com/user-attachments/assets/77598da6-9340-48b6-803f-17689cfb81f8" />
+<img width="687" height="1099" alt="image" src="https://github.com/user-attachments/assets/e33c6eb1-d666-4ebb-9fa8-4a6da4f021c3" />
 
-# EOS Cleaner & System Health
+# Arch System Health & Diagnostics
 
-A conservative maintenance toolkit and automated system health auditor for **EndeavourOS** and **Arch Linux**, featuring an interactive terminal UI and structured diagnostics designed for both human review and AI agents.
+[![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Unlike aggressive cleaning tools that blindly wipe packages and configurations, EOS Cleaner is built strictly around the official **[Arch Wiki: System Maintenance Guidelines](https://wiki.archlinux.org/title/System_maintenance)**. It prioritizes system stability, rollback capabilities, and actionable diagnostics over reclaiming every last byte.
+An interactive TUI diagnostic suite, system health audit, and AI-assisted troubleshooting report tool for **Arch Linux and Arch-based distributions** (EndeavourOS, Manjaro, CachyOS, etc.).
 
----
-
-## Key Features
-
-* **Strict Safety & Rollback Protection:** 
-  * Keeps the last two versions of installed packages in cache (`paccache -k 2`) so you can always roll back.
-  * Preserves official pacman package cache when pruning AUR build files (`yay -Sc --aur` / `paru -Sc --aur`).
-* **Deep Diagnostic Audit:**
-  * **Boot & Core:** Verifies kernel modules directory matching `uname -r`, initramfs integrity (normal + fallback images), ESP mount health, and checks if a reboot is pending after a kernel update.
-  * **Hardware & Drivers:** GPU runtime verification (NVIDIA / AMD / Intel), DKMS build status, CPU temperatures, SMART disk health (filters out virtual `zram`/`loop` devices), and SSD TRIM timer status.
-  * **System & Services:** Real-time pacman DB lock inspection, package file integrity (`pacman -Qk`), orphaned `.pacnew` / `.pacsave` detection, and failed system/user systemd units.
-  * **Network & Security:** DNS resolution latency test, available updates highlighting sensitive core components, mirrorlist age check, automated Arch Linux News feed parsing (flags *manual intervention* alerts), and vulnerability scans via `arch-audit`.
-* **AI Agent Handoff:** Generates machine-readable summaries (`summary.json`) and comprehensive software snapshots (`eos-software-state.txt`) ready to feed directly into LLMs (Goose, Antigravity, Claude, ChatGPT) for safe troubleshooting.
+> **Disclaimer:** This is an independent, unofficial community project. It is **not** developed, maintained, or endorsed by the EndeavourOS team or Arch Linux. It is designed to assist users in understanding, inspecting, and maintaining their systems safely.
 
 ---
 
-## Dependencies
+## Key Design Principles
 
-The script utilizes standard system utilities. While `gum` is required for the interactive UI (the script will ask before installing it), the following packages provide full diagnostic coverage:
+1. **Safety & Non-Invasiveness First (Read-Only by default):**
+   The primary action is a comprehensive system audit. It never modifies, uninstalls, or deletes anything without explicit, separated confirmation.
+2. **Context for AI Agents (Agentic Handoff):**
+   Produces structured, machine-readable diagnostic telemetry (`summary.json`, hardware/software snapshots) ready to feed directly into CLI AI assistants (Goose, Claude Code, Aider, local LLMs) for conservative, data-driven troubleshooting.
+3. **No Guesswork for Rolling Releases:**
+   Focuses on core Arch Linux failure points: out-of-sync kernels/modules, ESP/EFI mounts, DKMS builds, fallback initramfs integrity, pending reboot indicators, `.pacnew` tracking, upstream Arch News manual interventions, and CVE security auditing.
+
+---
+
+## Features
+
+### 1. Comprehensive Health Audit (Read-Only)
+* **Kernel & Modules:** Confirms running kernel modules match `/usr/lib/modules/$(uname -r)`.
+* **Initramfs & Boot Integrity:** Verifies normal and fallback initramfs images across Dracut and Mkinitcpio configurations.
+* **ESP / EFI Health:** Validates EFI system partition mount point (`/boot`, `/efi`, or `/boot/efi`) and checks for low free space (< 30 MB).
+* **Superseded Kernel Detection:** Detects if `vmlinuz` was updated after boot, warning that a reboot is pending.
+* **Crash & Unclean Shutdown Detection:** Inspects previous boot logs and filesystem journal recovery (`systemd-fsck`, unclean journald flags) to detect ungraceful power-offs and hard freezes.
+* **Hardware, Thermals & GPU Lockup:** GPU driver runtime status (NVIDIA, AMD, Intel), Xorg fliplock stall / kernel Xid error monitoring, DKMS build status, CPU temperatures (`lm_sensors`), disk SMART health (`smartctl`), and SSD TRIM timer status (`fstrim.timer`).
+* **Storage, Services & Recovery Keys:** Root disk space thresholds, failed systemd units (both system and user levels), and Magic SysRq emergency recovery validation (`kernel.sysrq`).
+* **Package Management & Security:**
+  * Pacman database stale lock detection (`db.lck`).
+  * Package file integrity auditing (`pacman -Qk`).
+  * Unmerged configuration files (`.pacnew`).
+  * Mirrorlist freshness check (Arch and distribution mirrorlists).
+  * Direct Arch News RSS feed check for required **manual interventions**.
+  * Official Arch Security Tracker (`arch-audit`), clearly separating actionable repository fixes from unclosed upstream tracker backlog.
+  * Installed foreign/AUR packages audit notice.
+
+### 2. AI Agent Handoff (Structured Diagnostics)
+Every health audit run automatically compiles:
+* A structured, machine-readable **`summary.json`** located at `~/.local/state/system-health/summary.json`.
+* An exportable **software state snapshot** (`software-state.txt`) capturing installed kernels, headers, GPU drivers, modules, and dracut/mkinitcpio configs.
+* A one-click prompt ready to paste into AI coding assistants for conservative, context-aware diagnosis.
+
+### 3. Safe System Maintenance (Optional)
+* **Paccache management:** Keep the last 2 versions of installed packages, clean uninstalled cache with `paccache -r -u -k 0`.
+* **AUR build cache cleanup:** Cleans unneeded build artifacts via `yay` or `paru`.
+* **Systemd journal vacuuming:** Vacuums logs older than 14 days without wiping recent boot context.
+* **Thumbnail cache cleanup:** Clears `$HOME/.cache/thumbnails`.
+* **Optional Deep Clean:** Separate mode with explicit confirmation to clean Desktop Trash, browser caches (`cache2`), and stored coredumps.
+
+---
+
+## Comparison: Archcanary vs. Arch System Health
+
+| Feature | **Archcanary** | **Arch System Health & Diagnostics** |
+| :--- | :--- | :--- |
+| **Primary Focus** | **Malware & threat detection** | **System hygiene, kernel/boot diagnostics & health audit** |
+| **Detection Scope** | AUR supply-chain attacks, blacklisted hashes, trojans, RATs, suspicious eBPF | Boot/ESP, kernels, DKMS, journal & unclean shutdowns, GPU lockups/fliplock, SysRq, failed units, mirror freshness, `.pacnew`, Arch News, CVE audit |
+| **Execution Mode** | Read-Only security scan | **Read-Only audit by default** + optional interactive maintenance |
+| **Security Audit** | Known malicious AUR package feeds | Official Arch Security Tracker (`arch-audit`) for core/extra repos |
+| **AI Integration** | None | Generates machine-readable `summary.json` and snapshots for AI agents |
+
+Both tools complement each other: Archcanary verifies package security against malicious threat actors, while Arch System Health keeps your operating system stable, transparent, and easy to diagnose.
+
+---
+
+## Prerequisites
+
+* **Required:**
+  * `gum` (charmbracelet's tool for interactive terminal UI):
+    ```bash
+    sudo pacman -S gum
+    ```
+* **Recommended for full functionality:**
+  * `pacman-contrib` (provides `paccache` and `checkupdates`)
+  * `arch-audit` (provides CVE audit from security.archlinux.org)
+  * `lm_sensors`, `smartmontools` (for temperatures and disk SMART health)
+  * `figlet`, `lolcat` (for header banners)
+  * `btop` (for live monitor)
+
+---
+
+## Usage
+
+### 1. Interactive Terminal UI (TUI)
+Run the script without arguments:
+```bash
+./system-health.sh
+```
+*(Prompts for `sudo` up front to authenticate for privileged checks and maintenance tasks).*
+
+### 2. Automated & AI Agent CLI Modes (Non-Interactive)
+The script supports headless execution designed for CLI AI agents (Goose, Claude Code, Aider), CI/CD pipelines, or cron scripts:
+
+* **Non-interactive health audit & report generation:**
+  ```bash
+  ./system-health.sh --audit
+  # Exit codes: 0 = ALL_CLEAR, 1 = ACTION_REQUIRED, 2 = REVIEW_WARNINGS
+  ```
+* **Output latest summary telemetry in JSON format:**
+  ```bash
+  ./system-health.sh --json
+  ```
+* **Output system software state snapshot:**
+  ```bash
+  ./system-health.sh --snapshot
+  ```
+* **Output full plain text audit log:**
+  ```bash
+  ./system-health.sh --report
+  ```
+* **Non-interactive safe maintenance followed by audit:**
+  ```bash
+  ./system-health.sh --maintenance
+  ```
+
+---
+
+## Optional Configuration
+
+You can customize behavior without modifying the script by creating `~/.config/system-health/system-health.conf` or `~/.config/system-health.conf`:
 
 ```bash
-sudo pacman -S --needed gum pacman-contrib jq bind smartmontools lm_sensors arch-audit
+# Custom host for DNS resolution test (default: archlinux.org)
+DNS_TEST_HOST="archlinux.org"
+
+# Custom DNS resolver to test against (e.g. local router or pfSense IP)
+# DNS_TEST_SERVER="192.168.1.1"
+
+# Skip time-consuming package file integrity check (0 = disabled, 1 = skip)
+SKIP_INTEGRITY=0
 ```
-
-*Optional terminal monitors for live inspection:* `btop` or `glances`.
-
----
-
-## Installation
-
-Download the script to your local user `~/bin` directory and make it executable:
-
-```bash
-mkdir -p ~/bin
-curl -fsSL https://raw.githubusercontent.com/Gbur79/eos-cleaner/main/eos-cleaner.sh -o ~/bin/eos-cleaner.sh
-chmod +x ~/bin/eos-cleaner.sh
-```
-
-Ensure `~/bin` is in your `PATH` (default on EndeavourOS). You can then run it anytime via:
-
-```bash
-eos-cleaner.sh
-```
-
----
-
-## Add to Application Menu (Optional)
-
-To integrate EOS Cleaner into your desktop application launcher (KDE Plasma, GNOME, XFCE, etc.), run the following command. It uses standard XDG categories:
-
-```bash
-mkdir -p ~/.local/share/applications
-cat << 'EOF' > ~/.local/share/applications/eos-cleaner.desktop
-[Desktop Entry]
-Version=1.1
-Type=Application
-Name=System Maintenance & Repair
-GenericName=System Health & Diagnostics
-Comment=Interactive system cleanup and health audit
-Exec=bash -ic "$HOME/bin/eos-cleaner.sh"
-Icon=utilities-system-monitor
-Terminal=true
-Categories=System;Monitor;
-StartupNotify=false
-EOF
-```
-
----
-
-## Operating Modes
-
-1. **Standard Clean & Health:**
-   * Prunes pacman cache keeping the last 2 versions (`paccache -r -k 2`).
-   * Clears cache of uninstalled packages (`paccache -r -u -k 0`).
-   * Safely clears AUR build cache via `yay`/`paru`.
-   * Vacuums systemd journal older than 14 days.
-   * Clears thumbnail cache.
-   * Executes the full system health audit.
-2. **Deep Clean & Health:**
-   * Includes everything from Standard Clean.
-   * Empties Desktop Trash (including hidden files).
-   * Safely clears browser disk caches (Firefox, Chromium).
-   * Clears stored system coredumps (`coredumpctl clear`).
-   * Executes the full system health audit.
-3. **Health Check Only:**
-   * Runs the complete diagnostic suite without altering any files or caches.
-4. **AI Agent Handoff:**
-   * Formats a ready-to-copy context prompt pointing to diagnostic logs, state snapshots, and JSON status.
-5. **Live Monitor:**
-   * Launches `btop` or `glances` for real-time performance and thermals monitoring.
 
 ---
 
 ## License
 
-MIT License. Free to use, modify, and distribute.
-```
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
