@@ -1,20 +1,136 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# EOS Cleaner & System Health v2.6
-# Safe maintenance + detailed diagnostics + AI Agent-friendly report
-# EndeavourOS / Arch Linux
+# Arch System Health & Diagnostics v2.8
+# Read-only health audit + AI Agent report generator + optional maintenance
+# Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
+# Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
 # ==============================================================================
 
 set -o pipefail
 
-VERSION="2.6"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eos-cleaner"
-LOG_FILE="$STATE_DIR/eos-cleaner.log"
+VERSION="2.8"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
+LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
-STATE_SNAPSHOT="$STATE_DIR/eos-software-state.txt"
+STATE_SNAPSHOT="$STATE_DIR/software-state.txt"
 RAW_DIR="$STATE_DIR/runs"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# User configuration (optional)
+# ------------------------------------------------------------------------------
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/system-health/system-health.conf"
+[[ ! -f "$CONFIG_FILE" ]] && CONFIG_FILE="$HOME/.config/system-health.conf"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# ------------------------------------------------------------------------------
+# Usage & CLI options
+# ------------------------------------------------------------------------------
+
+show_usage() {
+    cat <<EOF
+Arch System Health & Diagnostics v$VERSION
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  -a, --audit, --batch   Run read-only health audit & generate snapshot (non-interactive)
+  -j, --json             Print latest summary JSON to stdout and exit
+  -s, --snapshot         Print latest system software state snapshot to stdout and exit
+  -r, --report           Print latest text audit report to stdout and exit
+  -m, --maintenance      Run safe maintenance non-interactively, then run health audit
+  -h, --help             Show this help message and exit
+  -v, --version          Show version and exit
+
+Configuration:
+  Optional config file:
+    ~/.config/system-health/system-health.conf
+    or ~/.config/system-health.conf
+  Supported variables:
+    DNS_TEST_HOST="archlinux.org"   (host for DNS resolution test)
+    DNS_TEST_SERVER=""              (optional custom resolver IP, e.g. router)
+    SKIP_INTEGRITY=0                (set to 1 to skip time-consuming pacman -Qk)
+
+Exit codes (in --audit/--batch mode):
+  0: ALL_CLEAR (no errors or warnings)
+  1: ACTION_REQUIRED (one or more errors detected)
+  2: REVIEW_WARNINGS (warnings detected, no errors)
+EOF
+}
+
+ACTION="interactive"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--audit|--batch)
+            ACTION="audit"
+            shift
+            ;;
+        -j|--json)
+            ACTION="json"
+            shift
+            ;;
+        -s|--snapshot)
+            ACTION="snapshot"
+            shift
+            ;;
+        -r|--report)
+            ACTION="report"
+            shift
+            ;;
+        -m|--maintenance)
+            ACTION="maintenance"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "Arch System Health & Diagnostics v$VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Run '$(basename "$0") --help' for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Fast-paths for immediate stdout output
+if [[ "$ACTION" == "json" ]]; then
+    if [[ -f "$SUMMARY_FILE" ]]; then
+        cat "$SUMMARY_FILE"
+        echo ""
+    else
+        echo '{"status": "UNKNOWN", "errors": 0, "warnings": 0, "note": "No previous audit found. Run with --audit to generate."}'
+    fi
+    exit 0
+fi
+
+if [[ "$ACTION" == "snapshot" ]]; then
+    if [[ -f "$STATE_SNAPSHOT" ]]; then
+        cat "$STATE_SNAPSHOT"
+    else
+        echo "No software state snapshot found. Run with --audit to generate." >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+if [[ "$ACTION" == "report" ]]; then
+    if [[ -f "$LOG_FILE" ]]; then
+        cat "$LOG_FILE"
+    else
+        echo "No audit log report found. Run with --audit to generate." >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 # ------------------------------------------------------------------------------
 # Safety / environment
@@ -25,7 +141,7 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
-if ! command -v gum &>/dev/null; then
+if [[ "$ACTION" == "interactive" ]] && ! command -v gum &>/dev/null; then
     echo "gum is required for the interactive UI but is not installed."
     read -r -p "Would you like to install gum now via sudo pacman -S gum? [y/N] " _gum_resp
     if [[ "$_gum_resp" =~ ^([yY][eE][sS]|[yY])$ ]]; then
@@ -48,17 +164,32 @@ if [[ -s "$LOG_FILE" ]]; then
     PREVIOUS_RUN_SUMMARY="$(grep '^Summary:' "$LOG_FILE" | tail -n1)"
 fi
 
-# Keep sudo credentials alive while this script is running.
-sudo -v || exit 1
-(
-    while true; do
-        sudo -n true
-        sleep 45
-        kill -0 "$$" 2>/dev/null || exit
-    done
-) 2>/dev/null &
-SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+# Sudo credentials management (interactive prompts vs batch best-effort)
+HAVE_SUDO=0
+if sudo -n true 2>/dev/null; then
+    HAVE_SUDO=1
+elif [[ "$ACTION" == "interactive" ]]; then
+    if sudo -v; then
+        HAVE_SUDO=1
+    else
+        echo "Authentication failed or aborted." >&2
+        exit 1
+    fi
+elif [[ -t 0 ]] && sudo -v 2>/dev/null; then
+    HAVE_SUDO=1
+fi
+
+if [[ "$HAVE_SUDO" -eq 1 ]]; then
+    (
+        while true; do
+            sudo -n true 2>/dev/null || exit
+            sleep 45
+            kill -0 "$$" 2>/dev/null || exit
+        done
+    ) 2>/dev/null &
+    SUDO_KEEPALIVE_PID=$!
+    trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+fi
 
 # ------------------------------------------------------------------------------
 # UI
@@ -67,21 +198,21 @@ trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
 ui_title() {
     clear
     if command -v figlet &>/dev/null && command -v lolcat &>/dev/null; then
-        figlet -f standard "EOS SYSTEM" | lolcat
+        figlet -f standard "SYS HEALTH" | lolcat
     else
         gum style \
             --foreground 214 \
             --border double \
             --align center \
             --width 68 \
-            "ENDEAVOUROS SYSTEM"
+            "ARCH SYSTEM HEALTH & AUDIT"
     fi
 
     gum style \
         --foreground 244 \
         --align center \
         --width 68 \
-        "Maintenance • Health • Diagnostics  |  v$VERSION"
+        "Diagnostics • Health Audit • AI Handoff  |  v$VERSION"
 
     echo ""
     local _kern _up _disk
@@ -114,28 +245,36 @@ ui_screen() {
         --align center \
         --width 68 \
         --padding "0 1" \
-        "EOS SYSTEM  ›  $1"
+        "SYSTEM HEALTH  ›  $1"
     echo ""
 }
 
 section() {
     echo ""
-    gum style \
-        --foreground 214 \
-        --border normal \
-        --padding "0 1" \
-        "$1"
+    if [[ -t 1 ]] && command -v gum &>/dev/null; then
+        gum style \
+            --foreground 214 \
+            --border normal \
+            --padding "0 1" \
+            "$1"
+    else
+        echo "=== $1 ==="
+    fi
 }
 
-ok()   { gum style --foreground 82  "✔ $1"; }
-warn() { gum style --foreground 214 "⚠ $1"; }
-fail() { gum style --foreground 196 "✖ $1"; }
-info() { gum style --foreground 81  "ℹ $1"; }
+ok()   { if [[ -t 1 ]] && command -v gum &>/dev/null; then gum style --foreground 82  "✔ $1"; else echo "✔ $1"; fi; }
+warn() { if [[ -t 1 ]] && command -v gum &>/dev/null; then gum style --foreground 214 "⚠ $1"; else echo "⚠ $1"; fi; }
+fail() { if [[ -t 1 ]] && command -v gum &>/dev/null; then gum style --foreground 196 "✖ $1"; else echo "✖ $1"; fi; }
+info() { if [[ -t 1 ]] && command -v gum &>/dev/null; then gum style --foreground 81  "ℹ $1"; else echo "ℹ $1"; fi; }
 
 spinner() {
     local title="$1"
     shift
-    gum spin --spinner dot --title "$title" -- "$@"
+    if [[ -t 1 ]] && command -v gum &>/dev/null; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        "$@"
+    fi
 }
 
 log() {
@@ -182,13 +321,13 @@ add_row() {
 
     if [[ -z "$sec" ]]; then
         case "$comp" in
-            "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending")
+            "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending"|"Previous session shutdown")
                 sec="BOOT"
                 ;;
-            "GPU runtime"*|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer")
+            "GPU runtime"*|"GPU errors & lockups"|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer")
                 sec="HW"
                 ;;
-            "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*)
+            "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys")
                 sec="SYS"
                 ;;
             "System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
@@ -229,33 +368,45 @@ render_audit_section() {
         badge=" ⚠"
     fi
 
-    echo ""
-    gum style \
-        --foreground "$header_color" \
-        --border rounded \
-        --padding "0 1" \
-        --bold \
-        "${title}${badge}"
+    if [[ -t 1 ]] && command -v gum &>/dev/null; then
+        echo ""
+        gum style \
+            --foreground "$header_color" \
+            --border rounded \
+            --padding "0 1" \
+            --bold \
+            "${title}${badge}"
 
-    local formatted_data=""
-    local line comp st
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        comp="${line%% | *}"
-        st="${line#* | }"
-        st="${st//|/-}"
-        if (( ${#st} > 42 )); then
-            st="${st:0:41}…"
-        fi
-        formatted_data+="$comp | $st\n"
-    done <<< "$(echo -e -n "$data")"
+        local formatted_data=""
+        local line comp st
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            comp="${line%% | *}"
+            st="${line#* | }"
+            st="${st//|/-}"
+            if (( ${#st} > 42 )); then
+                st="${st:0:41}…"
+            fi
+            formatted_data+="$comp | $st\n"
+        done <<< "$(echo -e -n "$data")"
 
-    echo -e -n "$formatted_data" |
-        gum table \
-            -p \
-            -c "$col1,$col2" \
-            -s "|" \
-            --border rounded
+        echo -e -n "$formatted_data" |
+            gum table \
+                -p \
+                -c "$col1,$col2" \
+                -s "|" \
+                --border rounded
+    else
+        echo ""
+        echo "=== ${title}${badge} ==="
+        local line comp st
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            comp="${line%% | *}"
+            st="${line#* | }"
+            printf "  %-30s : %s\n" "$comp" "$st"
+        done <<< "$(echo -e -n "$data")"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -266,7 +417,7 @@ collect_system_snapshot() {
     : > "$LOG_FILE"
 
     log "============================================================"
-    log "EOS CLEANER REPORT"
+    log "ARCH SYSTEM HEALTH & AUDIT REPORT"
     log "============================================================"
     log "Version: $VERSION"
     log "Run ID: $RUN_ID"
@@ -300,7 +451,7 @@ refresh_state_snapshot() {
 
     spinner "Refreshing system state snapshot..." bash -c "
         {
-            echo '=== EOS SOFTWARE STATE SNAPSHOT ==='
+            echo '=== SYSTEM SOFTWARE STATE SNAPSHOT ==='
             echo \"Generated on: ${ts}\"
             echo ''
             echo '--- 1. Kernel Information ---'
@@ -409,7 +560,7 @@ run_maintenance() {
         log "MAINTENANCE thumbnails=cleaned"
     fi
 
-    if [[ "$mode" == "Deep Clean & Health" ]]; then
+    if [[ "$mode" == *"Deep Clean"* ]]; then
         section "DEEP CLEAN"
 
         rm -rf -- \
@@ -570,6 +721,41 @@ check_reboot_pending() {
     fi
 }
 
+check_previous_boot() {
+    if ! journalctl -b -1 -n 1 &>/dev/null; then
+        add_row "Previous session shutdown" "INFO ℹ (no previous boot record)"
+        log "HEALTH previous_boot=INFO no_record"
+        return
+    fi
+
+    local journal_unclean fsck_recovery last_shutdown
+    journal_unclean="$(journalctl -b 0 -u systemd-journald --no-pager 2>/dev/null | grep -im 1 "corrupted or uncleanly shut down" || true)"
+    fsck_recovery="$(journalctl -b 0 -u "systemd-fsck*" --no-pager 2>/dev/null | grep -im 1 -E "recovering journal|dirty bit is set" || true)"
+    last_shutdown="$(journalctl -b -1 -n 50 --no-pager 2>/dev/null | grep -m 1 -E "systemd-shutdown|Reached target (System Reboot|System Power Off|System Shutdown)" || true)"
+
+    if [[ -n "$journal_unclean" || -n "$fsck_recovery" || -z "$last_shutdown" ]]; then
+        add_row "Previous session shutdown" "WARN ⚠ (unclean shutdown / crash detected)"
+        ((WARNINGS++))
+        log "HEALTH previous_boot=WARN unclean=YES"
+        {
+            echo "### PREVIOUS BOOT / SHUTDOWN INTEGRITY"
+            if [[ -z "$last_shutdown" ]]; then
+                echo "Warning: Previous boot (-1) ended abruptly without a clean systemd shutdown sequence."
+            fi
+            if [[ -n "$journal_unclean" ]]; then
+                echo "Journald notice: $journal_unclean"
+            fi
+            if [[ -n "$fsck_recovery" ]]; then
+                echo "Filesystem recovery on boot: $fsck_recovery"
+            fi
+            echo ""
+        } >> "$LOG_FILE"
+    else
+        add_row "Previous session shutdown" "PASS ✔ (clean shutdown)"
+        log "HEALTH previous_boot=PASS"
+    fi
+}
+
 check_gpu() {
     local vga_info drivers="" driver_list="" gpu_name="GPU"
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
@@ -602,6 +788,44 @@ check_gpu() {
         add_row "GPU runtime" "WARN ⚠ (No kernel driver in use)"
         ((WARNINGS++))
         log "HEALTH gpu=WARN no_kernel_driver"
+    fi
+}
+
+check_gpu_errors() {
+    local xorg_log="/var/log/Xorg.0.log"
+    [[ ! -f "$xorg_log" && -f "$HOME/.local/share/xorg/Xorg.0.log" ]] && xorg_log="$HOME/.local/share/xorg/Xorg.0.log"
+
+    local fliplock_count=0
+    if [[ -f "$xorg_log" ]]; then
+        fliplock_count="$(grep -a -c "Failed to request fliplock" "$xorg_log" 2>/dev/null || true)"
+        fliplock_count="${fliplock_count:-0}"
+    fi
+
+    local nv_xid
+    nv_xid="$(journalctl -b 0 -k --no-pager 2>/dev/null | grep -im 1 "NVRM: Xid" || true)"
+
+    if [[ -n "$nv_xid" ]]; then
+        add_row "GPU errors & lockups" "WARN ⚠ (NVIDIA Xid error in dmesg)"
+        ((WARNINGS++))
+        log "HEALTH gpu_errors=WARN xid=YES"
+        {
+            echo "### GPU HARDWARE / DRIVER ERRORS"
+            echo "NVIDIA Xid error detected in kernel log: $nv_xid"
+            echo ""
+        } >> "$LOG_FILE"
+    elif (( fliplock_count > 0 )); then
+        add_row "GPU errors & lockups" "WARN ⚠ ($fliplock_count fliplock failures in Xorg)"
+        ((WARNINGS++))
+        log "HEALTH gpu_errors=WARN fliplock_count=$fliplock_count"
+        {
+            echo "### GPU HARDWARE / DRIVER ERRORS"
+            echo "Xorg fliplock failures detected ($fliplock_count occurrences in $xorg_log)."
+            echo "This indicates display buffer flip stalls between driver and display server."
+            echo ""
+        } >> "$LOG_FILE"
+    else
+        add_row "GPU errors & lockups" "PASS ✔ (no Xid or fliplock stalls)"
+        log "HEALTH gpu_errors=PASS"
     fi
 }
 
@@ -683,14 +907,16 @@ check_smart() {
         return
     fi
 
-    local failed=0 passed=0 total="${#disks[@]}"
+    local failed=0 passed=0 no_perm=0 total="${#disks[@]}"
     for dev in "${disks[@]}"; do
         local result
-        result="$(sudo smartctl -H "$dev" 2>&1 || true)"
+        result="$(sudo -n smartctl -H "$dev" 2>&1 || smartctl -H "$dev" 2>&1 || true)"
         if printf '%s\n' "$result" | grep -qiE 'PASSED|test result: ok'; then
             (( passed++ ))
         elif printf '%s\n' "$result" | grep -qiE 'FAILED!'; then
             (( failed++ ))
+        elif printf '%s\n' "$result" | grep -qiE 'Permission denied|password is required'; then
+            (( no_perm++ ))
         fi
     done
 
@@ -698,6 +924,10 @@ check_smart() {
         add_row "SMART disk health" "FAIL ✖ ($failed/$total disk(s) failed)"
         ((ERRORS++))
         log "HEALTH smart=FAIL failed=$failed"
+    elif (( no_perm == total )); then
+        add_row "SMART disk health" "INFO ℹ (root required)"
+        ((INFO_COUNT++))
+        log "HEALTH smart=INFO root_required"
     else
         add_row "SMART disk health" "PASS ✔ ($passed/$total OK)"
         log "HEALTH smart=PASS passed=$passed"
@@ -781,6 +1011,33 @@ check_failed_services() {
     fi
 }
 
+check_sysrq() {
+    local sysrq_val="?"
+    if [[ -f /proc/sys/kernel/sysrq ]]; then
+        sysrq_val="$(< /proc/sys/kernel/sysrq)"
+    fi
+
+    if [[ "$sysrq_val" == "1" ]]; then
+        add_row "Magic SysRq keys" "PASS ✔ (full emergency control enabled)"
+        log "HEALTH sysrq=PASS val=1"
+    elif [[ "$sysrq_val" == "0" ]]; then
+        add_row "Magic SysRq keys" "WARN ⚠ (disabled: no emergency recovery)"
+        ((WARNINGS++))
+        log "HEALTH sysrq=WARN val=0"
+    else
+        add_row "Magic SysRq keys" "WARN ⚠ (restricted: val=$sysrq_val, REISUB disabled)"
+        ((WARNINGS++))
+        log "HEALTH sysrq=WARN val=$sysrq_val"
+        {
+            echo "### MAGIC SYSRQ RESTRICTION"
+            echo "Current /proc/sys/kernel/sysrq value: $sysrq_val"
+            echo "Emergency recovery (REISUB) and display unlock (Alt+SysRq+K) are disabled."
+            echo "To enable emergency protection: echo 'kernel.sysrq = 1' | sudo tee /etc/sysctl.d/99-sysrq.conf"
+            echo ""
+        } >> "$LOG_FILE"
+    fi
+}
+
 check_pacman_lock() {
     if [[ ! -e /var/lib/pacman/db.lck ]]; then
         add_row "Pacman DB lock" "PASS ✔"
@@ -788,7 +1045,7 @@ check_pacman_lock() {
         return
     fi
 
-    if sudo fuser /var/lib/pacman/db.lck &>/dev/null || pgrep -x pacman &>/dev/null; then
+    if (sudo -n fuser /var/lib/pacman/db.lck 2>/dev/null || fuser /var/lib/pacman/db.lck 2>/dev/null || pgrep -x pacman &>/dev/null); then
         add_row "Pacman DB lock" "INFO ℹ (pacman is using it)"
         ((INFO_COUNT++))
         log "HEALTH pacman_lock=ACTIVE"
@@ -800,9 +1057,15 @@ check_pacman_lock() {
 }
 
 check_package_integrity() {
+    if [[ "${SKIP_INTEGRITY:-0}" == "1" ]]; then
+        add_row "Package file integrity" "INFO ℹ (skipped via config)"
+        log "HEALTH package_integrity=SKIPPED"
+        return
+    fi
+
     local integrity_file="$RUN_RAW/pacman-integrity.txt"
     spinner "Checking package file integrity (pacman -Qk)..." \
-        bash -c 'sudo pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+        bash -c 'sudo -n pacman -Qk > "$1" 2>&1 || pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
     PACMAN_INTEGRITY_TEXT="$(cat "$integrity_file" 2>/dev/null || true)"
 
     local problems
@@ -852,22 +1115,31 @@ check_dns() {
         return
     fi
 
+    local test_host="${DNS_TEST_HOST:-archlinux.org}"
+    local dig_cmd=(dig)
+    if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+        dig_cmd+=("@${DNS_TEST_SERVER}")
+    fi
+    dig_cmd+=("$test_host" "+time=2" "+tries=1")
+
     local dig_out qtime_num
-    dig_out="$(dig archlinux.org +time=2 +tries=1 2>&1)"
+    dig_out="$("${dig_cmd[@]}" 2>&1)"
     printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
 
     if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
         add_row "System DNS" "WARN ⚠ (query failed or NOERROR not received)"
         ((WARNINGS++))
-        log "HEALTH dns=WARN resolution_failed"
+        log "HEALTH dns=WARN resolution_failed host=$test_host"
         return
     fi
 
     qtime_num="$(printf '%s\n' "$dig_out" | grep -oE 'Query time: [0-9]+' | grep -oE '[0-9]+')"
     qtime_num="${qtime_num:-?}"
 
-    add_row "System DNS" "PASS ✔ (${qtime_num}ms)"
-    log "HEALTH dns=PASS qtime=${qtime_num}ms"
+    local server_note=""
+    [[ -n "${DNS_TEST_SERVER:-}" ]] && server_note=" @${DNS_TEST_SERVER}"
+    add_row "System DNS" "PASS ✔ (${qtime_num}ms${server_note})"
+    log "HEALTH dns=PASS qtime=${qtime_num}ms host=$test_host"
 }
 
 check_updates() {
@@ -919,8 +1191,8 @@ check_updates() {
 
 check_mirrorlist_age() {
     local arch_file="/etc/pacman.d/mirrorlist"
-    local eos_file="/etc/pacman.d/endeavouros-mirrorlist"
-    local now arch_days="?" eos_days="?"
+    local distro_file="/etc/pacman.d/endeavouros-mirrorlist"
+    local now arch_days="?" distro_days="?"
     now=$(date +%s)
 
     if [[ -f "$arch_file" ]]; then
@@ -931,15 +1203,15 @@ check_mirrorlist_age() {
         fi
     fi
 
-    if [[ -f "$eos_file" ]]; then
-        local eos_mtime
-        eos_mtime="$(stat -c %Y "$eos_file" 2>/dev/null || echo 0)"
-        if (( eos_mtime > 0 )); then
-            eos_days=$(( (now - eos_mtime) / 86400 ))
+    if [[ -f "$distro_file" ]]; then
+        local distro_mtime
+        distro_mtime="$(stat -c %Y "$distro_file" 2>/dev/null || echo 0)"
+        if (( distro_mtime > 0 )); then
+            distro_days=$(( (now - distro_mtime) / 86400 ))
         fi
     fi
 
-    if [[ "$arch_days" == "?" && "$eos_days" == "?" ]]; then
+    if [[ "$arch_days" == "?" && "$distro_days" == "?" ]]; then
         add_row "Mirrorlist age" "WARN ⚠ (mirrorlists missing)"
         ((WARNINGS++))
         log "HEALTH mirrorlist_age=WARN missing_both"
@@ -948,11 +1220,11 @@ check_mirrorlist_age() {
 
     local max_days=0
     [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
-    [[ "$eos_days" =~ ^[0-9]+$ ]] && (( eos_days > max_days )) && max_days=$eos_days
+    [[ "$distro_days" =~ ^[0-9]+$ ]] && (( distro_days > max_days )) && max_days=$distro_days
 
     local status_label=""
-    if [[ -f "$eos_file" ]]; then
-        status_label="Arch: ${arch_days}d │ EOS: ${eos_days}d"
+    if [[ -f "$distro_file" ]]; then
+        status_label="Arch: ${arch_days}d │ Distro: ${distro_days}d"
     else
         status_label="Arch: ${arch_days}d"
     fi
@@ -960,14 +1232,14 @@ check_mirrorlist_age() {
     if (( max_days > 90 )); then
         add_row "Mirrorlist age" "WARN ⚠ ($status_label)"
         ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN arch_days=$arch_days eos_days=$eos_days max_days=$max_days"
+        log "HEALTH mirrorlist_age=WARN arch_days=$arch_days distro_days=$distro_days max_days=$max_days"
     elif (( max_days > 45 )); then
         add_row "Mirrorlist age" "INFO ℹ ($status_label)"
         ((INFO_COUNT++))
-        log "HEALTH mirrorlist_age=INFO arch_days=$arch_days eos_days=$eos_days"
+        log "HEALTH mirrorlist_age=INFO arch_days=$arch_days distro_days=$distro_days"
     else
         add_row "Mirrorlist age" "PASS ✔ ($status_label)"
-        log "HEALTH mirrorlist_age=PASS arch_days=$arch_days eos_days=$eos_days"
+        log "HEALTH mirrorlist_age=PASS arch_days=$arch_days distro_days=$distro_days"
     fi
 }
 
@@ -1081,7 +1353,7 @@ check_arch_audit() {
             echo "ACTIONABLE SECURITY UPDATES AVAILABLE IN REPOS:"
             printf '%s\n' "$ARCH_AUDIT_ACTIONABLE"
             echo ""
-            echo "Recommendation: Run 'eos-update' or 'sudo pacman -Syu' to apply security updates."
+            echo "Recommendation: Run 'sudo pacman -Syu' (or distro update helper) to apply security updates."
             echo ""
         else
             echo "No pending security package upgrades found in official repositories."
@@ -1211,8 +1483,10 @@ run_health_check() {
     check_initramfs "$(uname -r)"
     check_efi_mount
     check_reboot_pending
+    check_previous_boot
 
     check_gpu
+    check_gpu_errors
     check_dkms
     check_temperature
     check_smart
@@ -1220,6 +1494,7 @@ run_health_check() {
 
     check_root_space
     check_failed_services
+    check_sysrq
     check_pacman_lock
     check_package_integrity
     check_pacnew
@@ -1246,32 +1521,43 @@ run_health_check() {
     fi
 
     echo ""
-    if (( ERRORS == 0 && WARNINGS == 0 )); then
-        gum style \
-            --foreground 82 \
-            --border double \
-            --align center \
-            --width 68 \
-            "SYSTEM HEALTH: ALL CLEAR ✔"
-    elif (( ERRORS == 0 )); then
-        gum style \
-            --foreground 214 \
-            --border double \
-            --align center \
-            --width 68 \
-            "SYSTEM HEALTH: REVIEW WARNINGS ⚠"
-    else
-        gum style \
-            --foreground 196 \
-            --border double \
-            --align center \
-            --width 68 \
-            "SYSTEM HEALTH: ACTION REQUIRED ✖"
-    fi
+    if [[ -t 1 ]] && command -v gum &>/dev/null; then
+        if (( ERRORS == 0 && WARNINGS == 0 )); then
+            gum style \
+                --foreground 82 \
+                --border double \
+                --align center \
+                --width 68 \
+                "SYSTEM HEALTH: ALL CLEAR ✔"
+        elif (( ERRORS == 0 )); then
+            gum style \
+                --foreground 214 \
+                --border double \
+                --align center \
+                --width 68 \
+                "SYSTEM HEALTH: REVIEW WARNINGS ⚠"
+        else
+            gum style \
+                --foreground 196 \
+                --border double \
+                --align center \
+                --width 68 \
+                "SYSTEM HEALTH: ACTION REQUIRED ✖"
+        fi
 
-    echo ""
-    gum style --foreground 244 \
-        "Report: $LOG_FILE"
+        echo ""
+        gum style --foreground 244 \
+            "Report: $LOG_FILE"
+    else
+        if (( ERRORS == 0 && WARNINGS == 0 )); then
+            echo "SYSTEM HEALTH: ALL CLEAR ✔"
+        elif (( ERRORS == 0 )); then
+            echo "SYSTEM HEALTH: REVIEW WARNINGS ⚠"
+        else
+            echo "SYSTEM HEALTH: ACTION REQUIRED ✖"
+        fi
+        echo "Report: $LOG_FILE"
+    fi
 }
 
 show_report() {
@@ -1291,19 +1577,25 @@ show_report() {
 show_ai_prompt() {
     section "AI AGENT HANDOFF"
 
-    cat <<EOF
-$(gum style --foreground 81 "The following prompt can be pasted into your AI coding assistant:")
+    local intro="The following prompt can be pasted into your AI coding assistant (Goose, Claude, ChatGPT, etc.):"
+    if [[ -t 1 ]] && command -v gum &>/dev/null; then
+        gum style --foreground 81 "$intro"
+    else
+        echo "$intro"
+    fi
 
-Read the EOS Cleaner state summary at:
+    cat <<EOF
+
+Read the System Health state summary at:
 $SUMMARY_FILE
 
 Additional system snapshot details at:
 $STATE_SNAPSHOT
 
-Detailed error logs (if any warnings exist) are available at:
+Detailed logs and health findings:
 $LOG_FILE
 
-Analyze the report conservatively and suggest solutions. Do NOT execute system-breaking commands without asking first.
+Analyze the report conservatively. Prioritize system boot stability and core Arch packages. Do NOT execute system-breaking commands without asking first.
 EOF
 }
 
@@ -1325,6 +1617,33 @@ live_monitor() {
 }
 
 # ------------------------------------------------------------------------------
+# Non-interactive execution entry points
+# ------------------------------------------------------------------------------
+
+if [[ "$ACTION" == "maintenance" ]]; then
+    run_maintenance "Safe Maintenance"
+    run_health_check
+    if (( ERRORS > 0 )); then
+        exit 1
+    elif (( WARNINGS > 0 )); then
+        exit 2
+    else
+        exit 0
+    fi
+fi
+
+if [[ "$ACTION" == "audit" ]]; then
+    run_health_check
+    if (( ERRORS > 0 )); then
+        exit 1
+    elif (( WARNINGS > 0 )); then
+        exit 2
+    else
+        exit 0
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # Main menu
 # ------------------------------------------------------------------------------
 
@@ -1333,55 +1652,55 @@ while true; do
 
     MODE="$(
         gum choose \
-            --header "What would you like to do?" \
-            "Standard Clean & Health" \
-            "Deep Clean & Health" \
-            "Health Check Only" \
-            "View Last Report" \
-            "AI Agent Handoff" \
-            "Live Monitor" \
-            "Exit"
+            --header "Select action:" \
+            "1. System Health Audit (Read-Only)" \
+            "2. AI Agent Handoff & Summary" \
+            "3. View Latest Audit Report" \
+            "4. Safe Maintenance & Health Audit" \
+            "5. Deep Clean (Trash & Browser Caches)" \
+            "6. Live System Monitor" \
+            "7. Exit"
     )"
 
     case "$MODE" in
-        "Standard Clean & Health")
-            ui_screen "Standard Clean & Health"
-            run_maintenance "$MODE"
+        "1. System Health Audit (Read-Only)")
+            ui_screen "System Health Audit"
             run_health_check
             pause_screen
             ;;
-        "Deep Clean & Health")
-            ui_screen "Deep Clean & Health"
+        "2. AI Agent Handoff & Summary")
+            ui_screen "AI Agent Handoff"
+            show_ai_prompt
+            pause_screen
+            ;;
+        "3. View Latest Audit Report")
+            ui_screen "Latest Audit Report"
+            show_report
+            pause_screen
+            ;;
+        "4. Safe Maintenance & Health Audit")
+            ui_screen "Safe Maintenance & Health Audit"
+            run_maintenance "Safe Maintenance"
+            run_health_check
+            pause_screen
+            ;;
+        "5. Deep Clean (Trash & Browser Caches)")
+            ui_screen "Deep Clean"
             gum style --foreground 214 \
-                "Deep clean also empties Trash, browser caches, and coredumps."
+                "Deep clean empties Desktop Trash, browser caches (cache2), and coredumps."
             if gum confirm "Continue with deep clean?"; then
-                run_maintenance "$MODE"
+                run_maintenance "Deep Clean"
                 run_health_check
             else
                 info "Deep clean cancelled — nothing was changed."
             fi
             pause_screen
             ;;
-        "Health Check Only")
-            ui_screen "Health Check Only"
-            run_health_check
-            pause_screen
-            ;;
-        "View Last Report")
-            ui_screen "View Last Report"
-            show_report
-            pause_screen
-            ;;
-        "AI Agent Handoff")
-            ui_screen "AI Agent Handoff"
-            show_ai_prompt
-            pause_screen
-            ;;
-        "Live Monitor")
-            ui_screen "Live Monitor"
+        "6. Live System Monitor")
+            ui_screen "Live System Monitor"
             live_monitor
             ;;
-        "Exit")
+        "7. Exit")
             clear
             exit 0
             ;;
