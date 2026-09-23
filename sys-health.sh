@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.8
+# Arch System Health & Diagnostics v2.9
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.8"
+VERSION="2.9"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -21,7 +21,9 @@ mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 # User configuration (optional)
 # ------------------------------------------------------------------------------
 
-CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/system-health/system-health.conf"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/sys-health/sys-health.conf"
+[[ ! -f "$CONFIG_FILE" ]] && CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/system-health/system-health.conf"
+[[ ! -f "$CONFIG_FILE" ]] && CONFIG_FILE="$HOME/.config/sys-health.conf"
 [[ ! -f "$CONFIG_FILE" ]] && CONFIG_FILE="$HOME/.config/system-health.conf"
 if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck source=/dev/null
@@ -195,23 +197,26 @@ fi
 # UI
 # ------------------------------------------------------------------------------
 
+UI_CARD_WIDTH=85
+
 ui_title() {
     clear
-    if command -v figlet &>/dev/null && command -v lolcat &>/dev/null; then
-        figlet -f standard "SYS HEALTH" | lolcat
+    if command -v figlet &>/dev/null; then
+        printf "\033[38;5;214;1m%s\033[0m\n" "$(figlet -f standard -c -w "$UI_CARD_WIDTH" "SYS HEALTH")"
     else
         gum style \
             --foreground 214 \
             --border double \
             --align center \
-            --width 68 \
-            "ARCH SYSTEM HEALTH & AUDIT"
+            --width "$UI_CARD_WIDTH" \
+            --padding "0 1" \
+            "SYS HEALTH  ›  Control Panel"
     fi
 
     gum style \
         --foreground 244 \
         --align center \
-        --width 68 \
+        --width "$UI_CARD_WIDTH" \
         "Diagnostics • Health Audit • AI Handoff  |  v$VERSION"
 
     echo ""
@@ -222,19 +227,51 @@ ui_title() {
     gum style \
         --foreground 81 \
         --border rounded \
+        --border-foreground 240 \
         --padding "0 2" \
-        --width 68 \
+        --width "$UI_CARD_WIDTH" \
         --align center \
-        "kernel: $_kern   uptime: $_up   /: $_disk"
+        "kernel: $_kern   •   uptime: $_up   •   root: $_disk"
 
-    if [[ -n "$PREVIOUS_RUN_SUMMARY" ]]; then
+    if [[ -f "$SUMMARY_FILE" ]] && command -v jq &>/dev/null; then
+        local st errs warns
+        st="$(jq -r '.status // empty' "$SUMMARY_FILE" 2>/dev/null || true)"
+        errs="$(jq -r '.counts.errors // 0' "$SUMMARY_FILE" 2>/dev/null || echo 0)"
+        warns="$(jq -r '.counts.warnings // 0' "$SUMMARY_FILE" 2>/dev/null || echo 0)"
+        if [[ "$st" == "ALL_CLEAR" ]]; then
+            gum style \
+                --foreground 82 \
+                --align center \
+                --width "$UI_CARD_WIDTH" \
+                "Last audit: ALL CLEAR ✔ (0 errors, 0 warnings)"
+        elif [[ "$st" == "ACTION_REQUIRED" ]]; then
+            gum style \
+                --foreground 196 \
+                --align center \
+                --width "$UI_CARD_WIDTH" \
+                "Last audit: ACTION REQUIRED ✖ ($errs errors, $warns warnings)"
+        elif [[ "$st" == "REVIEW_WARNINGS" ]]; then
+            gum style \
+                --foreground 214 \
+                --align center \
+                --width "$UI_CARD_WIDTH" \
+                "Last audit: REVIEW WARNINGS ⚠ ($errs errors, $warns warnings)"
+        fi
+    elif [[ -n "$PREVIOUS_RUN_SUMMARY" ]]; then
         gum style \
             --foreground 244 \
             --align center \
-            --width 68 \
+            --width "$UI_CARD_WIDTH" \
             "Last run: ${PREVIOUS_RUN_SUMMARY#Summary: }"
     fi
+
     echo ""
+    gum style \
+        --foreground 214 \
+        --border rounded \
+        --padding "0 1" \
+        --bold \
+        "AVAILABLE ACTIONS"
 }
 
 ui_screen() {
@@ -243,9 +280,9 @@ ui_screen() {
         --foreground 214 \
         --border double \
         --align center \
-        --width 68 \
+        --width "$UI_CARD_WIDTH" \
         --padding "0 1" \
-        "SYSTEM HEALTH  ›  $1"
+        "SYS HEALTH  ›  $1"
     echo ""
 }
 
@@ -330,7 +367,7 @@ add_row() {
             "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys")
                 sec="SYS"
                 ;;
-            "System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
+            "Network link & Gateway"*|"System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
                 sec="NET"
                 ;;
             *)
@@ -353,49 +390,94 @@ add_row() {
 render_audit_section() {
     local title="$1"
     local data="$2"
-    local col1 col2 badge=" ✔" header_color=82
+    local badge=" ✔"
+    local hdr_color=$'\033[38;5;82;1m'
 
     [[ -z "$data" ]] && return
 
-    col1=$(printf "%-28s" "Component")
-    col2=$(printf "%-42s" "Status")
-
-    if grep -q "FAIL ✖" <<< "$data"; then
-        header_color=196
+    if [[ "$data" =~ "FAIL ✖" ]]; then
+        hdr_color=$'\033[38;5;196;1m'
         badge=" ✖"
-    elif grep -q "WARN ⚠" <<< "$data"; then
-        header_color=214
+    elif [[ "$data" =~ "WARN ⚠" ]]; then
+        hdr_color=$'\033[38;5;214;1m'
         badge=" ⚠"
     fi
 
-    if [[ -t 1 ]] && command -v gum &>/dev/null; then
-        echo ""
-        gum style \
-            --foreground "$header_color" \
-            --border rounded \
-            --padding "0 1" \
-            --bold \
-            "${title}${badge}"
+    if [[ -t 1 ]]; then
+        local comp_w=28
+        local stat_w=50
+        local c_reset=$'\033[0m'
+        local c_border=$'\033[38;5;240m'
+        local c_comp=$'\033[38;5;255m'
+        local c_pass=$'\033[38;5;81;1m'
+        local c_warn=$'\033[38;5;214;1m'
+        local c_fail=$'\033[38;5;196;1m'
+        local c_info=$'\033[38;5;117m'
+        local c_dim=$'\033[38;5;250m'
 
-        local formatted_data=""
+        local h1="──────────────────────────────"  # 30 chars (comp_w + 2)
+        local h2="────────────────────────────────────────────────────" # 52 chars (stat_w + 2)
+
+        local hdr_left="${title}${badge}"
+        local hdr_right="STATUS"
+
+        local pad_h1_len=$((comp_w - ${#hdr_left}))
+        local pad_h2_len=$((stat_w - ${#hdr_right}))
+        local pad_h1="" pad_h2=""
+        (( pad_h1_len > 0 )) && pad_h1=$(printf "%*s" "$pad_h1_len" "")
+        (( pad_h2_len > 0 )) && pad_h2=$(printf "%*s" "$pad_h2_len" "")
+
+        echo ""
+        printf "%s╭%s┬%s╮%s\n" "$c_border" "$h1" "$h2" "$c_reset"
+        printf "%s│ %s%s%s %s│ %s%s%s %s│%s\n" \
+            "$c_border" "$hdr_color" "$hdr_left" "$pad_h1" \
+            "$c_border" "$hdr_color" "$hdr_right" "$pad_h2" \
+            "$c_border" "$c_reset"
+        printf "%s├%s┼%s┤%s\n" "$c_border" "$h1" "$h2" "$c_reset"
+
         local line comp st
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             comp="${line%% | *}"
             st="${line#* | }"
             st="${st//|/-}"
-            if (( ${#st} > 42 )); then
-                st="${st:0:41}…"
+            if (( ${#st} > stat_w )); then
+                st="${st:0:$((stat_w - 1))}…"
             fi
-            formatted_data+="$comp | $st\n"
+
+            local pad_c_len=$((comp_w - ${#comp}))
+            local pad_s_len=$((stat_w - ${#st}))
+            local pad_c="" pad_s=""
+            (( pad_c_len > 0 )) && pad_c=$(printf "%*s" "$pad_c_len" "")
+            (( pad_s_len > 0 )) && pad_s=$(printf "%*s" "$pad_s_len" "")
+
+            local st_disp=""
+            if [[ "$st" == *"FAIL ✖"* ]]; then
+                st_disp="${c_fail}${st}${c_reset}"
+            elif [[ "$st" == *"WARN ⚠"* ]]; then
+                st_disp="${c_warn}${st}${c_reset}"
+            elif [[ "$st" == "PASS ✔"* ]]; then
+                local rest="${st#PASS ✔}"
+                st_disp="${c_pass}PASS ✔${c_reset}${c_dim}${rest}${c_reset}"
+            elif [[ "$st" == "INFO"* ]]; then
+                local pfx="INFO ℹ"
+                local rest="${st#INFO ℹ}"
+                if [[ "$st" == "INFO i"* ]]; then
+                    pfx="INFO i"
+                    rest="${st#INFO i}"
+                fi
+                st_disp="${c_info}${pfx}${c_reset}${c_dim}${rest}${c_reset}"
+            else
+                st_disp="${c_comp}${st}${c_reset}"
+            fi
+
+            printf "%s│ %s%s%s %s│ %s%s %s│%s\n" \
+                "$c_border" "$c_comp" "$comp" "$pad_c" \
+                "$c_border" "$st_disp" "$pad_s" \
+                "$c_border" "$c_reset"
         done <<< "$(echo -e -n "$data")"
 
-        echo -e -n "$formatted_data" |
-            gum table \
-                -p \
-                -c "$col1,$col2" \
-                -s "|" \
-                --border rounded
+        printf "%s╰%s┴%s╯%s\n" "$c_border" "$h1" "$h2" "$c_reset"
     else
         echo ""
         echo "=== ${title}${badge} ==="
@@ -804,6 +886,8 @@ check_gpu_errors() {
     local nv_xid
     nv_xid="$(journalctl -b 0 -k --no-pager 2>/dev/null | grep -im 1 "NVRM: Xid" || true)"
 
+    local fliplock_threshold="${FLIPLOCK_WARN_THRESHOLD:-10}"
+
     if [[ -n "$nv_xid" ]]; then
         add_row "GPU errors & lockups" "WARN ⚠ (NVIDIA Xid error in dmesg)"
         ((WARNINGS++))
@@ -813,14 +897,22 @@ check_gpu_errors() {
             echo "NVIDIA Xid error detected in kernel log: $nv_xid"
             echo ""
         } >> "$LOG_FILE"
-    elif (( fliplock_count > 0 )); then
+    elif (( fliplock_count > fliplock_threshold )); then
         add_row "GPU errors & lockups" "WARN ⚠ ($fliplock_count fliplock failures in Xorg)"
         ((WARNINGS++))
         log "HEALTH gpu_errors=WARN fliplock_count=$fliplock_count"
         {
             echo "### GPU HARDWARE / DRIVER ERRORS"
-            echo "Xorg fliplock failures detected ($fliplock_count occurrences in $xorg_log)."
+            echo "Xorg fliplock failures detected ($fliplock_count occurrences in $xorg_log, threshold > $fliplock_threshold)."
             echo "This indicates display buffer flip stalls between driver and display server."
+            echo ""
+        } >> "$LOG_FILE"
+    elif (( fliplock_count > 0 )); then
+        add_row "GPU errors & lockups" "PASS ✔ (no Xid or severe stalls)"
+        log "HEALTH gpu_errors=PASS fliplock_count=$fliplock_count"
+        {
+            echo "### GPU HARDWARE / DRIVER LOG NOTE"
+            echo "Minor fliplock jitter detected in Xorg ($fliplock_count event(s) in $xorg_log), within normal desktop threshold (<=$fliplock_threshold)."
             echo ""
         } >> "$LOG_FILE"
     else
@@ -1105,6 +1197,111 @@ check_pacnew() {
             printf '%s\n' "$PACNEWS"
         } >> "$LOG_FILE"
     fi
+}
+
+check_network() {
+    if ! command -v ip &>/dev/null || ! command -v ping &>/dev/null; then
+        add_row "Network link & Gateway" "INFO ℹ (ip/ping missing)"
+        ((INFO_COUNT++))
+        log "HEALTH network=tools_missing"
+        return
+    fi
+
+    local dev gw
+    dev="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
+    gw="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+
+    if [[ -z "$dev" || -z "$gw" ]]; then
+        add_row "Network link & Gateway" "FAIL ✖ (no default route)"
+        ((ERRORS++))
+        log "HEALTH network=FAIL default_route_missing"
+        return
+    fi
+
+    local operstate
+    operstate="$(cat "/sys/class/net/$dev/operstate" 2>/dev/null || echo "unknown")"
+    if [[ "$operstate" != "up" ]]; then
+        add_row "Network link & Gateway" "FAIL ✖ ($dev state: $operstate)"
+        ((ERRORS++))
+        log "HEALTH network=FAIL iface=$dev operstate=$operstate"
+        return
+    fi
+
+    local rx_err tx_err rx_crc total_err
+    rx_err="$(cat "/sys/class/net/$dev/statistics/rx_errors" 2>/dev/null || echo 0)"
+    tx_err="$(cat "/sys/class/net/$dev/statistics/tx_errors" 2>/dev/null || echo 0)"
+    rx_crc="$(cat "/sys/class/net/$dev/statistics/rx_crc_errors" 2>/dev/null || echo 0)"
+    total_err=$(( rx_err + tx_err + rx_crc ))
+
+    local speed speed_str=""
+    speed="$(cat "/sys/class/net/$dev/speed" 2>/dev/null || echo "")"
+    if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ ]]; then
+        if (( speed >= 1000 )); then
+            if (( speed % 1000 == 0 )); then
+                speed_str="$(( speed / 1000 ))Gb/s, "
+            else
+                speed_str="$(awk "BEGIN {printf \"%.1fGb/s, \", $speed/1000}")"
+            fi
+        else
+            speed_str="${speed}Mb/s, "
+        fi
+    fi
+
+    local ping_out ping_ms
+    ping_out="$(ping -c 1 -W 1 "$gw" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+        add_row "Network link & Gateway" "FAIL ✖ (gateway $gw unreachable)"
+        ((ERRORS++))
+        log "HEALTH network=FAIL iface=$dev gateway=$gw ping=unreachable"
+        return
+    fi
+    ping_ms="$(printf '%s\n' "$ping_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
+    if [[ -n "$ping_ms" ]]; then
+        ping_ms="$(awk "BEGIN {printf \"%.1f\", $ping_ms}" 2>/dev/null || echo "$ping_ms")"
+    else
+        ping_ms="<1"
+    fi
+
+    local gw6 ping6_ms=""
+    gw6="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+    if [[ -n "$gw6" ]]; then
+        local ping6_out
+        if ping6_out="$(ping -6 -c 1 -W 1 "$gw6" 2>&1)"; then
+            ping6_ms="$(printf '%s\n' "$ping6_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
+            ping6_ms="${ping6_ms:-<1}"
+        else
+            add_row "Network link & Gateway" "WARN ⚠ ($dev: IPv6 gw unreachable)"
+            ((WARNINGS++))
+            log "HEALTH network=WARN iface=$dev gw6=$gw6 ping6=unreachable"
+            return
+        fi
+    fi
+
+    if ! ip link show AirVPN &>/dev/null && grep -q '10.128.0.1' /etc/resolv.conf 2>/dev/null; then
+        add_row "Network link & Gateway" "WARN ⚠ (orphan VPN DNS in resolv.conf)"
+        ((WARNINGS++))
+        log "HEALTH network=WARN orphan_vpn_dns=10.128.0.1"
+        return
+    fi
+
+    if (( total_err > 0 )); then
+        add_row "Network link & Gateway" "WARN ⚠ ($dev: $total_err NIC errors, gw: ${gw} ${ping_ms}ms)"
+        ((WARNINGS++))
+        log "HEALTH network=WARN iface=$dev speed=${speed}Mbps gateway=$gw ping=${ping_ms}ms errors=$total_err"
+        return
+    fi
+
+    if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 && speed <= 100 )); then
+        add_row "Network link & Gateway" "WARN ⚠ ($dev: degraded link speed ${speed}Mb/s)"
+        ((WARNINGS++))
+        log "HEALTH network=WARN iface=$dev degraded_speed=${speed}Mbps gateway=$gw"
+        return
+    fi
+
+    local ipv6_tag=""
+    [[ -n "$gw6" ]] && ipv6_tag=" +IPv6:${ping6_ms}ms"
+    add_row "Network link & Gateway" "PASS ✔ ($dev: ${speed_str}gw: ${gw} ${ping_ms}ms${ipv6_tag})"
+    log "HEALTH network=PASS iface=$dev speed=${speed}Mbps gateway=$gw ping=${ping_ms}ms errors=0"
 }
 
 check_dns() {
@@ -1463,7 +1660,9 @@ generate_summary_json() {
 }
 
 run_health_check() {
-    section "SYSTEM HEALTH AUDIT"
+    if [[ "$ACTION" != "interactive" ]]; then
+        section "SYS HEALTH AUDIT"
+    fi
 
     AUDIT_TABLE=""
     AUDIT_TABLE_BOOT=""
@@ -1499,6 +1698,7 @@ run_health_check() {
     check_package_integrity
     check_pacnew
 
+    check_network
     check_dns
     check_updates
     check_mirrorlist_age
@@ -1527,22 +1727,22 @@ run_health_check() {
                 --foreground 82 \
                 --border double \
                 --align center \
-                --width 68 \
-                "SYSTEM HEALTH: ALL CLEAR ✔"
+                --width "$UI_CARD_WIDTH" \
+                "SYS HEALTH: ALL CLEAR ✔"
         elif (( ERRORS == 0 )); then
             gum style \
                 --foreground 214 \
                 --border double \
                 --align center \
-                --width 68 \
-                "SYSTEM HEALTH: REVIEW WARNINGS ⚠"
+                --width "$UI_CARD_WIDTH" \
+                "SYS HEALTH: REVIEW WARNINGS ⚠"
         else
             gum style \
                 --foreground 196 \
                 --border double \
                 --align center \
-                --width 68 \
-                "SYSTEM HEALTH: ACTION REQUIRED ✖"
+                --width "$UI_CARD_WIDTH" \
+                "SYS HEALTH: ACTION REQUIRED ✖"
         fi
 
         echo ""
@@ -1550,11 +1750,11 @@ run_health_check() {
             "Report: $LOG_FILE"
     else
         if (( ERRORS == 0 && WARNINGS == 0 )); then
-            echo "SYSTEM HEALTH: ALL CLEAR ✔"
+            echo "SYS HEALTH: ALL CLEAR ✔"
         elif (( ERRORS == 0 )); then
-            echo "SYSTEM HEALTH: REVIEW WARNINGS ⚠"
+            echo "SYS HEALTH: REVIEW WARNINGS ⚠"
         else
-            echo "SYSTEM HEALTH: ACTION REQUIRED ✖"
+            echo "SYS HEALTH: ACTION REQUIRED ✖"
         fi
         echo "Report: $LOG_FILE"
     fi
@@ -1652,7 +1852,11 @@ while true; do
 
     MODE="$(
         gum choose \
-            --header "Select action:" \
+            --header="" \
+            --cursor="› " \
+            --cursor.foreground="81" \
+            --selected.foreground="81" \
+            --padding="0 1" \
             "1. System Health Audit (Read-Only)" \
             "2. AI Agent Handoff & Summary" \
             "3. View Latest Audit Report" \
@@ -1664,7 +1868,7 @@ while true; do
 
     case "$MODE" in
         "1. System Health Audit (Read-Only)")
-            ui_screen "System Health Audit"
+            ui_screen "Audit & Diagnostics"
             run_health_check
             pause_screen
             ;;
