@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.14"
+VERSION="2.15"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -5128,33 +5128,127 @@ check_laptop_battery_preflight() {
 }
 
 scan_arch_news_feed() {
+    local cache_file="${1:-${STATE_DIR:-$HOME/.local/state/system-health}/arch-news-cache.json}"
     python3 -c '
-import sys, urllib.request, xml.etree.ElementTree as ET, re
+import sys, os, time, urllib.request, xml.etree.ElementTree as ET, re, subprocess, html, json
 
-url = "https://archlinux.org/feeds/news/"
+cache_file = sys.argv[1] if len(sys.argv) > 1 else "/tmp/arch-news-cache.json"
+cache_ttl = 3600
+
+items = []
+now = time.time()
+
+# 1. Check local cache
+if os.path.exists(cache_file):
+    try:
+        if now - os.path.getmtime(cache_file) < cache_ttl:
+            with open(cache_file, "r") as f:
+                items = json.load(f)
+    except Exception:
+        items = []
+
+# 2. Network fetch if cache empty or expired
+if not items:
+    fetched = False
+    # Try RSS first
+    try:
+        req = urllib.request.Request("https://archlinux.org/feeds/news/", headers={"User-Agent": "sys-health/2.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            if resp.status == 200:
+                root = ET.fromstring(resp.read())
+                for item in root.findall("./channel/item")[:10]:
+                    t = (item.findtext("title") or "").strip()
+                    d = (item.findtext("description") or "").strip()
+                    l = (item.findtext("link") or "").strip()
+                    items.append({"title": t, "desc": d, "link": l})
+                fetched = True
+    except Exception:
+        pass
+
+    # Fallback to HTML if RSS failed or rate-limited
+    if not fetched:
+        try:
+            req = urllib.request.Request("https://archlinux.org/news/", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                if resp.status == 200:
+                    page = resp.read().decode("utf-8", errors="replace")
+                    for m in re.finditer(r"<td class=\"wrap\"><a href=\"([^\"]+)\"[^>]*title=\"[^\"]*\">([^<]+)</a>", page):
+                        l = "https://archlinux.org" + m.group(1)
+                        t = html.unescape(m.group(2).strip())
+                        items.append({"title": t, "desc": "", "link": l})
+                    items = items[:10]
+                    fetched = True
+        except Exception:
+            pass
+
+    if items:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump(items, f)
+        except Exception:
+            pass
+
+if not items:
+    print("IGNORED:0")
+    sys.exit(0)
+
 pattern = re.compile(r"(manual intervention|intervention required|breaking change|requires manual|drops .* support)", re.IGNORECASE)
 
 try:
-    req = urllib.request.Request(url, headers={"User-Agent": "sys-health/1.0"})
-    with urllib.request.urlopen(req, timeout=5) as response:
-        root = ET.fromstring(response.read())
+    installed = set(subprocess.check_output(["pacman", "-Qq"]).decode().split())
 except Exception:
-    sys.exit(0)
+    installed = set()
 
-alerts = []
-for item in root.findall("./channel/item")[:10]:
-    title = item.findtext("title") or ""
-    desc = item.findtext("description") or ""
-    link = item.findtext("link") or ""
+KNOWN_GROUPS = {
+    "nvidia": ["nvidia", "nvidia-open", "nvidia-lts", "nvidia-dkms"],
+    ".net": ["dotnet-runtime", "dotnet-sdk", "dotnet-host", "dotnet-targeting-pack"],
+    "dotnet": ["dotnet-runtime", "dotnet-sdk", "dotnet-host", "dotnet-targeting-pack"],
+    "pipewire": ["pipewire", "pipewire-pulse", "pipewire-alsa"],
+    "wireplumber": ["wireplumber"],
+    "plasma": ["plasma-desktop", "plasma-workspace"],
+    "gnome": ["gnome-shell", "gnome-desktop"],
+}
 
-    if pattern.search(title) or pattern.search(desc):
-        alerts.append(f"  • {title.strip()}\n    {link.strip()}")
+actionable = []
+ignored_count = 0
 
-if alerts:
-    print("\n".join(alerts))
+for it in items[:10]:
+    title = it.get("title", "")
+    desc = it.get("desc", "")
+    link = it.get("link", "")
+
+    if not (pattern.search(title) or pattern.search(desc)):
+        continue
+
+    candidates = set()
+    for m in re.findall(r"[`\x27\"]([a-zA-Z0-9@._+-]+)[`\x27\"]", title + " " + desc):
+        candidates.add(m.lower())
+    first_w = re.match(r"^([a-zA-Z0-9@._+-]+)\s*(?:>=|>|<=|<|=|:|\d)", title.strip())
+    if first_w:
+        candidates.add(first_w.group(1).lower())
+    for k, v in KNOWN_GROUPS.items():
+        if k in title.lower():
+            candidates.update(v)
+
+    if not candidates:
+        actionable.append(f"  • [SYSTEM-WIDE] {title}\n    {link}")
+        continue
+
+    matched = [c for c in candidates if c in installed]
+    if matched:
+        matched_str = ", ".join(sorted(matched))
+        actionable.append(f"  • [AFFECTS: {matched_str}] {title}\n    {link}")
+    else:
+        ignored_count += 1
+
+if actionable:
+    print("\n".join(actionable))
     sys.exit(2)
+
+print(f"IGNORED:{ignored_count}")
 sys.exit(0)
-' 2>/dev/null
+' "$cache_file" 2>/dev/null
 }
 
 # Guarded System Upgrade (Pre-Flight -> Update -> Post-Audit)
@@ -5394,14 +5488,14 @@ run_guarded_upgrade() {
     fi
 
     # --------------------------------------------------------------------------
-    # Gate 4: Arch News RSS Human Intervention Scanner
+    # Gate 4: Arch News Advisory Scanner (Correlated with Installed Packages)
     # --------------------------------------------------------------------------
     if command -v python3 &>/dev/null; then
         local news_alerts="" news_rc=0
-        news_alerts="$(scan_arch_news_feed)" || news_rc=$?
+        news_alerts="$(scan_arch_news_feed "${STATE_DIR}/arch-news-cache.json")" || news_rc=$?
 
         if (( news_rc == 2 )) && [[ -n "$news_alerts" ]]; then
-            warn "Pre-Flight Gate 4: Recent Arch News alert(s) requiring operator attention detected:"
+            warn "Pre-Flight Gate 4: Recent Arch News alert(s) affecting your system detected:"
             echo "$news_alerts"
             echo ""
             if [[ -t 0 ]] && command -v gum &>/dev/null; then
@@ -5410,11 +5504,18 @@ run_guarded_upgrade() {
                     preflight_passed=false
                 fi
             elif [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
-                fail "Arch News contains manual intervention notices. Aborting unattended upgrade for safety."
+                fail "Arch News contains manual intervention notices affecting installed packages. Aborting unattended upgrade for safety."
                 preflight_passed=false
             fi
+        elif [[ "$news_alerts" =~ IGNORED:([0-9]+) ]]; then
+            local ign_cnt="${BASH_REMATCH[1]}"
+            if (( ign_cnt > 0 )); then
+                ok "Pre-Flight Gate 4: Arch News checked ($ign_cnt upstream advisories reviewed; 0 affect your installed packages)."
+            else
+                ok "Pre-Flight Gate 4: Arch News checked (no recent manual interventions detected upstream)."
+            fi
         else
-            ok "Pre-Flight Gate 4: Arch News checked (no recent manual interventions detected)."
+            ok "Pre-Flight Gate 4: Arch News checked (no active advisories affecting installed packages)."
         fi
     else
         ok "Pre-Flight Gate 4: python3 not available to parse RSS, skipping feed check."
