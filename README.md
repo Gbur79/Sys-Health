@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.14](https://img.shields.io/badge/Version-2.14-orange.svg)](CHANGELOG.md)
+[![Version: 2.15](https://img.shields.io/badge/Version-2.15-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
