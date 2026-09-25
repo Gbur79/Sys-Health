@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.15
+# Arch System Health & Diagnostics v2.16
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.15"
+VERSION="2.16"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -5628,25 +5628,214 @@ run_guarded_upgrade() {
     echo ""
 
     # --------------------------------------------------------------------------
-    # FAZA 2: CANONICAL SYSTEM UPGRADE
+    # FAZA 2: TRANSACTION DISCOVERY & MANIFEST AUDIT
     # --------------------------------------------------------------------------
     local aur_helper
     aur_helper="$(detect_aur_helper)"
     local include_aur=false
-    local aur_count=0
-    if [[ -n "$aur_helper" ]]; then
-        aur_count="$("$aur_helper" -Qua 2>/dev/null | grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' | wc -l || echo 0)"
+    local repo_count=0 aur_count=0
+    local repo_raw="" aur_raw=""
+
+    local tmp_repo tmp_aur
+    tmp_repo="$(mktemp /tmp/syshealth-repo-XXXXXX)"
+    tmp_aur="$(mktemp /tmp/syshealth-aur-XXXXXX)"
+
+    if [[ -t 0 ]] && command -v gum &>/dev/null; then
+        gum spin --title "Discovering available repository & AUR package updates..." -- bash -c '
+            t_repo="$1"
+            t_aur="$2"
+            a_helper="$3"
+            (
+                if command -v checkupdates &>/dev/null; then
+                    checkupdates > "$t_repo" 2>/dev/null || true
+                else
+                    pacman -Qu > "$t_repo" 2>/dev/null || true
+                fi
+            ) &
+            (
+                if [[ -n "$a_helper" ]]; then
+                    "$a_helper" -Qua > "$t_aur" 2>/dev/null || true
+                fi
+            ) &
+            wait
+        ' _ "$tmp_repo" "$tmp_aur" "$aur_helper"
+    else
+        (
+            if command -v checkupdates &>/dev/null; then
+                checkupdates > "$tmp_repo" 2>/dev/null || true
+            else
+                pacman -Qu > "$tmp_repo" 2>/dev/null || true
+            fi
+        ) &
+        (
+            if [[ -n "$aur_helper" ]]; then
+                "$aur_helper" -Qua > "$tmp_aur" 2>/dev/null || true
+            fi
+        ) &
+        wait
     fi
-    if (( aur_count > 0 )) && [[ -t 0 ]] && command -v gum &>/dev/null; then
-        if gum confirm "Also update $aur_count pending AUR package(s) via $aur_helper?"; then
-            include_aur=true
+
+    repo_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$tmp_repo" 2>/dev/null || true)"
+    aur_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$tmp_aur" 2>/dev/null || true)"
+    rm -f "$tmp_repo" "$tmp_aur"
+
+    [[ -n "$repo_raw" ]] && repo_count="$(grep -c '^[a-zA-Z0-9@._+-]' <<< "$repo_raw" || echo 0)"
+    [[ -n "$aur_raw" ]] && aur_count="$(grep -c '^[a-zA-Z0-9@._+-]' <<< "$aur_raw" || echo 0)"
+
+    # Edge-case: System is fully up to date
+    if (( repo_count == 0 && aur_count == 0 )); then
+        echo ""
+        if [[ -t 1 ]] && command -v gum &>/dev/null; then
+            gum style --foreground 82 --border normal --padding "0 1" \
+                "✔ SYSTEM FULLY UP TO DATE: No pending updates in official repos or AUR."
+        else
+            ok "SYSTEM FULLY UP TO DATE: No pending updates in official repos or AUR."
+        fi
+        echo ""
+        if [[ -t 0 ]] && command -v gum &>/dev/null; then
+            if ! gum confirm "No pending updates found. Would you like to force-refresh databases (pacman -Syyu) anyway?"; then
+                info "System upgrade skipped — everything is up to date."
+                return 0
+            fi
+        elif [[ -t 0 ]]; then
+            local force_ans
+            read -r -p "No pending updates found. Force-refresh databases anyway? [y/N]: " force_ans
+            if [[ ! "$force_ans" =~ ^[Yy]$ ]]; then
+                info "System upgrade skipped — everything is up to date."
+                return 0
+            fi
+        else
+            ok "Unattended mode: System is already up to date. Exiting cleanly."
+            return 0
         fi
     fi
 
-    if [[ -t 0 ]] && command -v gum &>/dev/null; then
-        if ! gum confirm "Proceed with canonical system upgrade now?"; then
-            info "Upgrade cancelled by user."
-            return 0
+    # Categorize and format package manifest
+    local core_regex='^(linux|linux-lts|linux-zen|linux-hardened|nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|grub|mkinitcpio|xorg|wayland)'
+    local -a core_detected=()
+    local repo_table="" aur_table=""
+    local max_display=25
+
+    if (( repo_count > 0 )); then
+        local -a core_rows=()
+        local -a normal_rows=()
+
+        while IFS= read -r u_line; do
+            [[ -z "$u_line" ]] && continue
+            local p_name="${u_line%% *}"
+            local p_ver="${u_line#* }"
+            p_ver="${p_ver%% \[*}"
+            if [[ "$p_name" =~ $core_regex ]]; then
+                core_rows+=("${p_name} | ${p_ver} WARN ⚠ (core)")
+                core_detected+=("$p_name")
+            else
+                normal_rows+=("${p_name} | ${p_ver}")
+            fi
+        done <<< "$repo_raw"
+
+        local shown=0
+        for item in "${core_rows[@]}"; do
+            repo_table+="${item}\n"
+            ((shown++))
+        done
+
+        for item in "${normal_rows[@]}"; do
+            if (( shown >= max_display )); then
+                break
+            fi
+            repo_table+="${item}\n"
+            ((shown++))
+        done
+
+        if (( repo_count > shown )); then
+            repo_table+="... and $((repo_count - shown)) more packages | (run 'checkupdates' to view full list)\n"
+        fi
+
+        render_audit_section "PENDING OFFICIAL REPOSITORY UPDATES ($repo_count)" "$repo_table"
+        if (( ${#core_detected[@]} > 0 )); then
+            echo ""
+            warn "Critical system packages detected in transaction: ${core_detected[*]}"
+        fi
+    else
+        ok "Official repositories: UP TO DATE (0 pending updates)."
+    fi
+
+    if (( aur_count > 0 )); then
+        local -a aur_rows=()
+        while IFS= read -r a_line; do
+            [[ -z "$a_line" ]] && continue
+            local a_name="${a_line%% *}"
+            local a_ver="${a_line#* }"
+            a_ver="${a_ver%% \[*}"
+            aur_rows+=("${a_name} | ${a_ver}")
+        done <<< "$aur_raw"
+
+        local a_shown=0
+        for item in "${aur_rows[@]}"; do
+            if (( a_shown >= max_display )); then
+                break
+            fi
+            aur_table+="${item}\n"
+            ((a_shown++))
+        done
+
+        if (( aur_count > a_shown )); then
+            aur_table+="... and $((aur_count - a_shown)) more AUR packages | (run '${aur_helper} -Qua' to view full list)\n"
+        fi
+
+        echo ""
+        render_audit_section "PENDING AUR PACKAGES (${aur_helper:-AUR} - $aur_count)" "$aur_table"
+    elif [[ -n "$aur_helper" ]]; then
+        echo ""
+        ok "AUR packages (${aur_helper}): UP TO DATE (0 pending updates)."
+    fi
+
+    echo ""
+
+    # User confirmation gates
+    if (( aur_count > 0 )) && [[ -t 0 ]]; then
+        if command -v gum &>/dev/null; then
+            if gum confirm "Also update $aur_count pending AUR package(s) via $aur_helper?"; then
+                include_aur=true
+            fi
+        else
+            local aur_resp
+            read -r -p "Also update $aur_count pending AUR package(s) via $aur_helper? [y/N]: " aur_resp
+            if [[ "$aur_resp" =~ ^[Yy]$ ]]; then
+                include_aur=true
+            fi
+        fi
+    fi
+
+    # Safety: If official repos have 0 updates and user opted out of AUR, abort cleanly
+    if (( repo_count == 0 )) && ! $include_aur; then
+        info "Official repositories are already up to date and AUR update was omitted. Nothing to do."
+        return 0
+    fi
+
+    local total_txn=$repo_count
+    $include_aur && (( total_txn += aur_count ))
+
+    local confirm_prompt="Proceed with canonical system upgrade now ($total_txn package(s))?"
+    if (( repo_count == 0 )) && $include_aur; then
+        confirm_prompt="Proceed with AUR package upgrade now ($aur_count package(s))?"
+    elif ! $include_aur && (( aur_count > 0 )); then
+        confirm_prompt="Proceed with official repository upgrade only ($repo_count package(s), AUR skipped)?"
+    fi
+
+    if [[ -t 0 ]]; then
+        if command -v gum &>/dev/null; then
+            if ! gum confirm "$confirm_prompt"; then
+                info "Upgrade cancelled by user."
+                return 0
+            fi
+        else
+            local up_resp
+            read -r -p "$confirm_prompt [y/N]: " up_resp
+            if [[ ! "$up_resp" =~ ^[Yy]$ ]]; then
+                info "Upgrade cancelled by user."
+                return 0
+            fi
         fi
     fi
 
