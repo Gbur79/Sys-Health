@@ -61,8 +61,8 @@ sys-health AI Session:
 ## Core Features
 
 ### 1. Comprehensive Health Audit (Read-Only)
-* **Universal Multi-Bootloader Verification (v2.14):** Automatically identifies active bootloader (`systemd-boot`, `GRUB`, `Limine`, `rEFInd`, or standalone `UKI`) and validates that boot configurations, loader entries, and EFI binaries exist and are populated.
-* **ESP & Mount Topology Integrity (v2.14):** Inspects `/etc/fstab` and `findmnt` to ensure the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable, with sufficient free headroom (> 100 MB).
+* **Universal Multi-Bootloader Verification:** Automatically identifies active bootloader (`systemd-boot`, `GRUB`, `Limine`, `rEFInd`, or standalone `UKI`) and validates that boot configurations, loader entries, and EFI binaries exist and are populated.
+* **ESP & Mount Topology Integrity:** Inspects `/etc/fstab` and `findmnt` to ensure the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable, with sufficient free headroom (> 100 MB).
 * **Multi-Kernel & DKMS Synchronization:** Audits every installed kernel series (`linux`, `linux-lts`, `linux-zen`), ensuring matching kernel headers, module directories, and compiled DKMS modules exist for each.
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
 * **Crash & Unclean Shutdown Forensics:** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, or hard system freezes.
@@ -81,10 +81,10 @@ sys-health AI Session:
   * Ephemeral-filtered package integrity checking (`pacman -Qk`).
   * Unmerged configuration file detection (`.pacnew`).
   * Mirror sync freshness tracking (`core.db`).
-  * Upstream **Arch News** multi-item scraper matching manual intervention advisories against locally installed packages (`pacman -Qq`).
+  * **Smart Arch News Correlator (v2.15):** Proactively scrapes upstream Arch News with HTTP 429 rate-limiting resilience and local caching, correlating manual intervention advisories against locally installed packages (`pacman -Qq`) to eliminate false-positive alarm fatigue.
   * Official Arch Security Tracker (`arch-audit`) integration, separating actionable repository fixes from unclosed upstream backlog.
 
-### 2. Guarded System Upgrade (Pre-Flight → Update → Post-Audit, v2.14)
+### 2. Guarded System Upgrade (Pre-Flight → Update → Post-Audit, v2.15)
 Eliminates rolling-release upgrade friction through a disciplined 3-phase workflow:
 * **Phase 1: Pre-Flight Safety Gates:**
   1. *Privilege & Session Gate (Gate 0):* Validates sudo authentication with automated background keepalive; blocks running raw as root.
@@ -92,7 +92,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   3. *Substrate & Mount Topology Gate (Gate 1):* Confirms ESP and `/boot` are mounted and writable; enforces safe disk margins (6 GB root, 4 GB pacman cache, 100 MB ESP).
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
   5. *Network & Mirror Freshness Gate (Gate 3):* Verifies TLS/DNS reachability to official infrastructure and offers 1-click regional mirror ranking (`reflector` / `eos-rankmirrors`) if lists are older than 30 days.
-  6. *Arch News Human Intervention Gate (Gate 4):* Scans news feeds for manual interventions affecting installed packages.
+  6. *Smart Arch News Correlator Gate (Gate 4, v2.15):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
   7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants (e.g., legacy Maxwell GTX 970 vs modern drivers), kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
   Executes the canonical distribution package manager (`eos-update`, `yay`, `paru`, or `pacman`).
@@ -249,4 +249,3 @@ SKIP_INTEGRITY=0
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
