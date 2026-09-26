@@ -657,6 +657,83 @@ render_audit_section() {
 # System platform detectors (Universal GitHub / Dual-Lens portability)
 # ------------------------------------------------------------------------------
 
+detect_active_bootloader() {
+    local loader_info_var
+    loader_info_var="$(find /sys/firmware/efi/efivars/ -name 'LoaderInfo-*' 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$loader_info_var" && -r "$loader_info_var" ]]; then
+        local raw_info
+        raw_info="$(tr -d '\0' < "$loader_info_var" 2>/dev/null || true)"
+        case "$raw_info" in
+            *systemd-boot*) echo "systemd-boot"; return 0 ;;
+            *Limine*)       echo "limine"; return 0 ;;
+            *rEFInd*)       echo "refind"; return 0 ;;
+            *GRUB*)         echo "grub"; return 0 ;;
+        esac
+    fi
+
+    if [[ -d /sys/firmware/efi/efivars ]] && command -v bootctl &>/dev/null; then
+        local loader
+        loader="$(bootctl status 2>/dev/null | grep -i 'Product:' | head -n1 | awk '{$1=""; print $0}' | sed 's/^[ \t]*//' || true)"
+        if [[ -n "$loader" ]]; then
+            case "$loader" in
+                *systemd-boot*) echo "systemd-boot"; return 0 ;;
+                *GRUB*)         echo "grub"; return 0 ;;
+                *Limine*)       echo "limine"; return 0 ;;
+                *rEFInd*)       echo "refind"; return 0 ;;
+            esac
+        fi
+    fi
+
+    if command -v bootctl &>/dev/null; then
+        if sudo -n bootctl is-installed &>/dev/null || bootctl is-installed &>/dev/null; then
+            echo "systemd-boot"
+            return 0
+        fi
+    fi
+
+    for f in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/grub/grub.cfg /boot/efi/EFI/grub/grub.cfg /efi/EFI/grub/grub.cfg; do
+        if [[ -f "$f" ]]; then
+            echo "grub"
+            return 0
+        fi
+    done
+
+    for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg /efi/limine/limine.conf /efi/limine.conf /boot/efi/limine.conf; do
+        if [[ -f "$f" ]]; then
+            echo "limine"
+            return 0
+        fi
+    done
+
+    if [[ -f /boot/refind_linux.conf || -d /boot/efi/EFI/refind || -d /efi/EFI/refind ]]; then
+        echo "refind"
+        return 0
+    fi
+
+    local -a uki_paths=(
+        /efi/EFI/Linux/*.efi
+        /boot/EFI/Linux/*.efi
+        /boot/efi/EFI/Linux/*.efi
+    )
+    for uki in "${uki_paths[@]}"; do
+        if [[ -f "$uki" ]]; then
+            echo "uki"
+            return 0
+        fi
+    done
+
+    if [[ -d /boot/grub || -d /boot/grub2 ]]; then
+        echo "grub"
+        return 0
+    elif [[ -d /boot/loader || -d /efi/loader ]]; then
+        echo "systemd-boot"
+        return 0
+    fi
+
+    echo "unknown"
+    return 1
+}
+
 detect_bootloader() {
     if [[ -d /sys/firmware/efi/efivars ]] && command -v bootctl &>/dev/null; then
         local loader
@@ -666,17 +743,17 @@ detect_bootloader() {
             return
         fi
     fi
-    if [[ -d /boot/grub || -d /boot/grub2 ]]; then
-        echo "GRUB"
-    elif [[ -d /boot/loader || -d /efi/loader ]]; then
-        echo "systemd-boot"
-    elif [[ -d /boot/limine || -d /efi/limine ]]; then
-        echo "Limine"
-    elif [[ -d /boot/refind || -d /efi/EFI/refind ]]; then
-        echo "rEFInd"
-    else
-        echo "unknown"
-    fi
+
+    local active
+    active="$(detect_active_bootloader)"
+    case "$active" in
+        systemd-boot) echo "systemd-boot" ;;
+        grub)         echo "GRUB" ;;
+        limine)       echo "Limine" ;;
+        refind)       echo "rEFInd" ;;
+        uki)          echo "UKI (Direct EFI)" ;;
+        *)            echo "unknown" ;;
+    esac
 }
 
 detect_initramfs_generator() {
@@ -1772,10 +1849,17 @@ check_gpu_errors() {
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -Ei 'VGA|3D|Display' || true)"
     drivers_in_use="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u | tr '\n' ' ' || true)"
 
+    local target_uid="${EUID}"
+    if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        target_uid="$(id -u "$SUDO_USER" 2>/dev/null || echo "$EUID")"
+    fi
+
     local is_wayland=false
     if [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]]; then
         is_wayland=true
-    elif pgrep -u "$EUID" -x "kwin_wayland|gnome-shell|Hyprland|sway|wayfire|river" &>/dev/null; then
+    elif pgrep -u "$target_uid" -x "kwin_wayland|gnome-shell|Hyprland|sway|wayfire|river|labwc|cosmic-comp" &>/dev/null; then
+        is_wayland=true
+    elif pgrep -x "kwin_wayland|gnome-shell|Hyprland|sway|wayfire|river|labwc|cosmic-comp" &>/dev/null; then
         is_wayland=true
     fi
 
@@ -1795,7 +1879,11 @@ check_gpu_errors() {
 
         if ! $is_wayland; then
             local xorg_log="/var/log/Xorg.0.log"
-            [[ ! -f "$xorg_log" && -f "$HOME/.local/share/xorg/Xorg.0.log" ]] && xorg_log="$HOME/.local/share/xorg/Xorg.0.log"
+            local user_home="${HOME}"
+            if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+                user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
+            fi
+            [[ ! -f "$xorg_log" && -f "$user_home/.local/share/xorg/Xorg.0.log" ]] && xorg_log="$user_home/.local/share/xorg/Xorg.0.log"
 
             if [[ -f "$xorg_log" ]]; then
                 local fliplock_count
@@ -2080,21 +2168,33 @@ check_failed_services() {
         } >> "$LOG_FILE"
     fi
 
-    FAILED_USER_SERVICES="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
+    local has_user_bus=false
+    if [[ "$EUID" -ne 0 ]] || [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+        if systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null; then
+            has_user_bus=true
+        fi
+    fi
 
-    if [[ -z "$FAILED_USER_SERVICES" ]]; then
-        add_row "Systemd failed (user)" "PASS ✔"
-        log "HEALTH systemd_user_failed=0"
+    if $has_user_bus; then
+        FAILED_USER_SERVICES="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
+
+        if [[ -z "$FAILED_USER_SERVICES" ]]; then
+            add_row "Systemd failed (user)" "PASS ✔"
+            log "HEALTH systemd_user_failed=0"
+        else
+            local count
+            count="$(printf '%s\n' "$FAILED_USER_SERVICES" | wc -l)"
+            add_row "Systemd failed (user)" "WARN ⚠ ($count failed)"
+            ((WARNINGS++))
+            log "HEALTH systemd_user_failed=WARN count=$count"
+            {
+                echo "### FAILED SYSTEMD UNITS (USER)"
+                systemctl --user --failed --no-legend --plain 2>&1
+            } >> "$LOG_FILE"
+        fi
     else
-        local count
-        count="$(printf '%s\n' "$FAILED_USER_SERVICES" | wc -l)"
-        add_row "Systemd failed (user)" "WARN ⚠ ($count failed)"
-        ((WARNINGS++))
-        log "HEALTH systemd_user_failed=WARN count=$count"
-        {
-            echo "### FAILED SYSTEMD UNITS (USER)"
-            systemctl --user --failed --no-legend --plain 2>&1
-        } >> "$LOG_FILE"
+        add_row "Systemd failed (user)" "INFO ℹ (no active user session bus)"
+        log "HEALTH systemd_user_failed=INFO no_user_bus"
     fi
 }
 
@@ -5005,68 +5105,12 @@ detect_esp_mountpoint() {
     echo "$esp_path"
 }
 
-detect_active_bootloader() {
-    local loader_info_var
-    loader_info_var="$(find /sys/firmware/efi/efivars/ -name 'LoaderInfo-*' 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$loader_info_var" && -r "$loader_info_var" ]]; then
-        local raw_info
-        raw_info="$(tr -d '\0' < "$loader_info_var" 2>/dev/null || true)"
-        case "$raw_info" in
-            *systemd-boot*) echo "systemd-boot"; return 0 ;;
-            *Limine*)       echo "limine"; return 0 ;;
-            *rEFInd*)       echo "refind"; return 0 ;;
-            *GRUB*)         echo "grub"; return 0 ;;
-        esac
-    fi
-
-    if command -v bootctl &>/dev/null; then
-        if sudo -n bootctl is-installed &>/dev/null || bootctl is-installed &>/dev/null; then
-            echo "systemd-boot"
-            return 0
-        fi
-    fi
-
-    if [[ -f /boot/grub/grub.cfg || -f /boot/grub2/grub.cfg ]]; then
-        echo "grub"
-        return 0
-    fi
-
-    for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg /efi/limine/limine.conf /efi/limine.conf /boot/efi/limine.conf; do
-        if [[ -f "$f" ]]; then
-            echo "limine"
-            return 0
-        fi
-    done
-
-    if [[ -f /boot/refind_linux.conf || -d /boot/efi/EFI/refind || -d /efi/EFI/refind ]]; then
-        echo "refind"
-        return 0
-    fi
-
-    local -a uki_paths=(
-        /efi/EFI/Linux/*.efi
-        /boot/EFI/Linux/*.efi
-        /boot/efi/EFI/Linux/*.efi
-    )
-    for uki in "${uki_paths[@]}"; do
-        if [[ -f "$uki" ]]; then
-            echo "uki"
-            return 0
-        fi
-    done
-
-    if [[ -d /boot/grub || -d /boot/grub2 ]]; then
-        echo "grub"
-        return 0
-    fi
-
-    echo "unknown"
-    return 1
-}
-
 verify_bootloader_post_flight() {
     local bl_type
     bl_type="$(detect_active_bootloader)"
+    local esp_path
+    esp_path="$(detect_esp_mountpoint)"
+    [[ -z "$esp_path" ]] && esp_path="/efi"
 
     case "$bl_type" in
         systemd-boot)
@@ -5080,7 +5124,7 @@ verify_bootloader_post_flight() {
 
             if ! $has_entries; then
                 local e_dir
-                for e_dir in /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
+                for e_dir in "${esp_path}/loader/entries" /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
                     if [[ -d "$e_dir" ]] && compgen -G "${e_dir}/*.conf" >/dev/null; then
                         has_entries=true
                         break
@@ -5090,7 +5134,7 @@ verify_bootloader_post_flight() {
 
             if ! $has_entries; then
                 local uki_dir
-                for uki_dir in /efi/EFI/Linux /boot/EFI/Linux /boot/efi/EFI/Linux; do
+                for uki_dir in "${esp_path}/EFI/Linux" /efi/EFI/Linux /boot/EFI/Linux /boot/efi/EFI/Linux; do
                     if [[ -d "$uki_dir" ]] && compgen -G "${uki_dir}/*.efi" >/dev/null; then
                         has_entries=true
                         break
@@ -5110,6 +5154,8 @@ verify_bootloader_post_flight() {
         grub)
             local grub_cfg="/boot/grub/grub.cfg"
             [[ ! -f "$grub_cfg" && -f "/boot/grub2/grub.cfg" ]] && grub_cfg="/boot/grub2/grub.cfg"
+            [[ ! -f "$grub_cfg" && -f "${esp_path}/grub/grub.cfg" ]] && grub_cfg="${esp_path}/grub/grub.cfg"
+
             if [[ -f "$grub_cfg" && -s "$grub_cfg" ]]; then
                 local menu_ok=false
                 if sudo -n grep -qE '^[[:space:]]*(menuentry|submenu|linux)[[:space:]]' "$grub_cfg" 2>/dev/null; then
@@ -5136,7 +5182,7 @@ verify_bootloader_post_flight() {
 
         limine)
             local l_conf=""
-            for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg /efi/limine/limine.conf /efi/limine.conf /boot/efi/limine.conf; do
+            for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg "${esp_path}/limine/limine.conf" "${esp_path}/limine.conf" /efi/limine/limine.conf; do
                 if [[ -f "$f" && -s "$f" ]]; then
                     l_conf="$f"
                     break
@@ -5171,6 +5217,10 @@ verify_bootloader_post_flight() {
 print_bootloader_repair_hint() {
     local bl_type
     bl_type="$(detect_active_bootloader)"
+    local esp_path
+    esp_path="$(detect_esp_mountpoint)"
+    [[ -z "$esp_path" ]] && esp_path="/efi"
+
     case "$bl_type" in
         systemd-boot)
             echo "  [systemd-boot Repair] Re-install loader or inspect entries:"
@@ -5182,16 +5232,26 @@ print_bootloader_repair_hint() {
             fi
             ;;
         grub)
+            local grub_cfg="/boot/grub/grub.cfg"
+            [[ ! -f "$grub_cfg" && -f "/boot/grub2/grub.cfg" ]] && grub_cfg="/boot/grub2/grub.cfg"
+            [[ ! -f "$grub_cfg" && -f "${esp_path}/grub/grub.cfg" ]] && grub_cfg="${esp_path}/grub/grub.cfg"
             echo "  [GRUB Repair] Regenerate GRUB boot menu if needed:"
-            echo "    sudo grub-mkconfig -o /boot/grub/grub.cfg"
+            echo "    sudo grub-mkconfig -o \"$grub_cfg\""
             ;;
         limine)
+            local limine_cfg=""
+            for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg "${esp_path}/limine/limine.conf" "${esp_path}/limine.conf"; do
+                if [[ -f "$f" ]]; then
+                    limine_cfg="$f"
+                    break
+                fi
+            done
             echo "  [Limine Repair] Verify limine configuration and deployment:"
-            echo "    cat /boot/limine.conf"
+            echo "    cat \"${limine_cfg:-/boot/limine.conf}\""
             ;;
         uki)
-            echo "  [UKI Repair] Inspect UKI images in ESP (/efi/EFI/Linux or /boot/EFI/Linux):"
-            echo "    ls -la /efi/EFI/Linux /boot/EFI/Linux 2>/dev/null"
+            echo "  [UKI Repair] Inspect UKI images in ESP (${esp_path}/EFI/Linux):"
+            echo "    ls -la \"${esp_path}/EFI/Linux\" 2>/dev/null"
             ;;
         *)
             echo "  [Bootloader Repair] Verify EFI boot entries:"
@@ -5495,18 +5555,36 @@ run_guarded_upgrade() {
         fi
     fi
 
-    # 2. Boot Mount & Writable Check
-    if grep -qE '^[[:space:]]*[^#[:space:]]+[[:space:]]+/boot([[:space:]]|$)' /etc/fstab; then
-        if ! mountpoint -q /boot; then
-            fail "Pre-Flight Gate 1: Dedicated /boot partition defined in /etc/fstab is NOT mounted!"
+    # 2. Boot Mount & Writable Check (dynamic inspection of /etc/fstab)
+    local fstab_boot_mnt
+    while IFS= read -r fstab_boot_mnt; do
+        [[ -n "$fstab_boot_mnt" ]] || continue
+        # Skip if already verified as ESP above
+        [[ "$fstab_boot_mnt" == "$esp_mount" ]] && continue
+
+        if ! mountpoint -q "$fstab_boot_mnt"; then
+            fail "Pre-Flight Gate 1: Dedicated boot mount ($fstab_boot_mnt) defined in /etc/fstab is NOT mounted!"
+            preflight_passed=false
+        else
+            local m_opts
+            m_opts="$(findmnt -n -o OPTIONS -T "$fstab_boot_mnt" 2>/dev/null || true)"
+            if [[ "$m_opts" =~ (^|,)ro(,|$) ]]; then
+                fail "Pre-Flight Gate 1: Boot filesystem ($fstab_boot_mnt) is mounted READ-ONLY!"
+                preflight_passed=false
+            else
+                ok "Pre-Flight Gate 1: Dedicated boot mount ($fstab_boot_mnt) verified mounted and writable."
+            fi
+        fi
+    done < <(awk '$2 ~ /^\/(boot|efi|boot\/efi)$/ {print $2}' /etc/fstab 2>/dev/null || true)
+
+    # 2b. If /boot is a regular directory on root, verify root directory filesystem is writable
+    if [[ "$esp_mount" != "/boot" ]] && ! grep -qE '^[[:space:]]*[^#[:space:]]+[[:space:]]+/boot([[:space:]]|$)' /etc/fstab; then
+        local boot_dir_opts
+        boot_dir_opts="$(findmnt -n -o OPTIONS -T /boot 2>/dev/null || true)"
+        if [[ "$boot_dir_opts" =~ (^|,)ro(,|$) ]]; then
+            fail "Pre-Flight Gate 1: Root /boot directory filesystem is mounted READ-ONLY!"
             preflight_passed=false
         fi
-    fi
-    local boot_opts
-    boot_opts="$(findmnt -n -o OPTIONS -T /boot 2>/dev/null || true)"
-    if [[ "$boot_opts" =~ (^|,)ro(,|$) ]]; then
-        fail "Pre-Flight Gate 1: /boot filesystem is mounted READ-ONLY!"
-        preflight_passed=false
     fi
 
     # 3. Disk Space Margins (Root, ESP, Pacman Cache)
@@ -6102,52 +6180,44 @@ run_guarded_upgrade() {
         fi
 
         # 2. Boot Images, Initramfs & UKI verification
-        local vmlinuz="/boot/vmlinuz-${pkgb}"
-        local initrd="/boot/initramfs-${pkgb}.img"
-        local uki_found=false
+        local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+        _resolve_kernel_and_initramfs "$pkgb" "$target_k_ver"
 
-        for uki_dir in /efi/EFI/Linux /boot/EFI/Linux /boot/efi/EFI/Linux; do
-            if [[ -f "${uki_dir}/${pkgb}.efi" || -f "${uki_dir}/vmlinuz-${pkgb}.efi" ]]; then
-                uki_found=true
-                break
-            fi
-        done
-
-        if $uki_found; then
+        if [[ "$k_mode" == "uki" && -f "$k_vmlinuz" ]]; then
             ok "Boot image intact: Unified Kernel Image (UKI) found for $pkgb."
-        elif [[ -f "$vmlinuz" && -s "$vmlinuz" && -f "$initrd" && -s "$initrd" ]]; then
+        elif [[ -f "$k_vmlinuz" && -s "$k_vmlinuz" && -f "$k_initrd" && -s "$k_initrd" ]]; then
             local v_mtime i_mtime
-            v_mtime="$(stat -c %Y "$vmlinuz" 2>/dev/null || echo 0)"
-            i_mtime="$(stat -c %Y "$initrd" 2>/dev/null || echo 0)"
+            v_mtime="$(stat -c %Y "$k_vmlinuz" 2>/dev/null || echo 0)"
+            i_mtime="$(stat -c %Y "$k_initrd" 2>/dev/null || echo 0)"
             if (( i_mtime < v_mtime )); then
                 warn "Initramfs mtime is older than kernel for $pkgb (possible incomplete initramfs run)."
             fi
 
             local parse_ok=false
             if command -v lsinitrd &>/dev/null; then
-                if sudo -n lsinitrd "$initrd" &>/dev/null || lsinitrd "$initrd" &>/dev/null; then
+                if sudo -n lsinitrd "$k_initrd" &>/dev/null || lsinitrd "$k_initrd" &>/dev/null; then
                     parse_ok=true
                 fi
             elif command -v lsinitcpio &>/dev/null; then
-                if sudo -n lsinitcpio "$initrd" &>/dev/null || lsinitcpio "$initrd" &>/dev/null; then
+                if sudo -n lsinitcpio "$k_initrd" &>/dev/null || lsinitcpio "$k_initrd" &>/dev/null; then
                     parse_ok=true
                 fi
             else
                 local sz
-                sz="$(stat -c %s "$initrd" 2>/dev/null || echo 0)"
+                sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
                 (( sz > 10485760 )) && parse_ok=true
             fi
 
             if $parse_ok; then
-                local img_mb=$(( $(stat -c %s "$initrd" 2>/dev/null || echo 0) / 1048576 ))
-                ok "Boot image intact & parseable: vmlinuz-$pkgb & initramfs-${pkgb}.img (${img_mb}MB)."
+                local img_mb=$(( $(stat -c %s "$k_initrd" 2>/dev/null || echo 0) / 1048576 ))
+                ok "Boot image intact & parseable: $k_vmlinuz & $k_initrd (${img_mb}MB)."
             else
                 fail "Initramfs for $pkgb is corrupted or unreadable!"
                 initrd_fail_kernels+=("$target_k_ver:$pkgb")
                 post_failed=true
             fi
         else
-            fail "Missing boot kernel ($vmlinuz) or initramfs ($initrd) for $pkgb!"
+            fail "Missing boot kernel (${k_vmlinuz:-none}) or initramfs (${k_initrd:-none}) for $pkgb!"
             initrd_fail_kernels+=("$target_k_ver:$pkgb")
             post_failed=true
         fi
@@ -6241,14 +6311,17 @@ run_guarded_upgrade() {
             for k in "${initrd_fail_kernels[@]}"; do
                 local kver="${k%%:*}"
                 local pkgb="${k##*:}"
+                local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+                _resolve_kernel_and_initramfs "$pkgb" "$kver"
+                local target_initrd="${k_initrd:-/boot/initramfs-${pkgb}.img}"
                 if command -v dracut &>/dev/null; then
                     echo "  [Initramfs Repair] Regenerate Dracut image for $pkgb ($kver):"
                     echo "    sudo dracut --force --kver \"$kver\""
-                    echo "    sudo lsinitrd -m /boot/initramfs-${pkgb}.img"
+                    echo "    sudo lsinitrd -m \"$target_initrd\""
                 elif command -v mkinitcpio &>/dev/null; then
                     echo "  [Initramfs Repair] Regenerate mkinitcpio image for $pkgb:"
                     echo "    sudo mkinitcpio -p \"$pkgb\""
-                    echo "    sudo lsinitcpio /boot/initramfs-${pkgb}.img"
+                    echo "    sudo lsinitcpio \"$target_initrd\""
                 fi
             done
         fi
