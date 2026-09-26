@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.19
+# Arch System Health & Diagnostics v2.20
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.19"
+VERSION="2.20"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -1885,37 +1885,50 @@ check_previous_boot() {
 }
 
 check_gpu() {
-    local vga_info drivers="" driver_list="" gpu_name="GPU"
+    local vga_info
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
 
     if [[ -z "$vga_info" ]]; then
-        add_row "GPU runtime" "INFO ℹ (No GPU detected)"
+        add_row "GPU runtime" "INFO ℹ (No GPU detected)" "HW"
         log "HEALTH gpu=not_detected"
         return
     fi
 
+    local drivers driver_list
     drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u || true)"
-    driver_list="$(echo $drivers | tr '\n' ' ')"
+    driver_list="$(echo $drivers | tr '\n' ' ' | sed 's/ $//')"
+
+    # Extract clean model name for all GPU vendors from lspci
+    local raw_model gpu_model
+    raw_model="$(printf '%s\n' "$vga_info" | grep -iE 'VGA|3D|Display' | head -n1 || true)"
+    if [[ "$raw_model" =~ \[([^\]]+)\] ]]; then
+        gpu_model="${BASH_REMATCH[1]}"
+    else
+        gpu_model="$(echo "$raw_model" | sed -E 's/^[^:]+: //; s/ \(rev [0-9a-f]+\)$//')"
+    fi
+    [[ -z "$gpu_model" ]] && gpu_model="GPU"
 
     if [[ "$driver_list" == *"nvidia"* ]]; then
+        local gpu_temp=""
         if command -v nvidia-smi &>/dev/null; then
-            local gpu_temp
-            gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
-            gpu_temp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1)"
-            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_name:-GPU} | ${gpu_temp}°C)"
-            log "HEALTH gpu=NVIDIA driver=nvidia"
+            gpu_temp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1 || true)"
+            local temp_display=""
+            if [[ -n "$gpu_temp" && "$gpu_temp" =~ ^[0-9]+$ ]]; then
+                temp_display=" | ${gpu_temp}°C"
+            fi
+            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_model}${temp_display})" "HW"
+            log "HEALTH gpu=NVIDIA driver=nvidia model='$gpu_model' temp='${gpu_temp:-suspended}'"
         else
-            add_row "GPU runtime (NVIDIA)" "WARN ⚠ (nvidia-smi missing)"
-            ((WARNINGS++))
-            log "HEALTH gpu=NVIDIA driver=nvidia-smi_missing"
+            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_model} - driver: nvidia)" "HW"
+            log "HEALTH gpu=NVIDIA driver=nvidia model='$gpu_model'"
         fi
-    elif [[ -n "$drivers" ]]; then
-        add_row "GPU runtime" "PASS ✔ (Drivers: $driver_list)"
-        log "HEALTH gpu=PASS drivers=$driver_list"
+    elif [[ -n "$driver_list" ]]; then
+        add_row "GPU runtime" "PASS ✔ (${gpu_model} - $driver_list)" "HW"
+        log "HEALTH gpu=PASS model='$gpu_model' drivers=$driver_list"
     else
-        add_row "GPU runtime" "WARN ⚠ (No kernel driver in use)"
+        add_row "GPU runtime" "WARN ⚠ (No kernel driver in use for $gpu_model)" "HW"
         ((WARNINGS++))
-        log "HEALTH gpu=WARN no_kernel_driver"
+        log "HEALTH gpu=WARN no_kernel_driver model='$gpu_model'"
     fi
 }
 
@@ -2050,37 +2063,68 @@ check_dkms() {
 }
 
 check_temperature() {
-    if ! command -v sensors &>/dev/null; then
-        add_row "CPU temperature" "INFO ℹ (lm_sensors unavailable)"
-        ((INFO_COUNT++))
-        log "HEALTH cpu_temperature=unavailable"
-        return
+    local cpu_temp=""
+
+    # 1. Primary: lm_sensors with strict CPU priority (Tctl/Tdie for AMD, Package id for Intel)
+    if command -v sensors &>/dev/null; then
+        local sensors_out
+        sensors_out="$(sensors 2>&1 || true)"
+        printf '%s\n' "$sensors_out" > "$RUN_RAW/sensors.txt"
+
+        # Prioritize true CPU package/die sensors before generic temp1 diodes
+        cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'Package id 0|Tctl|Tdie' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
+        [[ -z "$cpu_temp" ]] && cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'Core 0|CPU Temperature' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
+        [[ -z "$cpu_temp" ]] && cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'temp1' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
     fi
 
-    local sensors_out
-    sensors_out="$(sensors 2>&1 || true)"
-    printf '%s\n' "$sensors_out" > "$RUN_RAW/sensors.txt"
+    # 2. Universal Native Fallback: Kernel sysfs /sys/class/hwmon (No external tools required)
+    if [[ -z "$cpu_temp" ]]; then
+        for h in /sys/class/hwmon/hwmon*; do
+            [[ -d "$h" ]] || continue
+            local hname
+            hname="$(cat "$h/name" 2>/dev/null || echo "")"
+            if [[ "$hname" =~ ^(coretemp|k10temp|zenpower|cpu_thermal)$ ]]; then
+                local raw_t
+                raw_t="$(cat "$h/temp1_input" 2>/dev/null || true)"
+                if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
+                    cpu_temp="$(( raw_t / 1000 )).0°C"
+                    break
+                fi
+            fi
+        done
+    fi
 
-    local cpu_temp
-    cpu_temp="$(printf '%s\n' "$sensors_out" |
-        grep -iE 'Package id 0|Tctl|Core 0|temp1' |
-        grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' |
-        head -n1)"
+    # 3. Secondary Native Fallback: /sys/class/thermal
+    if [[ -z "$cpu_temp" ]]; then
+        for z in /sys/class/thermal/thermal_zone*; do
+            [[ -d "$z" ]] || continue
+            local ztype
+            ztype="$(cat "$z/type" 2>/dev/null || echo "")"
+            if [[ "$ztype" =~ (x86_pkg_temp|cpu-thermal|k10temp) ]]; then
+                local raw_t
+                raw_t="$(cat "$z/temp" 2>/dev/null || true)"
+                if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
+                    cpu_temp="$(( raw_t / 1000 )).0°C"
+                    break
+                fi
+            fi
+        done
+    fi
 
     if [[ -n "$cpu_temp" ]]; then
         local temp_int="${cpu_temp%%.*}"
         temp_int="${temp_int//[^0-9]/}"
 
         if [[ -n "$temp_int" ]] && (( 10#${temp_int:-0} > 85 )); then
-            add_row "CPU temperature" "WARN ⚠ ($cpu_temp)"
+            add_row "CPU temperature" "WARN ⚠ ($cpu_temp)" "HW"
             ((WARNINGS++))
             log "HEALTH cpu_temperature=WARN value=$cpu_temp"
         else
-            add_row "CPU temperature" "PASS ✔ ($cpu_temp)"
+            add_row "CPU temperature" "PASS ✔ ($cpu_temp)" "HW"
             log "HEALTH cpu_temperature=PASS value=$cpu_temp"
         fi
     else
-        add_row "CPU temperature" "INFO ℹ (not detected)"
+        add_row "CPU temperature" "INFO ℹ (sensor unavailable)" "HW"
         ((INFO_COUNT++))
         log "HEALTH cpu_temperature=not_detected"
     fi
@@ -2088,7 +2132,7 @@ check_temperature() {
 
 check_smart() {
     if ! command -v smartctl &>/dev/null; then
-        add_row "SMART disk health" "INFO ℹ (smartmontools not installed)"
+        add_row "SMART disk health" "INFO ℹ (smartmontools not installed)" "HW"
         ((INFO_COUNT++))
         log "HEALTH smart=not_installed"
         return
@@ -2100,13 +2144,13 @@ check_smart() {
     done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 !~ /^(zram|loop)/ {print "/dev/"$1}')
 
     if [[ ${#disks[@]} -eq 0 ]]; then
-        add_row "SMART disk health" "INFO ℹ (no disks detected)"
+        add_row "SMART disk health" "INFO ℹ (no physical disks detected)" "HW"
         ((INFO_COUNT++))
         log "HEALTH smart=no_disks"
         return
     fi
 
-    local failed=0 passed=0 no_perm=0 total="${#disks[@]}"
+    local failed=0 passed=0 no_perm=0 unsupported=0 total="${#disks[@]}"
     for dev in "${disks[@]}"; do
         local result
         result="$(sudo -n smartctl -H "$dev" 2>&1 || smartctl -H "$dev" 2>&1 || true)"
@@ -2116,20 +2160,27 @@ check_smart() {
             (( failed++ ))
         elif printf '%s\n' "$result" | grep -qiE 'Permission denied|password is required'; then
             (( no_perm++ ))
+        elif printf '%s\n' "$result" | grep -qiE 'Device does not support SMART|Unavailable|Unknown USB bridge'; then
+            (( unsupported++ ))
         fi
     done
 
     if (( failed > 0 )); then
-        add_row "SMART disk health" "FAIL ✖ ($failed/$total disk(s) failed)"
+        add_row "SMART disk health" "FAIL ✖ ($failed/$total disk(s) failed)" "HW"
         ((ERRORS++))
         log "HEALTH smart=FAIL failed=$failed"
     elif (( no_perm == total )); then
-        add_row "SMART disk health" "INFO ℹ (root required)"
+        add_row "SMART disk health" "INFO ℹ (root required)" "HW"
         ((INFO_COUNT++))
         log "HEALTH smart=INFO root_required"
+    elif (( unsupported == total )); then
+        add_row "SMART disk health" "INFO ℹ (VM or non-SMART storage)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH smart=INFO reason=unsupported_storage"
     else
-        add_row "SMART disk health" "PASS ✔ ($passed/$total OK)"
-        log "HEALTH smart=PASS passed=$passed"
+        local smart_capable=$(( total - unsupported ))
+        add_row "SMART disk health" "PASS ✔ ($passed/$smart_capable OK)" "HW"
+        log "HEALTH smart=PASS passed=$passed capable=$smart_capable total=$total"
     fi
 }
 
@@ -2192,13 +2243,19 @@ check_fstrim() {
     if [[ "$status" == "active" ]]; then
         add_row "SSD/NVMe TRIM timer" "PASS ✔ (active)" "HW"
         log "HEALTH fstrim=PASS active=YES"
-    elif findmnt -no OPTIONS / 2>/dev/null | grep -q 'discard=async'; then
-        add_row "SSD/NVMe TRIM timer" "PASS ✔ (btrfs async discard enabled)" "HW"
-        log "HEALTH fstrim=PASS mode=btrfs_async_discard"
+    elif findmnt -no FSTYPE / 2>/dev/null | grep -q 'btrfs' || findmnt -no OPTIONS / 2>/dev/null | grep -q 'discard'; then
+        add_row "SSD/NVMe TRIM timer" "PASS ✔ (btrfs async/continuous discard enabled)" "HW"
+        log "HEALTH fstrim=PASS mode=filesystem_discard"
     else
         add_row "SSD/NVMe TRIM timer" "WARN ⚠ (inactive)" "HW"
         ((WARNINGS++))
         log "HEALTH fstrim=WARN active=NO"
+        {
+            echo "### SSD/NVME TRIM TIMER (FSTRIM)"
+            echo "fstrim.timer is inactive. SSDs and NVMe drives require periodic TRIM to maintain performance and flash endurance."
+            echo "To enable weekly automatic TRIM: sudo systemctl enable --now fstrim.timer"
+            echo ""
+        } >> "$LOG_FILE"
     fi
 }
 
@@ -3864,7 +3921,21 @@ reconstruct_tables_from_log() {
 
             # --- HARDWARE & DRIVERS ---
             gpu)
-                AUDIT_TABLE_HW+="$(_format_audit_row "GPU runtime" "$val" "$details")\n"
+                local gmodel=""
+                if [[ "$details" =~ model=\'([^\']+)\' ]]; then
+                    gmodel="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$val" == "NVIDIA" ]]; then
+                    local gtemp=""
+                    if [[ "$details" =~ temp=\'([0-9]+)\' ]]; then
+                        gtemp=" | ${BASH_REMATCH[1]}°C"
+                    fi
+                    AUDIT_TABLE_HW+="GPU runtime (NVIDIA) | PASS ✔ (${gmodel:-GPU}${gtemp})\n"
+                elif [[ "$val" == "PASS" ]]; then
+                    AUDIT_TABLE_HW+="GPU runtime | PASS ✔ (${gmodel:-GPU})\n"
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "GPU runtime" "$val" "$details")\n"
+                fi
                 ;;
             gpu_errors)
                 AUDIT_TABLE_HW+="$(_format_audit_row "GPU errors & lockups" "$val" "$details")\n"
@@ -3876,13 +3947,33 @@ reconstruct_tables_from_log() {
                 AUDIT_TABLE_HW+="$(_format_audit_row "CPU temperature" "$val" "${details#value=}")\n"
                 ;;
             smart)
-                local passed="${details#passed=}"
-                local smart_note="${passed} OK"
-                [[ -z "$passed" ]] && smart_note="$details"
-                AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$smart_note")\n"
+                if [[ "$val" == "PASS" ]]; then
+                    local passed="?" capable="?"
+                    [[ "$details" =~ passed=([0-9]+) ]] && passed="${BASH_REMATCH[1]}"
+                    [[ "$details" =~ capable=([0-9]+) ]] && capable="${BASH_REMATCH[1]}"
+                    AUDIT_TABLE_HW+="SMART disk health | PASS ✔ (${passed}/${capable} OK)\n"
+                elif [[ "$val" == "INFO" ]]; then
+                    if [[ "$details" =~ root_required ]]; then
+                        AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (root required)\n"
+                    elif [[ "$details" =~ unsupported_storage ]]; then
+                        AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (VM or non-SMART storage)\n"
+                    else
+                        AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (${details})\n"
+                    fi
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$details")\n"
+                fi
                 ;;
             fstrim)
-                AUDIT_TABLE_HW+="$(_format_audit_row "SSD/NVMe TRIM timer" "$val" "${details#active=}")\n"
+                if [[ "$val" == "PASS" ]]; then
+                    if [[ "$details" =~ filesystem_discard|btrfs_async_discard ]]; then
+                        AUDIT_TABLE_HW+="SSD/NVMe TRIM timer | PASS ✔ (btrfs async/continuous discard enabled)\n"
+                    else
+                        AUDIT_TABLE_HW+="SSD/NVMe TRIM timer | PASS ✔ (active)\n"
+                    fi
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "SSD/NVMe TRIM timer" "$val" "${details:-inactive}")\n"
+                fi
                 ;;
 
             # --- SYSTEM HEALTH & SERVICES ---
