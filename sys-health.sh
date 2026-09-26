@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.17"
+VERSION="2.18"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -1581,6 +1581,16 @@ detect_boot_directories() {
     printf "%s\n" "${dirs[@]}"
 }
 
+_find_pacnew_files() {
+    local -a scan_dirs=("/etc")
+    local -a boot_dirs=()
+    mapfile -t boot_dirs < <(detect_boot_directories)
+    for b in "${boot_dirs[@]}"; do
+        [[ -d "$b" ]] && scan_dirs+=("$b")
+    done
+    find "${scan_dirs[@]}" -maxdepth 4 -type f -name '*.pacnew' 2>/dev/null | sort -u || true
+}
+
 _resolve_kernel_and_initramfs() {
     local pkgb="$1"
     local kver="$2"
@@ -2193,24 +2203,55 @@ check_fstrim() {
 }
 
 check_root_space() {
-    local usage
-    usage="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')"
+    # Dynamically audit all active critical mountpoints (/, /home, /var, etc.)
+    local target_mounts=("/" "/home" "/var")
+    if command -v findmnt &>/dev/null; then
+        local extra_mnts
+        extra_mnts="$(findmnt -lno TARGET -t btrfs,ext4,ext3,ext2,xfs,f2fs,zfs 2>/dev/null || true)"
+        while read -r m; do
+            [[ -z "$m" || "$m" =~ ^/boot(/.*)?$ ]] && continue
+            if [[ ! " ${target_mounts[*]} " =~ " ${m} " ]]; then
+                target_mounts+=("$m")
+            fi
+        done <<< "$extra_mnts"
+    fi
 
-    if [[ -z "$usage" ]]; then
-        add_row "Root disk space" "WARN ⚠ (unable to read)"
+    local worst_usage=0
+    local worst_mount="/"
+    local checked_mounts=()
+
+    for mnt in "${target_mounts[@]}"; do
+        if mountpoint -q "$mnt" 2>/dev/null || [[ "$mnt" == "/" ]]; then
+            local usage
+            usage="$(df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
+            [[ -z "$usage" ]] && continue
+            checked_mounts+=("$mnt: ${usage}%")
+            if (( usage > worst_usage )); then
+                worst_usage="$usage"
+                worst_mount="$mnt"
+            fi
+        fi
+    done
+
+    if (( worst_usage == 0 && ${#checked_mounts[@]} == 0 )); then
+        add_row "Root disk space" "WARN ⚠ (unable to read)" "SYS"
         ((WARNINGS++))
         log "HEALTH root_space=WARN unreadable"
-    elif (( usage >= 90 )); then
-        add_row "Root disk space" "FAIL ✖ (${usage}%)"
+    elif (( worst_usage >= 90 )); then
+        add_row "Root disk space" "FAIL ✖ ($worst_mount at ${worst_usage}%)" "SYS"
         ((ERRORS++))
-        log "HEALTH root_space=FAIL usage=${usage}%"
-    elif (( usage >= 80 )); then
-        add_row "Root disk space" "WARN ⚠ (${usage}%)"
+        log "HEALTH root_space=FAIL usage=${worst_usage}% mount=$worst_mount"
+    elif (( worst_usage >= 80 )); then
+        add_row "Root disk space" "WARN ⚠ ($worst_mount at ${worst_usage}%)" "SYS"
         ((WARNINGS++))
-        log "HEALTH root_space=WARN usage=${usage}%"
+        log "HEALTH root_space=WARN usage=${worst_usage}% mount=$worst_mount"
     else
-        add_row "Root disk space" "PASS ✔ (${usage}%)"
-        log "HEALTH root_space=PASS usage=${usage}%"
+        if (( ${#checked_mounts[@]} > 1 )); then
+            add_row "Root disk space" "PASS ✔ (Max: $worst_mount ${worst_usage}%)" "SYS"
+        else
+            add_row "Root disk space" "PASS ✔ (${worst_usage}%)" "SYS"
+        fi
+        log "HEALTH root_space=PASS usage=${worst_usage}% mount=$worst_mount"
     fi
 }
 
@@ -2218,13 +2259,13 @@ check_failed_services() {
     FAILED_SERVICES="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
 
     if [[ -z "$FAILED_SERVICES" ]]; then
-        add_row "Systemd failed (system)" "PASS ✔"
+        add_row "Systemd failed (system)" "PASS ✔" "SYS"
         log "HEALTH systemd_failed=0"
     else
         local count first_svc
         count="$(printf '%s\n' "$FAILED_SERVICES" | wc -l)"
         first_svc="$(head -n1 <<< "$FAILED_SERVICES")"
-        add_row "Systemd failed (system)" "WARN ⚠ ($count failed)"
+        add_row "Systemd failed (system)" "WARN ⚠ ($count failed)" "SYS"
         ((WARNINGS++))
         log "HEALTH systemd_failed=WARN count=$count"
         {
@@ -2233,33 +2274,74 @@ check_failed_services() {
         } >> "$LOG_FILE"
     fi
 
-    local has_user_bus=false
-    if [[ "$EUID" -ne 0 ]] || [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+    # Universal User Session Audit (Supports: Unprivileged caller, sudo, multi-user seats, lingering daemons)
+    local total_user_failed=0
+    local user_audit_details=()
+    local checked_users=0
+    local user_failed_units=""
+
+    if [[ "$EUID" -eq 0 ]]; then
+        # Running as root: inspect all active systemd user managers dynamically
+        local active_user_units
+        active_user_units="$(systemctl list-units 'user@*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}' || true)"
+
+        while read -r unit; do
+            [[ -z "$unit" ]] && continue
+            local uid="${unit#user@}"
+            uid="${uid%.service}"
+            local uname
+            uname="$(id -nu "$uid" 2>/dev/null || echo "UID $uid")"
+
+            local failed_list
+            failed_list="$(systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d' || true)"
+            ((checked_users++))
+
+            if [[ -n "$failed_list" ]]; then
+                local u_cnt
+                u_cnt="$(printf '%s\n' "$failed_list" | wc -l)"
+                ((total_user_failed += u_cnt))
+                user_failed_units+="${failed_list}"$'\n'
+                user_audit_details+=("User $uname ($uid): $u_cnt failed")
+                {
+                    echo "### FAILED SYSTEMD UNITS (USER: $uname / $uid)"
+                    systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>&1
+                } >> "$LOG_FILE"
+            fi
+        done <<< "$active_user_units"
+    else
+        # Unprivileged execution: check current user bus
         if systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null; then
-            has_user_bus=true
+            local failed_list
+            failed_list="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d' || true)"
+            ((checked_users++))
+            if [[ -n "$failed_list" ]]; then
+                local u_cnt
+                u_cnt="$(printf '%s\n' "$failed_list" | wc -l)"
+                ((total_user_failed += u_cnt))
+                user_failed_units+="${failed_list}"$'\n'
+                user_audit_details+=("${USER:-UID $EUID}: $u_cnt failed")
+                {
+                    echo "### FAILED SYSTEMD UNITS (USER: ${USER:-$EUID})"
+                    systemctl --user --failed --no-legend --plain 2>&1
+                } >> "$LOG_FILE"
+            fi
         fi
     fi
 
-    if $has_user_bus; then
-        FAILED_USER_SERVICES="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
+    FAILED_USER_SERVICES="$(printf '%s\n' "$user_failed_units" | sed '/^$/d')"
 
-        if [[ -z "$FAILED_USER_SERVICES" ]]; then
-            add_row "Systemd failed (user)" "PASS ✔"
-            log "HEALTH systemd_user_failed=0"
-        else
-            local count
-            count="$(printf '%s\n' "$FAILED_USER_SERVICES" | wc -l)"
-            add_row "Systemd failed (user)" "WARN ⚠ ($count failed)"
-            ((WARNINGS++))
-            log "HEALTH systemd_user_failed=WARN count=$count"
-            {
-                echo "### FAILED SYSTEMD UNITS (USER)"
-                systemctl --user --failed --no-legend --plain 2>&1
-            } >> "$LOG_FILE"
-        fi
-    else
-        add_row "Systemd failed (user)" "INFO ℹ (no active user session bus)"
+    if (( checked_users == 0 )); then
+        add_row "Systemd failed (user)" "INFO ℹ (no active user session bus)" "SYS"
         log "HEALTH systemd_user_failed=INFO no_user_bus"
+    elif (( total_user_failed == 0 )); then
+        add_row "Systemd failed (user)" "PASS ✔" "SYS"
+        log "HEALTH systemd_user_failed=0"
+    else
+        local summary_text
+        summary_text="$(IFS='; '; echo "${user_audit_details[*]}")"
+        add_row "Systemd failed (user)" "WARN ⚠ ($total_user_failed failed)" "SYS"
+        ((WARNINGS++))
+        log "HEALTH systemd_user_failed=WARN count=$total_user_failed details='$summary_text'"
     fi
 }
 
@@ -2270,41 +2352,57 @@ check_sysrq() {
     fi
 
     if [[ "$sysrq_val" == "1" ]]; then
-        add_row "Magic SysRq keys" "PASS ✔ (full emergency control enabled)"
+        add_row "Magic SysRq keys" "PASS ✔ (full emergency control enabled)" "SYS"
         log "HEALTH sysrq=PASS val=1"
+    elif [[ "$sysrq_val" =~ ^(16|176|22)$ ]]; then
+        add_row "Magic SysRq keys" "PASS ✔ (safe upstream default: val=$sysrq_val)" "SYS"
+        log "HEALTH sysrq=PASS val=$sysrq_val upstream_policy"
     elif [[ "$sysrq_val" == "0" ]]; then
-        add_row "Magic SysRq keys" "WARN ⚠ (disabled: no emergency recovery)"
+        add_row "Magic SysRq keys" "WARN ⚠ (disabled: no emergency recovery)" "SYS"
         ((WARNINGS++))
         log "HEALTH sysrq=WARN val=0"
+        {
+            echo "### MAGIC SYSRQ RESTRICTION"
+            echo "Current /proc/sys/kernel/sysrq value: 0"
+            echo "Emergency recovery (REISUB) is completely disabled."
+            echo "To enable emergency protection: echo 'kernel.sysrq = 1' | sudo tee /etc/sysctl.d/99-sysrq.conf"
+            echo ""
+        } >> "$LOG_FILE"
     else
-        add_row "Magic SysRq keys" "WARN ⚠ (restricted: val=$sysrq_val, REISUB disabled)"
-        ((WARNINGS++))
-        log "HEALTH sysrq=WARN val=$sysrq_val"
+        add_row "Magic SysRq keys" "INFO ℹ (restricted: val=$sysrq_val, REISUB limited)" "SYS"
+        ((INFO_COUNT++))
+        log "HEALTH sysrq=INFO val=$sysrq_val"
         {
             echo "### MAGIC SYSRQ RESTRICTION"
             echo "Current /proc/sys/kernel/sysrq value: $sysrq_val"
-            echo "Emergency recovery (REISUB) and display unlock (Alt+SysRq+K) are disabled."
-            echo "To enable emergency protection: echo 'kernel.sysrq = 1' | sudo tee /etc/sysctl.d/99-sysrq.conf"
+            echo "Emergency recovery (REISUB) and display unlock (Alt+SysRq+K) are partially restricted."
+            echo "To enable full emergency protection: echo 'kernel.sysrq = 1' | sudo tee /etc/sysctl.d/99-sysrq.conf"
             echo ""
         } >> "$LOG_FILE"
     fi
 }
 
 check_pacman_lock() {
-    if [[ ! -e /var/lib/pacman/db.lck ]]; then
-        add_row "Pacman DB lock" "PASS ✔"
+    local db_path
+    db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
+    local lock_file="${db_path%/}/db.lck"
+
+    if [[ ! -e "$lock_file" ]]; then
+        add_row "Pacman DB lock" "PASS ✔" "SYS"
         log "HEALTH pacman_lock=PASS absent"
         return
     fi
 
-    if (sudo -n fuser /var/lib/pacman/db.lck 2>/dev/null || fuser /var/lib/pacman/db.lck 2>/dev/null || pgrep -x pacman &>/dev/null); then
-        add_row "Pacman DB lock" "INFO ℹ (pacman is using it)"
+    if pgrep -x "pacman|yay|paru|pamac-daemon|packagekitd" &>/dev/null || \
+       sudo -n fuser "$lock_file" &>/dev/null 2>&1 || \
+       fuser "$lock_file" &>/dev/null 2>&1; then
+        add_row "Pacman DB lock" "INFO ℹ (package manager is active)" "SYS"
         ((INFO_COUNT++))
         log "HEALTH pacman_lock=ACTIVE"
     else
-        add_row "Pacman DB lock" "WARN ⚠ (stale lock)"
+        add_row "Pacman DB lock" "WARN ⚠ (stale lock)" "SYS"
         ((WARNINGS++))
-        log "HEALTH pacman_lock=WARN stale"
+        log "HEALTH pacman_lock=WARN stale lock_path=$lock_file"
     fi
 }
 
@@ -2358,15 +2456,15 @@ check_package_integrity() {
 }
 
 check_pacnew() {
-    PACNEWS="$(find /etc -type f -name '*.pacnew' 2>/dev/null || true)"
+    PACNEWS="$(_find_pacnew_files)"
 
     if [[ -z "$PACNEWS" ]]; then
-        add_row ".pacnew configuration files" "PASS ✔"
+        add_row ".pacnew configuration files" "PASS ✔" "SYS"
         log "HEALTH pacnew=0"
     else
         local count
-        count="$(printf '%s\n' "$PACNEWS" | wc -l)"
-        add_row ".pacnew configuration files" "WARN ⚠ ($count)"
+        count="$(printf '%s\n' "$PACNEWS" | sed '/^$/d' | wc -l)"
+        add_row ".pacnew configuration files" "WARN ⚠ ($count)" "SYS"
         ((WARNINGS++))
         log "HEALTH pacnew=WARN count=$count"
         {
@@ -3265,14 +3363,14 @@ generate_summary_json() {
                     ;;
                 root_space)
                     code="STORAGE_ROOT_SPACE_CRITICAL"
-                    summary="Root filesystem usage is over threshold"
+                    summary="Filesystem usage is over threshold on critical partition"
                     fix="Run sys-health maintenance to clean package cache and old logs"
                     risk="HIGH"
                     ;;
                 systemd_failed|systemd_user_failed)
                     code="SYS_SERVICE_FAILED"
                     summary="Failed systemd service units detected"
-                    fix="Inspect failed units: systemctl --failed (or --user --failed)"
+                    fix="Inspect failed units: systemctl --failed (or systemctl --user --failed)"
                     risk="LOW"
                     ;;
                 sysrq)
@@ -3284,18 +3382,18 @@ generate_summary_json() {
                 pacman_lock)
                     code="PKG_PACMAN_STALE_LOCK"
                     summary="Pacman DB lock exists with no running pacman process"
-                    fix="Verify with pgrep pacman and remove: sudo rm /var/lib/pacman/db.lck"
+                    fix="Verify no package manager is active and remove: sudo rm \"\$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman)/db.lck\""
                     risk="LOW"
                     ;;
                 package_integrity)
                     code="PKG_CORRUPT_FILES"
                     summary="Critical files missing from installed packages"
-                    fix="Reinstall affected package(s) via sudo pacman -S --force <pkg>"
+                    fix="Reinstall affected package(s) via sudo pacman -S --overwrite '*' <pkg>"
                     risk="HIGH"
                     ;;
                 pacnew)
                     code="CONF_PACNEW_UNMERGED"
-                    summary="Unmerged .pacnew configuration files found in /etc"
+                    summary="Unmerged .pacnew configuration files found on system"
                     fix="Merge configuration updates using eos-pacdiff or pacdiff"
                     risk="LOW"
                     ;;
@@ -3650,12 +3748,12 @@ reconstruct_tables_from_log() {
         case "$key" in
             # --- BOOT & CORE OS ---
             kernel_modules)
-                AUDIT_TABLE_BOOT+="$(_format_audit_row "Kernel & modules" "$val" "$details")"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "Kernel & modules" "$val" "$details")\n"
                 ;;
             initramfs)
                 local pkgbase="${details#pkgbase=}"
                 pkgbase="${pkgbase:-generic}"
-                AUDIT_TABLE_BOOT+="$(_format_audit_row "Initramfs ($pkgbase)" "$val" "${details:-verified}")"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "Initramfs ($pkgbase)" "$val" "${details:-verified}")\n"
                 ;;
             efi)
                 local free_mb="${details#free_mb=}"
@@ -3667,7 +3765,7 @@ reconstruct_tables_from_log() {
                 local note="free: ${free_mb}MB"
                 [[ -z "$free_mb" ]] && note="$details"
                 local label="EFI partition (${mnt:-ESP})"
-                AUDIT_TABLE_BOOT+="$(_format_audit_row "$label" "$val" "$note")"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "$label" "$val" "$note")\n"
                 ;;
             reboot_pending)
                 if [[ "${val^^}" == "NO" ]]; then
@@ -3677,35 +3775,44 @@ reconstruct_tables_from_log() {
                 fi
                 ;;
             previous_boot)
-                AUDIT_TABLE_BOOT+="$(_format_audit_row "Previous session shutdown" "$val" "${details:-clean shutdown}")"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "Previous session shutdown" "$val" "${details:-clean shutdown}")\n"
                 ;;
 
             # --- HARDWARE & DRIVERS ---
             gpu)
-                AUDIT_TABLE_HW+="$(_format_audit_row "GPU runtime" "$val" "$details")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "GPU runtime" "$val" "$details")\n"
                 ;;
             gpu_errors)
-                AUDIT_TABLE_HW+="$(_format_audit_row "GPU errors & lockups" "$val" "$details")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "GPU errors & lockups" "$val" "$details")\n"
                 ;;
             dkms)
-                AUDIT_TABLE_HW+="$(_format_audit_row "DKMS modules" "$val" "$details")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "DKMS modules" "$val" "$details")\n"
                 ;;
             cpu_temperature)
-                AUDIT_TABLE_HW+="$(_format_audit_row "CPU temperature" "$val" "${details#value=}")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "CPU temperature" "$val" "${details#value=}")\n"
                 ;;
             smart)
                 local passed="${details#passed=}"
                 local smart_note="${passed} OK"
                 [[ -z "$passed" ]] && smart_note="$details"
-                AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$smart_note")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$smart_note")\n"
                 ;;
             fstrim)
-                AUDIT_TABLE_HW+="$(_format_audit_row "SSD/NVMe TRIM timer" "$val" "${details#active=}")"
+                AUDIT_TABLE_HW+="$(_format_audit_row "SSD/NVMe TRIM timer" "$val" "${details#active=}")\n"
                 ;;
 
             # --- SYSTEM HEALTH & SERVICES ---
             root_space)
-                AUDIT_TABLE_SYS+="$(_format_audit_row "Root disk space" "$val" "${details#usage=}")"
+                local rusage="${details#usage=}"
+                local rmount=""
+                if [[ "$details" =~ mount=([^ ]+) ]]; then
+                    rmount="${BASH_REMATCH[1]}"
+                fi
+                local rnote="$rusage"
+                if [[ -n "$rmount" && "$rmount" != "/" ]]; then
+                    rnote="$rmount: $rusage"
+                fi
+                AUDIT_TABLE_SYS+="$(_format_audit_row "Root disk space" "$val" "$rnote")\n"
                 ;;
             systemd_failed)
                 if [[ "$val" == "0" ]]; then
@@ -3718,27 +3825,37 @@ reconstruct_tables_from_log() {
             systemd_user_failed)
                 if [[ "$val" == "0" ]]; then
                     AUDIT_TABLE_SYS+="Systemd failed (user) | PASS ✔\n"
+                elif [[ "$val" == "INFO" ]]; then
+                    AUDIT_TABLE_SYS+="Systemd failed (user) | INFO ℹ (${details:-no user session})\n"
                 else
                     local ucount="${details#count=}"
+                    ucount="${ucount%% *}"
                     AUDIT_TABLE_SYS+="Systemd failed (user) | WARN ⚠ (${ucount:-$val} failed)\n"
                 fi
                 ;;
             sysrq)
-                if [[ "$val" == "PASS" || "$val" == "OK" || "$val" == "1" ]]; then
-                    AUDIT_TABLE_SYS+="Magic SysRq keys | PASS ✔ (enabled)\n"
+                if [[ "$details" =~ upstream_policy ]]; then
+                    local sval="${details%% *}"
+                    sval="${sval#val=}"
+                    AUDIT_TABLE_SYS+="Magic SysRq keys | PASS ✔ (safe upstream default: val=${sval:-16})\n"
+                elif [[ "$val" == "PASS" || "$val" == "OK" || "$val" == "1" ]]; then
+                    AUDIT_TABLE_SYS+="Magic SysRq keys | PASS ✔ (full emergency control enabled)\n"
+                elif [[ "$val" == "INFO" ]]; then
+                    local sval="${details#val=}"
+                    AUDIT_TABLE_SYS+="Magic SysRq keys | INFO ℹ (restricted: val=${sval:-?})\n"
                 else
-                    AUDIT_TABLE_SYS+="$(_format_audit_row "Magic SysRq keys" "$val" "${details:-disabled}")"
+                    AUDIT_TABLE_SYS+="$(_format_audit_row "Magic SysRq keys" "$val" "${details:-disabled}")\n"
                 fi
                 ;;
             pacman_lock)
                 if [[ "$val" == "PASS" || "$val" == "OK" ]]; then
                     AUDIT_TABLE_SYS+="Pacman DB lock | PASS ✔ (none)\n"
                 else
-                    AUDIT_TABLE_SYS+="$(_format_audit_row "Pacman DB lock" "$val" "${details:-lock file present}")"
+                    AUDIT_TABLE_SYS+="$(_format_audit_row "Pacman DB lock" "$val" "${details:-lock file present}")\n"
                 fi
                 ;;
             package_integrity)
-                AUDIT_TABLE_SYS+="$(_format_audit_row "Package file integrity" "$val" "$details")"
+                AUDIT_TABLE_SYS+="$(_format_audit_row "Package file integrity" "$val" "$details")\n"
                 ;;
             pacnew)
                 if [[ "$val" == "0" ]]; then
@@ -3751,10 +3868,10 @@ reconstruct_tables_from_log() {
 
             # --- NETWORK & UPDATES ---
             network)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Network link & Gateway" "$val" "$details")"
+                AUDIT_TABLE_NET+="$(_format_audit_row "Network link & Gateway" "$val" "$details")\n"
                 ;;
             dns)
-                AUDIT_TABLE_NET+="$(_format_audit_row "System DNS" "$val" "$details")"
+                AUDIT_TABLE_NET+="$(_format_audit_row "System DNS" "$val" "$details")\n"
                 ;;
             updates)
                 if [[ "$val" == "0" ]]; then
@@ -3764,38 +3881,38 @@ reconstruct_tables_from_log() {
                 fi
                 ;;
             mirrorlist_age)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "$details")"
+                AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "$details")\n"
                 ;;
             arch_news)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Arch News (Latest)" "$val" "$details")"
+                AUDIT_TABLE_NET+="$(_format_audit_row "Arch News (Latest)" "$val" "$details")\n"
                 ;;
             arch_audit)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Arch security audit" "$val" "$details")"
+                AUDIT_TABLE_NET+="$(_format_audit_row "Arch security audit" "$val" "$details")\n"
                 ;;
 
             # --- GAMING & STEAM READINESS ---
             multilib)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "Multilib repository" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Multilib repository" "$val" "$details")\n"
                 ;;
             vulkan_32bit)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "Vulkan & 32-bit" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Vulkan & 32-bit" "$val" "$details")\n"
                 ;;
             proton_memory)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "Proton memory limits" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Proton memory limits" "$val" "$details")\n"
                 ;;
             cpu_governor)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "CPU governor" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "CPU governor" "$val" "$details")\n"
                 ;;
             desktop_session)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "Desktop session & GPU" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Desktop session & GPU" "$val" "$details")\n"
                 ;;
             steam_runtime)
-                AUDIT_TABLE_GAME+="$(_format_audit_row "Proton & Steam tools" "$val" "$details")"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Proton & Steam tools" "$val" "$details")\n"
                 ;;
 
             # --- UNMAPPED CHECKS ---
             *)
-                AUDIT_TABLE_OTHER+="$(_format_audit_row "$key" "$val" "$details")"
+                AUDIT_TABLE_OTHER+="$(_format_audit_row "$key" "$val" "$details")\n"
                 ;;
         esac
     done < "$LOG_FILE"
@@ -6350,8 +6467,11 @@ run_guarded_upgrade() {
     fi
 
     # 4. Pacman DB & Lock verification
-    if [[ -f "/var/lib/pacman/db.lck" ]]; then
-        warn "Warning: /var/lib/pacman/db.lck was left behind after upgrade transaction."
+    local post_db_path
+    post_db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
+    local post_lock="${post_db_path%/}/db.lck"
+    if [[ -f "$post_lock" ]]; then
+        warn "Warning: $post_lock was left behind after upgrade transaction."
     else
         ok "Pacman database lock clean."
     fi
@@ -6366,11 +6486,11 @@ run_guarded_upgrade() {
 
     # 5. Check .pacnew configuration files
     local pacnews
-    pacnews="$(find /etc -name "*.pacnew" 2>/dev/null || true)"
+    pacnews="$(_find_pacnew_files)"
     if [[ -n "$pacnews" ]]; then
         local p_cnt
         p_cnt="$(echo "$pacnews" | sed '/^$/d' | wc -l)"
-        warn "Notice: $p_cnt unmerged .pacnew configuration file(s) found in /etc."
+        warn "Notice: $p_cnt unmerged .pacnew configuration file(s) found on system."
         info "Run 'eos-pacdiff' or 'pacdiff' to review and merge config files."
     else
         ok "Zero unmerged .pacnew configuration files."
