@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.16
+# Arch System Health & Diagnostics v2.19
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
