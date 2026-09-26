@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.18"
+VERSION="2.19"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2475,16 +2475,23 @@ check_pacnew() {
 }
 
 check_network() {
-    if ! command -v ip &>/dev/null || ! command -v ping &>/dev/null; then
-        add_row "Network link & Gateway" "INFO ℹ (ip/ping missing)" "NET"
+    if ! command -v ip &>/dev/null; then
+        add_row "Network link & Gateway" "INFO ℹ (ip tool missing)" "NET"
         ((INFO_COUNT++))
         log "HEALTH network=tools_missing"
         return
     fi
 
-    local dev gw
+    local dev gw is_ipv6_only=false
     dev="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
     gw="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+
+    # Dual-stack fallback: support pure IPv6 networks
+    if [[ -z "$dev" || -z "$gw" ]]; then
+        dev="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
+        gw="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+        [[ -n "$dev" && -n "$gw" ]] && is_ipv6_only=true
+    fi
 
     if [[ -z "$dev" || -z "$gw" ]]; then
         add_row "Network link & Gateway" "FAIL ✖ (no default route)" "NET"
@@ -2526,41 +2533,61 @@ check_network() {
         fi
     fi
 
-    local ping_out ping_ms
-    ping_out="$(ping -c 1 -W 1 "$gw" 2>&1)"
-    if [[ $? -ne 0 ]]; then
-        add_row "Network link & Gateway" "FAIL ✖ (gateway $gw unreachable)" "NET"
-        ((ERRORS++))
-        log "HEALTH network=FAIL iface=$dev gateway=$gw ping=unreachable"
-        return
-    fi
-    ping_ms="$(printf '%s\n' "$ping_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
-    if [[ -n "$ping_ms" ]]; then
-        ping_ms="$(awk "BEGIN {printf \"%.1f\", $ping_ms}" 2>/dev/null || echo "$ping_ms")"
-    else
-        ping_ms="<1"
+    local ping_ms="<1" gw_stealth=false
+    if command -v ping &>/dev/null; then
+        local ping_cmd=(ping -c 1 -W 1 "$gw")
+        $is_ipv6_only && ping_cmd=(ping -6 -c 1 -W 1 "$gw")
+
+        local ping_out
+        if ping_out="$("${ping_cmd[@]}" 2>&1)"; then
+            ping_ms="$(printf '%s\n' "$ping_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
+            if [[ -n "$ping_ms" ]]; then
+                ping_ms="$(awk "BEGIN {printf \"%.1f\", $ping_ms}" 2>/dev/null || echo "$ping_ms")"
+            else
+                ping_ms="<1"
+            fi
+        else
+            # Gateway dropped ICMP (stealth router/firewall): verify via ARP neighbor table or public ping
+            if ip neigh show "$gw" 2>/dev/null | grep -qiE 'REACHABLE|DELAY|STALE'; then
+                gw_stealth=true
+                ping_ms="stealth"
+            elif ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+                gw_stealth=true
+                ping_ms="stealth"
+            else
+                add_row "Network link & Gateway" "FAIL ✖ (gateway $gw unreachable)" "NET"
+                ((ERRORS++))
+                log "HEALTH network=FAIL iface=$dev gateway=$gw ping=unreachable"
+                return
+            fi
+        fi
     fi
 
     local gw6 ping6_ms="" ipv6_tag=""
-    gw6="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
-    if [[ -n "$gw6" ]]; then
-        local ping6_out
-        if ping6_out="$(ping -6 -c 1 -W 1 "$gw6" 2>&1)"; then
-            ping6_ms="$(printf '%s\n' "$ping6_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
-            ipv6_tag=" +IPv6:${ping6_ms:-<1}ms"
-        else
-            ipv6_tag=" +IPv6:unreachable"
-            log "HEALTH network=INFO iface=$dev gw6=$gw6 ping6=unreachable"
+    if ! $is_ipv6_only; then
+        gw6="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+        if [[ -n "$gw6" ]]; then
+            local ping6_out
+            if ping6_out="$(ping -6 -c 1 -W 1 "$gw6" 2>&1)"; then
+                ping6_ms="$(printf '%s\n' "$ping6_out" | grep -oE 'time=[0-9.]+' | head -n1 | cut -d= -f2)"
+                ipv6_tag=" +IPv6:${ping6_ms:-<1}ms"
+            else
+                ipv6_tag=" +IPv6:unreachable"
+                log "HEALTH network=INFO iface=$dev gw6=$gw6 ping6=unreachable"
+            fi
         fi
     fi
 
     # Generic orphan VPN DNS detection (covers AirVPN, WireGuard, OpenVPN, Mullvad)
-    if grep -qE '^(nameserver 10\.128\.0\.1|nameserver 10\.2\.0\.1|nameserver 10\.64\.0\.1)' /etc/resolv.conf 2>/dev/null; then
-        if ! ip link show | grep -qiE '(tun|wg|tap|airvpn|nordlynx|mullvad)'; then
-            add_row "Network link & Gateway" "WARN ⚠ (orphan VPN DNS in resolv.conf)" "NET"
-            ((WARNINGS++))
-            log "HEALTH network=WARN orphan_vpn_dns=yes"
-            return
+    # Only alert if dedicated VPN DNS server is configured in resolv.conf without active VPN interface AND is unreachable
+    if grep -qE '^(nameserver 10\.128\.0\.1|nameserver 10\.64\.0\.1)' /etc/resolv.conf 2>/dev/null; then
+        if ! ip link show 2>/dev/null | grep -qiE '(tun|wg|tap|airvpn|nordlynx|mullvad)'; then
+            if ! ping -c 1 -W 1 10.64.0.1 &>/dev/null && ! ping -c 1 -W 1 10.128.0.1 &>/dev/null; then
+                add_row "Network link & Gateway" "WARN ⚠ (unreachable orphan VPN DNS in resolv.conf)" "NET"
+                ((WARNINGS++))
+                log "HEALTH network=WARN orphan_vpn_dns=yes"
+                return
+            fi
         fi
     fi
 
@@ -2572,11 +2599,21 @@ check_network() {
     fi
 
     if [[ -z "$speed_str" || "$speed_str" != "Wi-Fi, "* ]]; then
-        if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 && speed <= 100 )); then
-            add_row "Network link & Gateway" "WARN ⚠ ($dev: degraded link speed ${speed}Mb/s)" "NET"
-            ((WARNINGS++))
-            log "HEALTH network=WARN iface=$dev degraded_speed=${speed}Mbps gateway=$gw"
-            return
+        if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ ]]; then
+            if (( speed <= 10 && speed > 0 )); then
+                add_row "Network link & Gateway" "WARN ⚠ ($dev: critically degraded link speed ${speed}Mb/s)" "NET"
+                ((WARNINGS++))
+                log "HEALTH network=WARN iface=$dev degraded_speed=${speed}Mbps gateway=$gw"
+                return
+            elif (( speed <= 100 && speed > 0 )); then
+                # Only flag as degraded if interface is known to support Gigabit+
+                if command -v ethtool &>/dev/null && ethtool "$dev" 2>/dev/null | grep -qE '1000base|2500base|5000base|10000base'; then
+                    add_row "Network link & Gateway" "WARN ⚠ ($dev: degraded link speed 100Mb/s on Gigabit+ NIC)" "NET"
+                    ((WARNINGS++))
+                    log "HEALTH network=WARN iface=$dev degraded_speed=100Mbps gateway=$gw"
+                    return
+                fi
+            fi
         fi
     fi
 
@@ -2601,43 +2638,67 @@ check_network() {
         fi
     fi
 
-    add_row "Network link & Gateway" "PASS ✔ ($dev: ${speed_str}gw: ${gw} ${ping_ms}ms${ipv6_tag})" "NET"
-    log "HEALTH network=PASS iface=$dev speed=${speed:-auto} gateway=$gw ping=${ping_ms}ms errors=0 metered=${metered_status:-no}"
+    local gw_display="${gw} ${ping_ms}ms"
+    $gw_stealth && gw_display="${gw} (stealth ICMP OK)"
+
+    add_row "Network link & Gateway" "PASS ✔ ($dev: ${speed_str}gw: ${gw_display}${ipv6_tag})" "NET"
+    log "HEALTH network=PASS iface=$dev speed=${speed:-auto} gateway=$gw ping=${ping_ms} errors=0 metered=${metered_status:-no}"
 }
 
 check_dns() {
-    if ! command -v dig &>/dev/null; then
-        add_row "System DNS" "INFO ℹ (dig not installed)"
-        ((INFO_COUNT++))
-        log "HEALTH dns=dig_missing"
-        return
-    fi
-
     local test_host="${DNS_TEST_HOST:-archlinux.org}"
-    local dig_cmd=(dig)
-    if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
-        dig_cmd+=("@${DNS_TEST_SERVER}")
-    fi
-    dig_cmd+=("$test_host" "+time=2" "+tries=1")
+    local qtime_num="" server_note=""
 
-    local dig_out qtime_num
-    dig_out="$("${dig_cmd[@]}" 2>&1)"
-    printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
+    if command -v dig &>/dev/null; then
+        local dig_cmd=(dig)
+        if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+            dig_cmd+=("@${DNS_TEST_SERVER}")
+            server_note=" @${DNS_TEST_SERVER}"
+        fi
+        dig_cmd+=("$test_host" "+time=2" "+tries=1")
 
-    if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
-        add_row "System DNS" "WARN ⚠ (query failed or NOERROR not received)"
+        local dig_out
+        dig_out="$("${dig_cmd[@]}" 2>&1)"
+        printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
+
+        if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
+            add_row "System DNS" "WARN ⚠ (query failed or NOERROR not received)" "NET"
+            ((WARNINGS++))
+            log "HEALTH dns=WARN resolution_failed host=$test_host"
+            return
+        fi
+
+        qtime_num="$(printf '%s\n' "$dig_out" | grep -oE 'Query time: [0-9]+' | grep -oE '[0-9]+')"
+        qtime_num="${qtime_num:-?}"
+        add_row "System DNS" "PASS ✔ (${qtime_num}ms${server_note})" "NET"
+        log "HEALTH dns=PASS qtime=${qtime_num}ms host=$test_host"
+    elif command -v drill &>/dev/null; then
+        local drill_cmd=(drill)
+        if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+            drill_cmd+=("@${DNS_TEST_SERVER}")
+            server_note=" @${DNS_TEST_SERVER}"
+        fi
+        drill_cmd+=("$test_host")
+        local drill_out
+        drill_out="$("${drill_cmd[@]}" 2>&1)"
+        if ! grep -q 'rcode: NOERROR' <<< "$drill_out"; then
+            add_row "System DNS" "WARN ⚠ (drill query failed)" "NET"
+            ((WARNINGS++))
+            log "HEALTH dns=WARN resolution_failed host=$test_host"
+            return
+        fi
+        qtime_num="$(grep -oE 'Query time: [0-9]+' <<< "$drill_out" | grep -oE '[0-9]+')"
+        qtime_num="${qtime_num:-?}"
+        add_row "System DNS" "PASS ✔ (${qtime_num}ms${server_note})" "NET"
+        log "HEALTH dns=PASS qtime=${qtime_num}ms host=$test_host"
+    elif getent ahosts "$test_host" &>/dev/null; then
+        add_row "System DNS" "PASS ✔ (resolved via getent)" "NET"
+        log "HEALTH dns=PASS method=getent host=$test_host"
+    else
+        add_row "System DNS" "WARN ⚠ (resolution failed for $test_host)" "NET"
         ((WARNINGS++))
         log "HEALTH dns=WARN resolution_failed host=$test_host"
-        return
     fi
-
-    qtime_num="$(printf '%s\n' "$dig_out" | grep -oE 'Query time: [0-9]+' | grep -oE '[0-9]+')"
-    qtime_num="${qtime_num:-?}"
-
-    local server_note=""
-    [[ -n "${DNS_TEST_SERVER:-}" ]] && server_note=" @${DNS_TEST_SERVER}"
-    add_row "System DNS" "PASS ✔ (${qtime_num}ms${server_note})"
-    log "HEALTH dns=PASS qtime=${qtime_num}ms host=$test_host"
 }
 
 check_updates() {
@@ -2688,56 +2749,76 @@ check_updates() {
 }
 
 check_mirrorlist_age() {
-    local arch_file="/etc/pacman.d/mirrorlist"
-    local distro_file="/etc/pacman.d/endeavouros-mirrorlist"
-    local now arch_days="?" distro_days="?"
+    local now
     now=$(date +%s)
+    local -a mirror_files=()
 
-    if [[ -f "$arch_file" ]]; then
-        local arch_mtime
-        arch_mtime="$(stat -c %Y "$arch_file" 2>/dev/null || echo 0)"
-        if (( arch_mtime > 0 )); then
-            arch_days=$(( (now - arch_mtime) / 86400 ))
-        fi
-    fi
+    # Discover all active mirrorlists dynamically (Arch, EndeavourOS, CachyOS, Chaotic, etc.)
+    while IFS= read -r f; do
+        [[ -f "$f" ]] && mirror_files+=("$f")
+    done < <(find /etc/pacman.d -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
 
-    if [[ -f "$distro_file" ]]; then
-        local distro_mtime
-        distro_mtime="$(stat -c %Y "$distro_file" 2>/dev/null || echo 0)"
-        if (( distro_mtime > 0 )); then
-            distro_days=$(( (now - distro_mtime) / 86400 ))
-        fi
-    fi
-
-    if [[ "$arch_days" == "?" && "$distro_days" == "?" ]]; then
-        add_row "Mirrorlist age" "WARN ⚠ (mirrorlists missing)"
+    if (( ${#mirror_files[@]} == 0 )); then
+        add_row "Mirrorlist age" "WARN ⚠ (no mirrorlist found in /etc/pacman.d)" "NET"
         ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN missing_both"
+        log "HEALTH mirrorlist_age=WARN missing_all"
         return
     fi
 
+    # Ensure standard Arch mirrorlist is evaluated first if present
+    local -a sorted_files=()
+    if [[ -f "/etc/pacman.d/mirrorlist" ]]; then
+        sorted_files+=("/etc/pacman.d/mirrorlist")
+    fi
+    for mf in "${mirror_files[@]}"; do
+        [[ "$mf" == "/etc/pacman.d/mirrorlist" ]] && continue
+        sorted_files+=("$mf")
+    done
+
     local max_days=0
-    [[ "$arch_days" =~ ^[0-9]+$ ]] && (( arch_days > max_days )) && max_days=$arch_days
-    [[ "$distro_days" =~ ^[0-9]+$ ]] && (( distro_days > max_days )) && max_days=$distro_days
+    local -a labels=()
+
+    for mf in "${sorted_files[@]}"; do
+        local mtime fname days
+        fname="$(basename "$mf")"
+        fname="${fname%-mirrorlist}"
+        fname="${fname#mirrorlist}"
+        case "${fname,,}" in
+            arch|"")    fname="Arch" ;;
+            endeavouros) fname="Distro" ;;
+            cachyos)     fname="CachyOS" ;;
+            chaotic*)    fname="Chaotic" ;;
+            *)           fname="${fname^}" ;;
+        esac
+
+        mtime="$(stat -c %Y "$mf" 2>/dev/null || echo 0)"
+        if (( mtime > 0 )); then
+            days=$(( (now - mtime) / 86400 ))
+            (( days > max_days )) && max_days=$days
+            labels+=("${fname}: ${days}d")
+        fi
+    done
 
     local status_label=""
-    if [[ -f "$distro_file" ]]; then
-        status_label="Arch: ${arch_days}d │ Distro: ${distro_days}d"
-    else
-        status_label="Arch: ${arch_days}d"
-    fi
+    for l in "${labels[@]}"; do
+        if [[ -z "$status_label" ]]; then
+            status_label="$l"
+        else
+            status_label+=" │ $l"
+        fi
+    done
 
     if (( max_days > 90 )); then
-        add_row "Mirrorlist age" "WARN ⚠ ($status_label)"
+        add_row "Mirrorlist age" "WARN ⚠ ($status_label)" "NET"
         ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN arch_days=$arch_days distro_days=$distro_days max_days=$max_days"
+        log "HEALTH mirrorlist_age=WARN max_days=$max_days details='$status_label'"
     elif (( max_days > 45 )); then
-        add_row "Mirrorlist age" "INFO ℹ ($status_label)"
+        add_row "Mirrorlist age" "INFO ℹ ($status_label)" "NET"
         ((INFO_COUNT++))
-        log "HEALTH mirrorlist_age=INFO arch_days=$arch_days distro_days=$distro_days"
+        log "HEALTH mirrorlist_age=INFO max_days=$max_days details='$status_label'"
     else
-        add_row "Mirrorlist age" "PASS ✔ ($status_label)"
-        log "HEALTH mirrorlist_age=PASS arch_days=$arch_days distro_days=$distro_days"
+        add_row "Mirrorlist age" "PASS ✔ ($status_label)" "NET"
+        log "HEALTH mirrorlist_age=PASS max_days=$max_days details='$status_label'"
     fi
 }
 
@@ -2757,15 +2838,18 @@ check_arch_news() {
     local affected_pkgs=()
     local recent_items=()
 
-    # Parse top 10 news items across the feed instead of single NR==2
+    # Parse top 10 news items across the feed
     while IFS= read -r title; do
         [[ -z "$title" ]] && continue
         local clean_title
         clean_title="$(sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g; s/&quot;/"/g' <<< "$title")"
         if grep -qi 'manual intervention' <<< "$clean_title"; then
-            local pkg
-            pkg="$(awk '{print $1}' <<< "$clean_title")"
-            if pacman -Qq "$pkg" &>/dev/null; then
+            # Extract package candidate, strip punctuation, and convert to lowercase for exact pacman matching
+            local raw_pkg pkg
+            raw_pkg="$(awk '{print $1}' <<< "$clean_title")"
+            pkg="${raw_pkg//[^a-zA-Z0-9_-]/}"
+            pkg="${pkg,,}"
+            if [[ -n "$pkg" ]] && pacman -Qq "$pkg" &>/dev/null; then
                 affected_pkgs+=("$pkg")
             fi
         fi
@@ -2773,7 +2857,7 @@ check_arch_news() {
     done < <(grep -oP '(?<=<title>).*?(?=</title>)' <<< "$rss_data" | sed '1d' | head -n 10 || true)
 
     if (( ${#affected_pkgs[@]} > 0 )); then
-        add_row "Arch News (30d)" "WARN ⚠ (manual intervention: ${affected_pkgs[*]})" "NET"
+        add_row "Arch News (Latest)" "WARN ⚠ (manual intervention: ${affected_pkgs[*]})" "NET"
         ((WARNINGS++))
         log "HEALTH arch_news=WARN manual_intervention=YES affected=YES packages='${affected_pkgs[*]}'"
         {
@@ -3881,10 +3965,26 @@ reconstruct_tables_from_log() {
                 fi
                 ;;
             mirrorlist_age)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "$details")\n"
+                if [[ "$details" =~ details=\'([^\']+)\' ]]; then
+                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "${BASH_REMATCH[1]}")\n"
+                else
+                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "$details")\n"
+                fi
                 ;;
             arch_news)
-                AUDIT_TABLE_NET+="$(_format_audit_row "Arch News (Latest)" "$val" "$details")\n"
+                if [[ "$val" == "PASS" || "$val" == "OK" ]]; then
+                    local top_title="${details#top_title=}"
+                    top_title="${top_title%\'}"
+                    top_title="${top_title#\'}"
+                    AUDIT_TABLE_NET+="Arch News (Latest) | PASS ✔ (${top_title:-Recent news up to date})\n"
+                elif [[ "$val" == "WARN" ]]; then
+                    local pkgs="${details#*packages=}"
+                    pkgs="${pkgs%\'}"
+                    pkgs="${pkgs#\'}"
+                    AUDIT_TABLE_NET+="Arch News (Latest) | WARN ⚠ (manual intervention: ${pkgs})\n"
+                else
+                    AUDIT_TABLE_NET+="$(_format_audit_row "Arch News (Latest)" "$val" "$details")\n"
+                fi
                 ;;
             arch_audit)
                 AUDIT_TABLE_NET+="$(_format_audit_row "Arch security audit" "$val" "$details")\n"
