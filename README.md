@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.16](https://img.shields.io/badge/Version-2.16-orange.svg)](CHANGELOG.md)
+[![Version: 2.20](https://img.shields.io/badge/Version-2.20-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -81,10 +81,10 @@ sys-health AI Session:
   * Ephemeral-filtered package integrity checking (`pacman -Qk`).
   * Unmerged configuration file detection (`.pacnew`).
   * Mirror sync freshness tracking (`core.db`).
-  * **Smart Arch News Correlator (v2.15):** Proactively scrapes upstream Arch News with HTTP 429 rate-limiting resilience and local caching, correlating manual intervention advisories against locally installed packages (`pacman -Qq`) to eliminate false-positive alarm fatigue.
+  * **Smart Arch News Correlator:** Proactively scrapes upstream Arch News with HTTP 429 rate-limiting resilience and local caching, correlating manual intervention advisories against locally installed packages (`pacman -Qq`) to eliminate false-positive alarm fatigue.
   * Official Arch Security Tracker (`arch-audit`) integration, separating actionable repository fixes from unclosed upstream backlog.
 
-### 2. Guarded System Upgrade (Pre-Flight → Update → Post-Audit, v2.15)
+### 2. Guarded System Upgrade (Pre-Flight → Update → Post-Audit)
 Eliminates rolling-release upgrade friction through a disciplined 3-phase workflow:
 * **Phase 1: Pre-Flight Safety Gates:**
   1. *Privilege & Session Gate (Gate 0):* Validates sudo authentication with automated background keepalive; blocks running raw as root.
@@ -92,7 +92,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   3. *Substrate & Mount Topology Gate (Gate 1):* Confirms ESP and `/boot` are mounted and writable; enforces safe disk margins (6 GB root, 4 GB pacman cache, 100 MB ESP).
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
   5. *Network & Mirror Freshness Gate (Gate 3):* Verifies TLS/DNS reachability to official infrastructure and offers 1-click regional mirror ranking (`reflector` / `eos-rankmirrors`) if lists are older than 30 days.
-  6. *Smart Arch News Correlator Gate (Gate 4, v2.15):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
+  6. *Smart Arch News Correlator Gate (Gate 4):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
   7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants (e.g., legacy Maxwell GTX 970 vs modern drivers), kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
   Executes the canonical distribution package manager (`eos-update`, `yay`, `paru`, or `pacman`).
@@ -134,7 +134,7 @@ Bridges the gap for software installed outside distribution repositories:
 * **Active Browser Process Protection:** Inspects running Firefox or Chromium processes (`pgrep`). Skips browser cache cleaning during active sessions to prevent SQLite WAL corruption, lost tabs, or session restore loss.
 * **Strict Shader Cache Blacklist:** Hardcoded blacklist permanently safeguarding graphics shader caches (`~/.nv`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, Steam shader pre-caches, DXVK caches), eliminating post-cleanup in-game stutter.
 * **Offline Rollback Lifeline:** Prunes package cache retaining the last 2 versions of installed packages, while retaining **at least 1 version of uninstalled packages** (`paccache -r -u -k 1`), preserving emergency offline rollback capabilities.
-* **FreeDesktop Trash & Journal Clean:** Native `gio trash --empty` and safe systemd journal vacuuming (> 14 days).
+* **FreeDesktop Trash & Journal Clean:** Native `gio trash --empty` and safe systemd journal vacuuming (> 30 days).
 
 ---
 
