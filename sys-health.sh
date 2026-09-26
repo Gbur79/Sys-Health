@@ -4481,6 +4481,18 @@ is_shim_managed() {
     [[ "$(check_binary_ownership "$1")" == "shim" ]]
 }
 
+can_self_update_binary() {
+    local bin="$1"
+    local bin_path
+    bin_path="$(type -P "$bin" 2>/dev/null || true)"
+    [[ -z "$bin_path" ]] && return 1
+    local real
+    real="$(realpath -e "$bin_path" 2>/dev/null || echo "$bin_path")"
+    local dir
+    dir="$(dirname "$real")"
+    [[ -w "$real" && -w "$dir" ]]
+}
+
 # Guardrail checking whether official repo updates are pending before AUR upgrade
 check_partial_upgrade_risk() {
     # Returns:
@@ -4868,6 +4880,28 @@ run_software_updates() {
         )"
 
         case "$act" in
+            *"Re-check for updates"*)
+                continue
+                ;;
+            *"Return to Main Menu"*|"")
+                return "$exit_summary"
+                ;;
+        esac
+
+        # Security & Multi-User Isolation Guardrail:
+        # Standalone tools (~/.local/bin, pipx, rustup, uv, goose) and AUR packages must NEVER be updated as root.
+        if [[ "$EUID" -eq 0 ]]; then
+            echo ""
+            fail "SECURITY GUARDRAIL: Standalone & AUR updates cannot be executed as root!"
+            info "Running user-space updates (AUR, ~/.local/bin, uv, goose, pipx, rustup) as root causes"
+            info "permission corruption (root-owned files in user \$HOME), broken environments, and build failures."
+            info "Please run 'sys-health --software' directly from your standard user terminal account without sudo."
+            echo ""
+            pause_screen
+            continue
+        fi
+
+        case "$act" in
             *"Update AUR Packages"*)
                 if [[ -z "$aur_helper" ]]; then
                     fail "No supported AUR helper installed (paru/yay/pikaur)."
@@ -4928,6 +4962,13 @@ run_software_updates() {
                     fail "UV Python Toolchain is managed by a runtime shim (mise/asdf/cargo/pyenv). Please update via its manager."
                     pause_screen
                     continue
+                elif ! can_self_update_binary uv; then
+                    local uv_path
+                    uv_path="$(type -P uv 2>/dev/null || echo "uv")"
+                    fail "Cannot self-update $uv_path: target binary or directory is not writable by current user ($USER)."
+                    info "If uv was installed globally into /usr/local/bin, update it via administrative tools or package manager."
+                    pause_screen
+                    continue
                 fi
                 info "Running: uv self update"
                 if uv self update; then
@@ -4947,6 +4988,13 @@ run_software_updates() {
                     continue
                 elif [[ "$goose_owner" == "shim" ]]; then
                     fail "Goose AI Assistant is managed by a runtime shim (mise/asdf/cargo). Please update via its manager."
+                    pause_screen
+                    continue
+                elif ! can_self_update_binary goose; then
+                    local goose_path
+                    goose_path="$(type -P goose 2>/dev/null || echo "goose")"
+                    fail "Cannot self-update $goose_path: target binary or directory is not writable by current user ($USER)."
+                    info "If goose was installed globally into /usr/local/bin, update it via administrative tools."
                     pause_screen
                     continue
                 fi
@@ -5032,19 +5080,27 @@ run_software_updates() {
                 fi
                 if $uv_up_needed; then
                     if [[ "$(check_binary_ownership uv)" == "standalone" ]]; then
-                        info "--- Updating UV Python Toolchain ---"
-                        if ! uv self update; then
-                            fail "UV Python Toolchain update failed."
-                            exit_summary=1
+                        if can_self_update_binary uv; then
+                            info "--- Updating UV Python Toolchain ---"
+                            if ! uv self update; then
+                                fail "UV Python Toolchain update failed."
+                                exit_summary=1
+                            fi
+                        else
+                            warn "Skipping UV update: binary or directory is not writable by current user ($USER)."
                         fi
                     fi
                 fi
                 if $goose_up_needed; then
                     if [[ "$(check_binary_ownership goose)" == "standalone" ]]; then
-                        info "--- Updating Goose AI Assistant ---"
-                        if ! goose update; then
-                            fail "Goose AI Assistant update failed."
-                            exit_summary=1
+                        if can_self_update_binary goose; then
+                            info "--- Updating Goose AI Assistant ---"
+                            if ! goose update; then
+                                fail "Goose AI Assistant update failed."
+                                exit_summary=1
+                            fi
+                        else
+                            warn "Skipping Goose update: binary or directory is not writable by current user ($USER)."
                         fi
                     fi
                 fi
