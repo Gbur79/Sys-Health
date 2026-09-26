@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.16"
+VERSION="2.17"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -680,9 +680,18 @@ detect_bootloader() {
 }
 
 detect_initramfs_generator() {
-    if command -v dracut &>/dev/null && [[ -d /etc/dracut.conf.d ]]; then
+    if command -v dracut &>/dev/null && [[ -d /etc/dracut.conf.d || -f /etc/dracut.conf || -d /usr/lib/dracut ]]; then
+        if command -v mkinitcpio &>/dev/null && [[ -f /etc/mkinitcpio.conf || -d /etc/mkinitcpio.d ]]; then
+            if [[ -f /usr/share/libalpm/hooks/90-dracut-install.hook || -f /etc/pacman.d/hooks/90-dracut-install.hook || -f /usr/share/libalpm/hooks/eos-dracut.hook ]]; then
+                echo "dracut"
+                return
+            elif [[ -f /usr/share/libalpm/hooks/90-mkinitcpio-install.hook ]]; then
+                echo "mkinitcpio"
+                return
+            fi
+        fi
         echo "dracut"
-    elif command -v mkinitcpio &>/dev/null && [[ -f /etc/mkinitcpio.conf ]]; then
+    elif command -v mkinitcpio &>/dev/null && [[ -f /etc/mkinitcpio.conf || -d /etc/mkinitcpio.d ]]; then
         echo "mkinitcpio"
     elif command -v booster &>/dev/null; then
         echo "booster"
@@ -773,8 +782,9 @@ refresh_state_snapshot() {
         lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display'
         echo ''
         echo '--- 7. Initramfs Configuration Files (Dracut / Mkinitcpio) ---'
-        if [[ -d /etc/dracut.conf.d ]]; then
+        if [[ -f /etc/dracut.conf || -d /etc/dracut.conf.d ]]; then
             echo 'Dracut configs:'
+            [[ -f /etc/dracut.conf ]] && grep -v '^#' /etc/dracut.conf 2>/dev/null | sed '/^$/d'
             ls -la /etc/dracut.conf.d/ 2>/dev/null
             cat /etc/dracut.conf.d/*.conf 2>/dev/null
         fi
@@ -789,6 +799,11 @@ refresh_state_snapshot() {
         echo ''
         echo '--- 9. Boot Directory Content ---'
         ls -lah /boot/ 2>/dev/null
+        if [[ -d /efi ]]; then
+            echo ''
+            echo '--- 9b. EFI Directory Content (/efi) ---'
+            ls -lah /efi/ 2>/dev/null
+        fi
         echo ''
         echo '--- 10. Failed Systemd Services (System) ---'
         systemctl --failed --no-legend --plain 2>/dev/null
@@ -863,6 +878,7 @@ readonly CRITICAL_SYSTEM_ROOTS=(
     "/var"
     "/usr"
     "/boot"
+    "/efi"
     "/opt"
     "/bin"
     "/sbin"
@@ -1386,12 +1402,186 @@ run_maintenance() {
 # Health checks
 # ------------------------------------------------------------------------------
 
+detect_boot_directories() {
+    local -a dirs=()
+    local seen=" "
+
+    # 1. Active vfat ESP mountpoints from findmnt
+    local esp_mnt
+    while IFS= read -r esp_mnt; do
+        [[ -n "$esp_mnt" && -d "$esp_mnt" ]] || continue
+        if [[ "$seen" != *" $esp_mnt "* ]]; then
+            dirs+=("$esp_mnt")
+            seen+="$esp_mnt "
+        fi
+    done < <(findmnt -n -r -t vfat -o TARGET 2>/dev/null || true)
+
+    # 2. Inspect /etc/fstab for vfat or boot mounts
+    local fstab_mnt
+    while IFS= read -r fstab_mnt; do
+        [[ -n "$fstab_mnt" && -d "$fstab_mnt" ]] || continue
+        if [[ "$seen" != *" $fstab_mnt "* ]]; then
+            dirs+=("$fstab_mnt")
+            seen+="$fstab_mnt "
+        fi
+    done < <(awk '$3 == "vfat" || $2 ~ /^\/(boot|efi|boot\/efi)$/ {print $2}' /etc/fstab 2>/dev/null || true)
+
+    # 3. Dedicated /boot, /efi, or /boot/efi directories if present
+    for cand in /boot /efi /boot/efi; do
+        if [[ -d "$cand" ]]; then
+            if [[ "$seen" != *" $cand "* ]]; then
+                dirs+=("$cand")
+                seen+="$cand "
+            fi
+        fi
+    done
+
+    printf "%s\n" "${dirs[@]}"
+}
+
+_resolve_kernel_and_initramfs() {
+    local pkgb="$1"
+    local kver="$2"
+    local -a boot_dirs=()
+    mapfile -t boot_dirs < <(detect_boot_directories)
+
+    k_vmlinuz=""
+    k_initrd=""
+    k_fallback=""
+    k_mode=""
+    k_sz=0
+
+    # 1. UKI Check (Unified Kernel Image - Type #2 BLS)
+    for bdir in "${boot_dirs[@]}"; do
+        local uki_match
+        uki_match="$(compgen -G "${bdir}/EFI/Linux/*${pkgb}*.efi" 2>/dev/null | head -n1 || true)"
+        [[ -z "$uki_match" && -n "$kver" ]] && uki_match="$(compgen -G "${bdir}/EFI/Linux/*${kver}*.efi" 2>/dev/null | head -n1 || true)"
+        if [[ -n "$uki_match" && -f "$uki_match" ]]; then
+            k_vmlinuz="$uki_match"
+            k_initrd="$uki_match"
+            k_mode="uki"
+            k_sz="$(stat -c %s "$uki_match" 2>/dev/null || echo 0)"
+            return 0
+        fi
+    done
+
+    # 2. Type #1 BLS (systemd-boot entries / kernel-install layout)
+    for bdir in "${boot_dirs[@]}"; do
+        if [[ -d "${bdir}/loader/entries" ]]; then
+            for entry in "${bdir}"/loader/entries/*.conf; do
+                [[ -f "$entry" ]] || continue
+                if grep -qiE "linux.*(${pkgb}|${kver})" "$entry" 2>/dev/null || grep -qiE "(title|version).*(${pkgb}|${kver})" "$entry" 2>/dev/null; then
+                    local l_rel i_rel
+                    l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' "$entry" | head -n1 || true)"
+                    i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' "$entry" | tail -n1 || true)"
+                    if [[ -n "$l_rel" && -f "${bdir}/${l_rel#/}" ]]; then
+                        k_vmlinuz="${bdir}/${l_rel#/}"
+                    fi
+                    if [[ -n "$i_rel" && -f "${bdir}/${i_rel#/}" ]]; then
+                        k_initrd="${bdir}/${i_rel#/}"
+                        k_mode="bls"
+                        k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                    fi
+                    if [[ -n "$k_vmlinuz" && -n "$k_initrd" ]]; then
+                        break 2
+                    fi
+                fi
+            done
+        fi
+        if [[ -z "$k_vmlinuz" || -z "$k_initrd" ]]; then
+            local bls_k bls_i
+            bls_k="$(compgen -G "${bdir}/*/${kver}/linux" 2>/dev/null | head -n1 || true)"
+            [[ -z "$bls_k" ]] && bls_k="$(compgen -G "${bdir}/*/${kver}/vmlinuz" 2>/dev/null | head -n1 || true)"
+            bls_i="$(compgen -G "${bdir}/*/${kver}/initrd*" 2>/dev/null | head -n1 || true)"
+            [[ -z "$bls_i" ]] && bls_i="$(compgen -G "${bdir}/*/${kver}/initramfs*" 2>/dev/null | head -n1 || true)"
+            if [[ -n "$bls_k" && -f "$bls_k" ]]; then
+                k_vmlinuz="$bls_k"
+            fi
+            if [[ -n "$bls_i" && -f "$bls_i" ]]; then
+                k_initrd="$bls_i"
+                k_mode="bls"
+                k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+            fi
+            if [[ -n "$k_vmlinuz" && -n "$k_initrd" ]]; then
+                break
+            fi
+        fi
+    done
+
+    # 3. Traditional Flat Layout (GRUB / Limine / rEFInd / flat systemd-boot)
+    for bdir in "${boot_dirs[@]}"; do
+        if [[ -z "$k_vmlinuz" ]]; then
+            for kcand in \
+                "${bdir}/vmlinuz-${pkgb}" \
+                "${bdir}/vmlinuz-${kver}" \
+                "${bdir}/${pkgb}/vmlinuz" \
+                "${bdir}/${pkgb}/linux"; do
+                if [[ -f "$kcand" ]]; then
+                    k_vmlinuz="$kcand"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$k_initrd" ]]; then
+            for icand in \
+                "${bdir}/initramfs-${pkgb}.img" \
+                "${bdir}/initramfs-${kver}.img" \
+                "${bdir}/initramfs-${pkgb}" \
+                "${bdir}/initrd-${pkgb}.img" \
+                "${bdir}/initrd-${pkgb}" \
+                "${bdir}/initrd-${kver}" \
+                "${bdir}/${pkgb}/initramfs.img" \
+                "${bdir}/${pkgb}/initrd"; do
+                if [[ -f "$icand" ]]; then
+                    k_initrd="$icand"
+                    k_mode="normal"
+                    k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$k_initrd" ]]; then
+            for bcand in \
+                "${bdir}/booster-${pkgb}.img" \
+                "${bdir}/booster-${kver}.img"; do
+                if [[ -f "$bcand" ]]; then
+                    k_initrd="$bcand"
+                    k_mode="booster"
+                    k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$k_fallback" ]]; then
+            for fcand in \
+                "${bdir}/initramfs-${pkgb}-fallback.img" \
+                "${bdir}/initramfs-${kver}-fallback.img" \
+                "${bdir}/initrd-${pkgb}-fallback.img"; do
+                if [[ -f "$fcand" ]]; then
+                    k_fallback="$fcand"
+                    break
+                fi
+            done
+        fi
+    done
+
+    # 4. Fallback for single-kernel systems
+    if [[ -z "$k_vmlinuz" && -f "/boot/vmlinuz" ]]; then
+        k_vmlinuz="/boot/vmlinuz"
+    fi
+    if [[ -z "$k_vmlinuz" && -f "/efi/vmlinuz" ]]; then
+        k_vmlinuz="/efi/vmlinuz"
+    fi
+}
+
 check_kernel() {
     local running_k
     running_k="$(uname -r)"
     local installed_kernels=()
     local missing_components=()
-    local esp_paths=("/efi" "/boot/efi" "/boot")
 
     # Multi-kernel validation: inspect all installed kernel module directories
     for pkgbase_file in /usr/lib/modules/*/pkgbase; do
@@ -1402,31 +1592,11 @@ check_kernel() {
         [[ -z "$pkgb" ]] && pkgb="linux"
         installed_kernels+=("$pkgb")
 
-        # 1. UKI check (Unified Kernel Image - systemd-boot / direct EFI)
-        local uki_found=false
-        for esp in "${esp_paths[@]}"; do
-            if compgen -G "${esp}/EFI/Linux/*${pkgb}*.efi" >/dev/null 2>&1; then
-                uki_found=true
-                break
-            fi
-        done
+        local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+        _resolve_kernel_and_initramfs "$pkgb" "$kver"
 
-        if $uki_found; then
-            continue
-        fi
-
-        # 2. Traditional vmlinuz + initramfs (GRUB / standard mkinitcpio / dracut / booster)
-        local vmlinuz="/boot/vmlinuz-${pkgb}"
-        local init_norm="/boot/initramfs-${pkgb}.img"
-        local init_booster="/boot/booster-${pkgb}.img"
-        local init_fall="/boot/initramfs-${pkgb}-fallback.img"
-
-        [[ ! -f "$vmlinuz" ]] && missing_components+=("$pkgb: missing vmlinuz")
-        if [[ ! -f "$init_norm" && ! -f "$init_booster" ]]; then
-            missing_components+=("$pkgb: missing initramfs")
-        elif [[ ! -f "$init_fall" && ! -f "$init_booster" ]]; then
-            missing_components+=("$pkgb: missing fallback")
-        fi
+        [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
+        [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
     done
 
     if (( ${#missing_components[@]} > 0 )); then
@@ -1442,45 +1612,40 @@ check_kernel() {
 
 check_initramfs() {
     # Maintained for backwards compatibility / specific sub-checks
-    local running="$1"
+    local running="${1:-$(uname -r)}"
     local pkgbase_file="/usr/lib/modules/$running/pkgbase"
     local pkgbase="linux-lts"
     [[ -f "$pkgbase_file" ]] && pkgbase="$(< "$pkgbase_file")"
 
-    # Check for UKI first
-    local esp_paths=("/efi" "/boot/efi" "/boot")
-    for esp in "${esp_paths[@]}"; do
-        local uki_match
-        uki_match="$(compgen -G "${esp}/EFI/Linux/*${pkgbase}*.efi" 2>/dev/null | head -n1 || true)"
-        if [[ -n "$uki_match" && -f "$uki_match" ]]; then
-            local uki_sz
-            uki_sz="$(stat -c %s "$uki_match" 2>/dev/null || echo 0)"
-            add_row "Initramfs ($pkgbase)" "PASS ✔ (UKI image [$((uki_sz / 1048576))MB])" "BOOT"
-            log "HEALTH initramfs=PASS mode=uki pkgbase=$pkgbase file=$uki_match"
-            return
+    local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+    _resolve_kernel_and_initramfs "$pkgbase" "$running"
+
+    if [[ -n "$k_initrd" && -f "$k_initrd" ]]; then
+        local sz_mb=$((k_sz / 1048576))
+        if [[ "$k_mode" == "uki" ]]; then
+            add_row "Initramfs ($pkgbase)" "PASS ✔ (UKI image [${sz_mb}MB])" "BOOT"
+            log "HEALTH initramfs=PASS mode=uki pkgbase=$pkgbase file=$k_initrd"
+        elif [[ "$k_mode" == "booster" ]]; then
+            add_row "Initramfs ($pkgbase)" "PASS ✔ (booster [${sz_mb}MB])" "BOOT"
+            log "HEALTH initramfs=PASS mode=booster pkgbase=$pkgbase file=$k_initrd"
+        elif [[ "$k_mode" == "bls" ]]; then
+            add_row "Initramfs ($pkgbase)" "PASS ✔ (BLS initrd [${sz_mb}MB])" "BOOT"
+            log "HEALTH initramfs=PASS mode=bls pkgbase=$pkgbase file=$k_initrd"
+        else
+            local gen
+            gen="$(detect_initramfs_generator)"
+            [[ "$gen" == "unknown" ]] && gen="normal"
+            if [[ -n "$k_fallback" && -f "$k_fallback" ]]; then
+                add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB] + fallback)" "BOOT"
+                log "HEALTH initramfs=PASS mode=$gen fallback=yes pkgbase=$pkgbase file=$k_initrd"
+            else
+                # For Dracut or custom mkinitcpio presets without fallback: this is a full PASS
+                add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB])" "BOOT"
+                log "HEALTH initramfs=PASS mode=$gen fallback=no pkgbase=$pkgbase file=$k_initrd"
+            fi
         fi
-    done
-
-    local normal="/boot/initramfs-${pkgbase}.img"
-    local booster="/boot/booster-${pkgbase}.img"
-    local fallback="/boot/initramfs-${pkgbase}-fallback.img"
-
-    if [[ -f "$booster" ]]; then
-        local sz
-        sz="$(stat -c %s "$booster" 2>/dev/null || echo 0)"
-        add_row "Initramfs ($pkgbase)" "PASS ✔ (booster [$((sz / 1048576))MB])" "BOOT"
-        log "HEALTH initramfs=PASS mode=booster pkgbase=$pkgbase"
-    elif [[ -f "$normal" && -f "$fallback" ]]; then
-        local sz
-        sz="$(stat -c %s "$normal" 2>/dev/null || echo 0)"
-        add_row "Initramfs ($pkgbase)" "PASS ✔ (normal [$((sz / 1048576))MB] + fallback)" "BOOT"
-        log "HEALTH initramfs=PASS pkgbase=$pkgbase"
-    elif [[ -f "$normal" ]]; then
-        add_row "Initramfs ($pkgbase)" "WARN ⚠ (fallback missing)" "BOOT"
-        ((WARNINGS++))
-        log "HEALTH initramfs=WARN fallback_missing pkgbase=$pkgbase"
     else
-        add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing $normal)" "BOOT"
+        add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing initramfs image)" "BOOT"
         ((ERRORS++))
         log "HEALTH initramfs=FAIL normal_missing pkgbase=$pkgbase"
     fi
@@ -1509,10 +1674,10 @@ check_efi_mount() {
     if [[ -n "$avail_mb" ]] && (( avail_mb < 30 )); then
         add_row "EFI partition ($efi_mnt)" "WARN ⚠ (low free space: ${avail_mb}MB)"
         ((WARNINGS++))
-        log "HEALTH efi=WARN low_space=${avail_mb}MB"
+        log "HEALTH efi=WARN low_space=${avail_mb}MB mount=$efi_mnt"
     else
         add_row "EFI partition ($efi_mnt)" "PASS ✔ (mounted vfat, free: ${avail_mb:-?}MB)"
-        log "HEALTH efi=PASS free_mb=${avail_mb:-unknown}"
+        log "HEALTH efi=PASS free_mb=${avail_mb:-unknown} mount=$efi_mnt"
     fi
 }
 
@@ -3044,7 +3209,7 @@ generate_summary_json() {
                 --arg cd "$code" \
                 --arg sm "$summary" \
                 --arg fx "$fix" \
-                --arg rk "$risk" \
+                --arg risk "$risk" \
                 '{check: $c, severity: $s, code: $cd, summary: $sm, suggested_fix: $fx, risk: $risk}')"
             entries+=("$obj")
         done < "$LOG_FILE"
@@ -3329,9 +3494,15 @@ reconstruct_tables_from_log() {
                 ;;
             efi)
                 local free_mb="${details#free_mb=}"
+                local mnt=""
+                if [[ "$details" =~ mount=([^ ]+) ]]; then
+                    mnt="${BASH_REMATCH[1]}"
+                fi
+                free_mb="${free_mb%% *}"
                 local note="free: ${free_mb}MB"
                 [[ -z "$free_mb" ]] && note="$details"
-                AUDIT_TABLE_BOOT+="$(_format_audit_row "EFI partition (/boot/efi)" "$val" "$note")"
+                local label="EFI partition (${mnt:-ESP})"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "$label" "$val" "$note")"
                 ;;
             reboot_pending)
                 if [[ "${val^^}" == "NO" ]]; then
