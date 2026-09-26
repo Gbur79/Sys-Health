@@ -926,6 +926,29 @@ MAINTENANCE_CONFIRMED="${MAINTENANCE_CONFIRMED:-0}"
 COREDUMP_CLEAN_CONFIRMED="${COREDUMP_CLEAN_CONFIRMED:-0}"
 
 # Strict Never-Touch protection list for Gaming, DXVK, Vulkan & GPU Shader Caches
+get_never_touch_shader_paths() {
+    local xdg_c="${XDG_CACHE_HOME:-$HOME/.cache}"
+    local xdg_d="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local xdg_cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+    printf "%s\n" \
+        "$HOME/.nv" \
+        "$HOME/.cache/nvidia" "$xdg_c/nvidia" \
+        "$HOME/.cache/mesa_shader_cache" "$xdg_c/mesa_shader_cache" \
+        "$HOME/.cache/mesa_shader_cache_db" "$xdg_c/mesa_shader_cache_db" \
+        "$HOME/.cache/AMD" "$xdg_c/AMD" \
+        "$HOME/.steam" \
+        "$HOME/.local/share/Steam" "$xdg_d/Steam" \
+        "$HOME/.var/app/com.valvesoftware.Steam" \
+        "$HOME/faf-linux" \
+        "$HOME/.local/share/lutris" "$xdg_d/lutris" \
+        "$HOME/.cache/lutris" "$xdg_c/lutris" \
+        "$HOME/.config/heroic" "$xdg_cfg/heroic" \
+        "$HOME/.cache/heroic" "$xdg_c/heroic" \
+        "$HOME/.var/app/com.heroicgameslauncher.hgl" \
+        "$HOME/.local/share/bottles" "$xdg_d/bottles" \
+        "$HOME/.var/app/com.usebottles.bottles"
+}
+
 readonly NEVER_TOUCH_SHADER_PATHS=(
     "$HOME/.nv"
     "$HOME/.cache/nvidia"
@@ -1016,10 +1039,16 @@ is_protected_cache_path() {
 
     target_real="$(realpath -m -- "$target" 2>/dev/null)" || return 0
 
+    local -a all_protected=("${NEVER_TOUCH_SHADER_PATHS[@]}")
+    if declare -F get_never_touch_shader_paths &>/dev/null; then
+        mapfile -t -O "${#all_protected[@]}" all_protected < <(get_never_touch_shader_paths)
+    fi
+
     # Bidirectional safety check:
     # 1. target is within or equal to protected path
     # 2. protected path is within target (fail-safe against broad wipes like ~/.cache)
-    for protected in "${NEVER_TOUCH_SHADER_PATHS[@]}"; do
+    for protected in "${all_protected[@]}"; do
+        [[ -n "$protected" ]] || continue
         protected_real="$(realpath -m -- "$protected" 2>/dev/null)" || return 0
 
         if [[ "$target_real" == "$protected_real" || "$target_real" == "$protected_real/"* ]]; then
@@ -1128,8 +1157,8 @@ safe_delete_children() {
     target_dev="$(stat -c '%d' -- "$target_real" 2>/dev/null)" || return 1
     parent_dev="$(stat -c '%d' -- "$target_parent" 2>/dev/null)" || return 1
 
-    # Check for mountpoint crossing (exempting Btrfs subvolumes on same filesystem if verified)
-    if [[ "$target_dev" != "$parent_dev" ]] && ! findmnt -n --target "$target_real" 2>/dev/null | grep -q "btrfs"; then
+    # Check for mountpoint crossing (exempting Btrfs/ZFS subvolumes/datasets or tmpfs on same parent if verified)
+    if [[ "$target_dev" != "$parent_dev" ]] && ! findmnt -n -o FSTYPE --target "$target_real" 2>/dev/null | grep -qiE '^(btrfs|zfs|tmpfs)$'; then
         warn "Refusing to clean mountpoint on a different filesystem: $target_real"
         return 1
     fi
@@ -1150,6 +1179,11 @@ browser_process_running() {
     for process_name in "$@"; do
         if pgrep -u "$uid" -x "$process_name" >/dev/null 2>&1; then
             return 0
+        fi
+        if command -v flatpak &>/dev/null; then
+            if flatpak ps 2>/dev/null | grep -qiE "$process_name"; then
+                return 0
+            fi
         fi
     done
 
@@ -1263,7 +1297,7 @@ clean_all_detected_browsers() {
 }
 
 empty_freedesktop_trash() {
-    local trash_dir="$HOME/.local/share/Trash"
+    local trash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
     local trash_size
 
     [[ "$MAINTENANCE_CONFIRMED" == "1" ]] || {
@@ -1306,29 +1340,39 @@ empty_freedesktop_trash() {
 
 clean_thumbnail_cache() {
     local thumbnail_dir="${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails"
-    local thumbnail_size
+    local legacy_thumb_dir="$HOME/.thumbnails"
+    local thumbnail_size freed_bytes=0
 
     [[ "$MAINTENANCE_CONFIRMED" == "1" ]] || return 2
-    [[ -d "$thumbnail_dir" ]] || return 0
 
-    if is_protected_cache_path "$thumbnail_dir"; then
-        fail "Refusing to clean protected thumbnail path: $thumbnail_dir"
-        return 1
+    # Clean standard XDG thumbnail directory
+    if [[ -d "$thumbnail_dir" ]]; then
+        if is_protected_cache_path "$thumbnail_dir"; then
+            fail "Refusing to clean protected thumbnail path: $thumbnail_dir"
+            return 1
+        fi
+
+        thumbnail_size="$(calculate_reclaimable_space "$thumbnail_dir")"
+        if [[ "$thumbnail_size" != "0B" && "$thumbnail_size" != "0" ]]; then
+            if ! safe_delete_children "$thumbnail_dir"; then
+                fail "Thumbnail cache cleanup failed: $thumbnail_dir"
+                log "MAINTENANCE thumbnails=result=failed dir=$thumbnail_dir"
+                return 1
+            fi
+            ok "Desktop Thumbnail cache cleaned (freed approximately $thumbnail_size)."
+            log "MAINTENANCE thumbnails=result=cleaned size=${thumbnail_size}"
+        fi
     fi
 
-    thumbnail_size="$(calculate_reclaimable_space "$thumbnail_dir")"
-    if [[ "$thumbnail_size" == "0B" ]]; then
-        return 0
+    # Clean legacy ~/.thumbnails if present (GNOME 2 / XFCE / older legacy apps)
+    if [[ -d "$legacy_thumb_dir" && ! -L "$legacy_thumb_dir" ]]; then
+        local leg_sz
+        leg_sz="$(calculate_reclaimable_space "$legacy_thumb_dir")"
+        if [[ "$leg_sz" != "0B" && "$leg_sz" != "0" ]]; then
+            safe_delete_children "$legacy_thumb_dir" || true
+            log "MAINTENANCE thumbnails_legacy=result=cleaned size=${leg_sz}"
+        fi
     fi
-
-    if ! safe_delete_children "$thumbnail_dir"; then
-        fail "Thumbnail cache cleanup failed."
-        log "MAINTENANCE thumbnails=result=failed"
-        return 1
-    fi
-
-    ok "Desktop Thumbnail cache cleaned (freed approximately $thumbnail_size)."
-    log "MAINTENANCE thumbnails=result=cleaned size=${thumbnail_size}"
 }
 
 clean_coredumps_by_age() {
@@ -1378,7 +1422,7 @@ prune_aur_cache_safely() {
         # Find directories inside aur_cache_dir that contain pkg.tar files
         while IFS= read -r -d '' pdir; do
             [[ -n "$pdir" ]] && extra_cdirs+=("-c" "$pdir")
-        done < <(find "$aur_cache_dir" -mindepth 1 -maxdepth 2 -type f -name "*.pkg.tar.*" -exec dirname {} + 2>/dev/null | sort -u | tr '\n' '\0')
+        done < <(find "$aur_cache_dir" -mindepth 1 -maxdepth 3 -type f -name "*.pkg.tar.*" -exec dirname {} + 2>/dev/null | sort -u | tr '\n' '\0')
 
         if (( ${#extra_cdirs[@]} > 0 )); then
             if ! run_checked \
@@ -1409,12 +1453,15 @@ run_maintenance() {
         warn "Package manager or AUR build activity detected; pacman cache step skipped."
         log "MAINTENANCE pacman_cache=result=skipped_busy"
     elif command -v paccache >/dev/null 2>&1; then
-        pacman_size="$(calculate_reclaimable_space /var/cache/pacman/pkg)"
-        info "Primary pacman package cache: $pacman_size"
+        local pacman_cache_dir
+        pacman_cache_dir="$(pacman-conf CacheDir 2>/dev/null | head -n 1 || echo "/var/cache/pacman/pkg")"
+        [[ -d "$pacman_cache_dir" ]] || pacman_cache_dir="/var/cache/pacman/pkg"
+        pacman_size="$(calculate_reclaimable_space "$pacman_cache_dir")"
+        info "Primary pacman package cache ($pacman_cache_dir): $pacman_size"
 
         if ! run_checked \
             "Pruning installed package cache; keeping ${PACCACHE_INSTALLED_KEEP} versions..." \
-            sudo paccache --remove --keep "$PACCACHE_INSTALLED_KEEP"; then
+            sudo paccache -c "$pacman_cache_dir" --remove --keep "$PACCACHE_INSTALLED_KEEP"; then
             fail "Installed-package paccache operation failed."
             log "MAINTENANCE pacman_cache=result=failed installed=1"
         else
@@ -1424,7 +1471,7 @@ run_maintenance() {
 
         if ! run_checked \
             "Pruning uninstalled package cache; keeping ${PACCACHE_UNINSTALLED_KEEP} version..." \
-            sudo paccache --remove --uninstalled --keep "$PACCACHE_UNINSTALLED_KEEP"; then
+            sudo paccache -c "$pacman_cache_dir" --remove --uninstalled --keep "$PACCACHE_UNINSTALLED_KEEP"; then
             fail "Uninstalled-package paccache operation failed."
             log "MAINTENANCE pacman_cache=result=failed uninstalled=1"
         else
@@ -1436,40 +1483,58 @@ run_maintenance() {
         log "MAINTENANCE pacman_cache=result=skipped missing=paccache"
     fi
 
-    # Safe AUR cache pruning (preserves rollback versions via paccache -c)
+    # Safe AUR cache pruning across all installed helpers (preserves rollback versions via paccache -c)
+    local user_cache="${XDG_CACHE_HOME:-$HOME/.cache}"
     if command -v yay >/dev/null 2>&1; then
-        prune_aur_cache_safely "yay" "$HOME/.cache/yay"
-    elif command -v paru >/dev/null 2>&1; then
-        prune_aur_cache_safely "paru" "$HOME/.cache/paru/clone"
+        prune_aur_cache_safely "yay" "$user_cache/yay"
+    fi
+    if command -v paru >/dev/null 2>&1; then
+        prune_aur_cache_safely "paru" "$user_cache/paru/clone"
+    fi
+    if command -v pikaur >/dev/null 2>&1; then
+        prune_aur_cache_safely "pikaur" "$user_cache/pikaur/pkg"
     fi
 
     # Systemd journal maintenance (Dual-constraint: time + size limit)
-    if ! run_checked \
-        "Vacuuming system journal (retention: ${JOURNAL_RETENTION_DAYS}d, max size: ${JOURNAL_RETENTION_SIZE})..." \
-        sudo journalctl --vacuum-time="${JOURNAL_RETENTION_DAYS}days" --vacuum-size="${JOURNAL_RETENTION_SIZE}"; then
-        fail "System journal vacuum failed."
-        log "MAINTENANCE journal=result=failed"
-    else
-        ok "System journal vacuum completed (retained last ${JOURNAL_RETENTION_DAYS} days / ${JOURNAL_RETENTION_SIZE})."
-        log "MAINTENANCE journal=result=cleaned retention_days=${JOURNAL_RETENTION_DAYS}"
-    fi
+    if command -v journalctl &>/dev/null; then
+        if [[ -d "/var/log/journal" ]]; then
+            if ! run_checked \
+                "Vacuuming system journal (retention: ${JOURNAL_RETENTION_DAYS}d, max size: ${JOURNAL_RETENTION_SIZE})..." \
+                sudo journalctl --vacuum-time="${JOURNAL_RETENTION_DAYS}days" --vacuum-size="${JOURNAL_RETENTION_SIZE}"; then
+                fail "System journal vacuum failed."
+                log "MAINTENANCE journal=result=failed"
+            else
+                ok "System journal vacuum completed (retained last ${JOURNAL_RETENTION_DAYS} days / ${JOURNAL_RETENTION_SIZE})."
+                log "MAINTENANCE journal=result=cleaned retention_days=${JOURNAL_RETENTION_DAYS}"
+            fi
+        else
+            info "System journal is volatile (/run/log/journal - RAM only); vacuum skipped."
+            log "MAINTENANCE journal=result=skipped_volatile"
+        fi
 
-    # User journal vacuuming if persistent
-    if [[ -d "$HOME/.local/share/systemd/journal" ]] || journalctl --user --disk-usage &>/dev/null; then
-        journalctl --user --vacuum-time="${JOURNAL_RETENTION_DAYS}days" --vacuum-size="${USER_JOURNAL_RETENTION_SIZE}" &>/dev/null || true
+        # User journal vacuuming if persistent
+        if [[ -d "$HOME/.local/share/systemd/journal" ]] || journalctl --user --disk-usage &>/dev/null; then
+            journalctl --user --vacuum-time="${JOURNAL_RETENTION_DAYS}days" --vacuum-size="${USER_JOURNAL_RETENTION_SIZE}" &>/dev/null || true
+        fi
     fi
 
     # Deep Clean operations
     if [[ "$mode" == *"Deep Clean"* ]]; then
         section "DEEP CLEAN"
 
-        empty_freedesktop_trash || warn "Trash cleanup was not completed."
+        if [[ "$EUID" -eq 0 && -z "${SUDO_USER:-}" ]]; then
+            warn "Deep Clean targets personal user files (trash, browser caches)."
+            warn "Running Deep Clean directly as root is restricted to prevent file ownership corruption."
+            info "Please run 'sys-health --deep-clean' from your regular user account."
+        else
+            empty_freedesktop_trash || warn "Trash cleanup was not completed."
 
-        clean_all_detected_browsers
+            clean_all_detected_browsers
 
-        clean_thumbnail_cache || warn "Thumbnail cleanup was not completed."
+            clean_thumbnail_cache || warn "Thumbnail cleanup was not completed."
 
-        clean_coredumps_by_age || warn "Coredump cleanup was not completed."
+            clean_coredumps_by_age || warn "Coredump cleanup was not completed."
+        fi
     fi
 }
 
@@ -6520,8 +6585,20 @@ while true; do
             ;;
         "7. Deep Clean (Trash & Browser Caches)")
             ui_screen "Deep Clean"
+
+            if [[ "$EUID" -eq 0 && -z "${SUDO_USER:-}" ]]; then
+                echo ""
+                fail "SECURITY GUARDRAIL: Deep Clean cannot be run directly as root!"
+                info "Deep Clean targets desktop trash, user browser caches, and thumbnails."
+                info "Running as pure root will either target /root or corrupt permissions for regular users."
+                info "Please run 'sys-health' from your regular desktop user account."
+                echo ""
+                pause_screen
+                continue
+            fi
+
             local t_sz thumb_sz cd_sz
-            t_sz="$(calculate_reclaimable_space "$HOME/.local/share/Trash")"
+            t_sz="$(calculate_reclaimable_space "${XDG_DATA_HOME:-$HOME/.local/share}/Trash")"
             thumb_sz="$(calculate_reclaimable_space "${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails")"
             cd_sz="0B"
             if [[ -d /var/lib/systemd/coredump ]]; then
