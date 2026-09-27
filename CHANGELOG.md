@@ -1,0 +1,247 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [2.21] - 2026-09-27
+
+### Added & Hardened (Universal Orphan Triage & Zero-Residue Purge Engine)
+- **Dynamic 3-Tier Orphan Safety Classifier (`triage_orphan_packages`)**:
+  - Implemented an intelligent offline classifier analyzing unrequired packages (`pacman -Qtdq`) via batch local ALPM metadata queries (`LC_ALL=C pacman -Qi`):
+    - 🟢 **Tier 1 (Safe Leaves):** Truly unrequired leaf packages (`Optional For: None`). Safe to purge automatically.
+    - 🟡 **Tier 2 (Optional Dependencies):** Packages actively utilized as optional dependencies by installed software. Surfaces exact reverse dependencies (e.g. Dolphin, GIMP, VLC) to prevent silent feature loss.
+    - 🔴 **Tier 3 (Core & Toolchain Safety Guard):** Regex blacklist preventing accidental deletion of kernel headers, firmware, GPU drivers, audio servers, fonts, and build toolchains (`base-devel`, `rust`, `cargo`, `go`, `gcc`, `make`, etc.).
+- **Zero-Residue Cache Purge (Arch Wiki Maintenance Standard)**:
+  - Automatically executes `paccache -c "$pacman_cache_dir" --remove --uninstalled --keep 0` immediately following orphan deinstallation (`pacman -Rns`) to eliminate dead `.pkg.tar.zst` archives while preserving rollback history for installed packages (`PACCACHE_INSTALLED_KEEP=2`).
+- **Explicit Intent Protection (`pacman -D --asexplicit`)**:
+  - Integrated interactive action allowing users to mark useful build tools or dependencies as explicitly installed, permanently resolving recurring orphan alerts for user tools.
+- **Pre-Flight Gate 2 Orphan Advisory**:
+  - Added passive informative advisory in `run_guarded_upgrade` warning users about pending orphans and stale AUR compilation risks before initiating system upgrades (100% Upstream Harmonization: zero false alarm FAIL/WARN).
+- **Read-Only Audit & Table Reconstruction Fidelity**:
+  - Added `check_orphan_packages()` under System Health & Services in `run_health_check` and updated `reconstruct_tables_from_log()` for 100% fidelity across report viewers.
+- **CLI & TUI Integration**:
+  - Added `-o, --orphans` command-line switch for standalone execution and interactive submenu under Option 6 (Safe Maintenance).
+
+## [2.20] - 2026-09-26
+
+### Fixed & Hardened (Universal Hardware & Drivers Audit Engine)
+- **Universal CPU Temperature Detection & AMD Ryzen Prioritization:**
+  - Hardened `check_temperature()` to prioritize dedicated CPU package and die sensors (`Package id 0`, `Tctl`, `Tdie`) over generic motherboard `temp1` diodes. Resolves inaccurate low readings on AMD Ryzen platforms where ACPI/Super I/O chips reported motherboard diode temps instead of true CPU temperature.
+  - Implemented dual-stage native kernel sysfs fallback (`/sys/class/hwmon` matching `coretemp`, `k10temp`, `zenpower`, `cpu_thermal` and `/sys/class/thermal`), eliminating telemetry dropouts when `lm_sensors` is not installed.
+- **Virtual Machine & Non-SMART Storage Awareness:**
+  - Added detection for non-SMART devices (`Device does not support SMART` / virtual disks / USB thumb drives) in `check_smart()`.
+  - Replaced confusing `PASS ✔ (0/1 OK)` outputs on KVM/QEMU virtio disks, VirtualBox disks, and USB-attached installations with clean `INFO ℹ (VM or non-SMART storage)` or capable-disk tallies (`PASS ✔ ($passed/$capable OK)`).
+- **Multi-Vendor GPU Telemetry Democratization:**
+  - Expanded `check_gpu()` to extract clean GPU model names from `lspci` for ALL hardware vendors (AMD RDNA/GCN, Intel Arc/Iris/Xe, and NVIDIA).
+  - Gracefully handles hybrid laptop NVIDIA Optimus/PRIME power suspension (D3cold), preventing malformed `| °C` temperature strings when the discrete GPU is asleep.
+- **Universal Btrfs Async & Filesystem Discard Awareness:**
+  - Hardened `check_fstrim()` to recognize modern Btrfs in-kernel asynchronous discard defaults (`FSTYPE=btrfs`) and continuous mount discard options.
+  - Prevents false-positive `WARN ⚠ (inactive)` warnings on installations where Btrfs manages SSD discard natively without requiring `fstrim.timer`.
+- **Log Table Reconstruction Parser Hardening:**
+  - Updated `reconstruct_tables_from_log()` with dedicated pattern extractors for new hardware telemetry keys (`gpu`, `smart`, `fstrim`), guaranteeing 100% formatted table fidelity across log viewers and `--report`.
+
+## [2.19] - 2026-09-26
+
+### Fixed & Hardened (Universal Community Network & Updates Audit Engine)
+- **Case-Insensitive Arch News Package Matching:**
+  - Resolved fatal community defect where capitalized package names in headlines (e.g. `Mkinitcpio >=42 requires manual intervention...`) caused `pacman -Qq` to fail lookups (`error: package 'Mkinitcpio' was not found`).
+  - Added case normalization (`${pkg,,}`) and punctuation stripping, ensuring critical manual intervention warnings (`WARN ⚠`) are accurately triggered for any affected installed package.
+- **Stealth Gateway & Firewall Fallback (Zero False Failures):**
+  - Eliminated false `FAIL ✖ (gateway unreachable)` audits on networks where routers or firewalls drop ICMP echo requests to their LAN IP (e.g. stealth pfSense/OPNsense rules, enterprise Cisco/MikroTik, dormitories, public Wi-Fi).
+  - Implemented dual-stage fallback: verifies gateway presence in kernel ARP neighbor tables (`ip neigh show`) and checks upstream internet ping (`1.1.1.1` / `9.9.9.9`), logging `PASS ✔ (... gw: <IP> (stealth ICMP OK))` when connectivity is healthy.
+- **Dual-Stack & Pure IPv6 Network Support:**
+  - Added automatic fallback to IPv6 default routes (`ip -6 route show default`) when no IPv4 default route is present, supporting modern pure IPv6 / NAT64 community network environments without flagging false route failures.
+- **Reachability-Validated Orphan VPN DNS Checking:**
+  - Hardened orphan VPN DNS detection to ping candidate nameservers before alerting, preventing false-positive `WARN ⚠` warnings on standard RFC1918 home subnets (e.g. `10.2.0.1` home routers or local Pi-holes).
+- **Intelligent Degraded Ethernet Link Speed Detection:**
+  - Replaced crude `<= 100Mb/s` warning with hardware-aware inspection via `ethtool`.
+  - Flags degraded link speed (`WARN ⚠`) only when the interface negotiates at `<=100Mb/s` on a card verified to support Gigabit+ (`1000base`, `2500base`, `10000base`), avoiding false alarms on legacy 100M-only hardware while accurately detecting cable/switch pin failures.
+- **Tool-Agnostic DNS Diagnostics Hierarchy:**
+  - Expanded `check_dns()` beyond `bind-tools` (`dig`) to dynamically support `drill` (from `ldns`), `systemd-resolved`, and standard libc resolution via `getent ahosts`, eliminating test dropouts on minimal CLI installations.
+- **Dynamic Distro-Agnostic Mirrorlist Inspection:**
+  - Replaced hardcoded EndeavourOS mirrorlist file paths in `check_mirrorlist_age()` with dynamic discovery of all active `/etc/pacman.d/*mirrorlist*` files (filtering backups and pacnews).
+  - Seamlessly audits mirror age across Arch Linux, EndeavourOS, CachyOS, and Chaotic-AUR repositories with prioritized Arch ordering (`Arch: Xd │ Distro: Yd │ CachyOS: Zd`).
+
+## [2.18] - 2026-09-26
+
+### Fixed & Hardened (Multi-User & Multi-Config System Health & Services)
+- **EndeavourOS & Arch Community-Portability Principles Applied:**
+  - **Universal Bootloader & Configuration .pacnew Scanning:** Implemented `_find_pacnew_files()` to scan both `/etc` and all active boot/ESP partitions (`/boot`, `/efi`, `/boot/efi`). Resolves community blindspots where bootloader config updates (e.g. `systemd-boot` `/loader/loader.conf.pacnew` or `limine` `/boot/limine.conf.pacnew`) were previously ignored.
+  - **Upstream Magic SysRq Policy Harmonization:** Harmonized `check_sysrq` to recognize standard Arch Linux and systemd upstream security defaults (`16`, `176`, `22`) as `PASS ✔ (safe upstream default: val=...)`. Eliminates false-positive `WARN ⚠` review alerts for community users on clean installs, reserving warnings strictly for completely disabled (`val=0`) states.
+  - **Dynamic Pacman DBPath Discovery:** Replaced static `/var/lib/pacman` paths in `check_pacman_lock()` and upgrade post-flight validation with runtime interrogation via `pacman-conf DBPath`, supporting custom user database locations.
+- **Universal Multi-User Session Service Auditing:**
+  - Hardened `check_failed_services()` to dynamically enumerate and audit all active systemd user managers (`user@*.service`) via `systemctl --user -M <UID>@ list-units --failed`.
+  - When executed under `sudo` or as root (cron/maintenance/SSH), it no longer drops to `INFO (no active user session bus)`, but instead audits every active human or lingering background user on the system.
+  - Accurately reports failed user unit counts per user account in log files (`### FAILED SYSTEMD UNITS (USER: <USER> / <UID>)`).
+- **Dynamic Multi-Mount Storage Discovery:**
+  - Expanded `check_root_space()` to inspect all critical storage mountpoints (`/`, `/home`, `/var`, etc.) dynamically via `mountpoint` probing and `findmnt` filesystem discovery.
+  - Prevents silent failures where separate `/home` or `/var` partitions hit 100% capacity while `/` remained under threshold.
+  - Dynamically highlights the worst-utilized mount in audit tables (e.g. `PASS ✔ (Max: /home 45%)` or `WARN ⚠ (/var at 85%)`), while maintaining single-partition backward compatibility on baseline rigs (`PASS ✔ (19%)`).
+- **Pacman DB Lock Wrapper & Helper Awareness:**
+  - Hardened `check_pacman_lock()` to recognize active AUR helpers and package daemons (`pacman`, `yay`, `paru`, `pamac-daemon`, `packagekitd`) via exact process name regex matching.
+  - Eliminated false-positive `stale lock` warnings when unprivileged users audit the system while an AUR transaction or package daemon holds the lock file.
+- **Modernized Remediation Guidance:**
+  - Replaced obsolete pacman `--force` flag (removed in Pacman v5.2) with modern `sudo pacman -S --overwrite '*' <pkg>` in package integrity failure recommendations (`PKG_CORRUPT_FILES`).
+  - Generalized storage remediation summary in recommendation engine from monolithic "Root filesystem" to "Filesystem usage is over threshold on critical partition".
+- **Log Table Reconstruction Row Delimiter Fix:**
+  - Fixed a formatting bug in `reconstruct_tables_from_log()` where command substitution `$(_format_audit_row ...)` stripped trailing newlines, causing consecutive audit rows in log reports to concatenate onto a single line.
+
+## [2.17] - 2026-09-26
+
+### Fixed & Hardened (Boot & Core OS Audit Engine)
+- **Dynamic ESP & Boot Directory Topology Detection:**
+  - Resolved user bug report: script assumed hardcoded `/boot` paths for kernels (`vmlinuz-*`) and initramfs (`initramfs-*.img`), causing complete audit failures on systems mounting the EFI System Partition at `/efi` (e.g., CachyOS, standard `systemd-boot`, and Type #1 BLS layouts).
+  - Implemented dynamic boot directory resolution discovering active vfat mounts via `findmnt`, `/etc/fstab`, and candidate paths (`/efi`, `/boot/efi`, `/boot`).
+  - Added full support for Type #1 Boot Loader Specification (BLS) entries (`/loader/entries/*.conf` and `<boot>/<entry-token>/<kver>/linux`), Type #2 Unified Kernel Images (`EFI/Linux/*.efi`), and flat layouts across multiple kernels (`linux-lts`, `linux-cachyos`, `linux-xanmod-*`, etc.).
+- **Dracut & Alternative Initramfs Generator Support:**
+  - Resolved user bug report: script failed to recognize Dracut initramfs images stored outside `/boot` and erroneously failed audits with `FAIL ✖ (missing fallback)`.
+  - Dracut builds host-only images without separate fallback images by default. Missing fallback images are now properly classified as normal operation for Dracut systems and are never treated as fatal errors (`ERRORS++`).
+  - Expanded `detect_initramfs_generator` to inspect `/etc/dracut.conf`, `/etc/dracut.conf.d`, `/usr/lib/dracut`, and active ALPM hooks, correctly distinguishing Dracut from mkinitcpio.
+  - Dynamically formats the detected initramfs generator and image size in audit reports (e.g. `dracut [45MB]`).
+- **Guarded System Upgrade (Option 2) Post-Flight Verification [RESOLVED]:**
+  - Migrated post-flight kernel and initramfs integrity check from static `/boot/` paths to the dynamic `_resolve_kernel_and_initramfs()` engine.
+  - Upgrades on installations mounting ESP at `/efi` or using BLS layout now correctly detect installed kernels and initramfs images without false-positive post-upgrade failure warnings.
+  - Updated post-flight disaster recovery guidance to dynamically template the actual detected initramfs image path in `lsinitrd` / `lsinitcpio` inspection commands.
+- **Guarded System Upgrade (Option 2) Pre-Flight Gate 1 [RESOLVED]:**
+  - Eliminated hardcoded assumption that `/boot` must exist as a dedicated filesystem in `/etc/fstab`.
+  - Implemented dynamic inspection of `/etc/fstab` for any partition targets matching `/boot`, `/efi`, or `/boot/efi`.
+  - Intelligently skips duplicate checks if a partition was already verified as the ESP.
+  - Dynamically verifies read-write status on whichever boot mounts exist without blocking upgrades on systems with unified root and `/efi` partitions.
+- **Bootloader Detection Harmonization & Contextual Repair Hints [RESOLVED]:**
+  - Harmonized `detect_bootloader()` with `detect_active_bootloader()`: performs multi-source probing via efivars (`LoaderInfo-*`), `bootctl status`, configuration file discovery, and UKI verification.
+  - Contextualized `print_bootloader_repair_hint()`: dynamically paths GRUB configs (`/boot/grub/grub.cfg`, `/efi/grub/grub.cfg`), Limine configs, and UKI paths based on the active ESP path instead of hardcoded `/boot` paths.
+- **Multi-User & Session Environment Adaptability [RESOLVED]:**
+  - Hardened `check_failed_services()` for user systemd units: checks for a live user D-Bus session (`XDG_RUNTIME_DIR/bus` or `is-system-running`) before querying `systemctl --user`, outputting a clean `INFO ℹ` banner when run non-interactively or under root.
+  - Enhanced Wayland compositor and Xorg log detection in `check_gpu_errors()` to track active user targets under `SUDO_USER` and check modern compositors (`labwc`, `cosmic-comp`, `river`, `Hyprland`, `kwin_wayland`, `gnome-shell`).
+- **Software & Standalone Updates Multi-User Security Guardrails [RESOLVED]:**
+  - Enforced strict non-root privilege boundary in `run_software_updates()`: explicitly blocks running standalone user updates (AUR via `yay`/`paru`, `uv self update`, `goose update`, `pipx`, `rustup`) as `root` or via `sudo`, completely eliminating the risk of root-owned file creation and permission hijacking in user home directories (`$HOME`).
+  - Added binary writability verifications (`can_self_update_binary()`): checks write permissions for both the target binary and its parent directory before attempting in-place updates, preventing permission faults and partial writes when binaries are installed in shared locations like `/usr/local/bin`.
+- **Safe Maintenance & Deep Clean Multiplatform Hardening [RESOLVED]:**
+  - Replaced hardcoded pacman cache path with dynamic querying via `pacman-conf CacheDir` with graceful fallback to `/var/cache/pacman/pkg`.
+  - Expanded AUR build cache pruning to iterate through all installed helpers (`yay`, `paru`, `pikaur`) rather than exclusively picking the first one found, and expanded `find` depth to 3 for complex build trees.
+  - Hardened systemd journal maintenance against volatile RAM-only logging (`/run/log/journal`), cleanly reporting an informative skip notice instead of failing `journalctl --vacuum`.
+  - Added Btrfs, ZFS, and tmpfs mount boundary tolerance in `safe_delete_children()` using `findmnt -o FSTYPE` to avoid false-positive aborts on nested subvolumes/datasets.
+  - Dynamically resolved XDG standards in Deep Clean (`empty_freedesktop_trash` and `clean_thumbnail_cache`) using `${XDG_DATA_HOME:-$HOME/.local/share}/Trash` and `${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails`, plus legacy `~/.thumbnails` detection.
+  - Hardened shader & gaming cache never-touch guards (`get_never_touch_shader_paths()`) to dynamically protect custom `$XDG_CACHE_HOME` and `$XDG_DATA_HOME` locations against accidental purge.
+  - Integrated Flatpak process detection in `browser_process_running()` querying `flatpak ps` to prevent race conditions during browser cache cleanup.
+  - Implemented strict interactive root guardrail in Main Menu Option 7: blocks executing Deep Clean directly as `root` without `SUDO_USER` to prevent `/root` clutter and home directory permission corruption.
+- **Audit View & Log Reconstruction Alignment:**
+  - Corrected `reconstruct_tables_from_log` to dynamically display the actual mounted ESP path (e.g. `EFI partition (/efi)`) rather than hardcoding `(/boot/efi)`.
+  - Added `/efi` to `CRITICAL_SYSTEM_ROOTS` to prevent path traversal during system maintenance/hygiene operations.
+  - Included `/efi` directory enumerations in system diagnostic snapshots (`Section 9b`).
+- **Remediation JSON Generator Fix:**
+  - Fixed variable scoping typo in `generate_summary_json` where `$risk` caused jq compile failures during headless audits.
+
+### Slated for Assessment (Downstream Multi-Environment Hardening)
+- **Wayland / Headless GPU Diagnostics:**
+  - *Current State:* Evaluates GPU lockups primarily via `journalctl -k` and Xorg logs.
+  - *Focus:* Expand Wayland compositor session log analysis (`journalctl --user -u plasma-kwin_wayland -u gnome-shell`) for multi-user seat configurations.
+  - *Status:* Slated for next session.
+
+---
+
+## [2.16] - 2026-09-25
+
+### Added & Improved
+- **Transparent Pre-Upgrade Package Manifest (Guarded Upgrade 2.0):**
+  - Resolves blind upgrade confirmation in Guarded System Upgrade (Option 2) where pending packages were not displayed.
+  - Actively discovers and formats explicit, high-density audit cards for all pending official repository packages (`checkupdates` / `pacman -Qu`) and AUR packages (`yay` / `paru` / `pikaur -Qua`) before operator prompts.
+  - **Core Component Awareness & Early Alert:** Automatically classifies critical system infrastructure packages (kernels `linux*`, `nvidia*`, `mesa*`, `systemd*`, `glibc*`, `dracut*`, `grub*`, `mkinitcpio*`, `wayland*`, `xorg*`) with `[core]` tags and displays a prominent warning banner with component names.
+  - **Intelligent Zero-Update Handling:** Detects when both official and AUR packages are fully up to date, displaying an all-clear confirmation and preventing redundant empty package transactions.
+  - **Safe Pagination & Buffer Protection:** Caps displayed package rows at 25 items for large transactions with a helpful summary notice, ensuring terminal stability while always prioritizing core packages.
+
+---
+
+## [2.15] - 2026-09-25
+
+### Added & Improved
+- **Smart Arch News Correlator (Gate 4 2.0):**
+  - Correlates upstream Arch News manual intervention alerts directly against locally installed packages (`pacman -Qq`).
+  - Eliminates false positive alerts (e.g. `mkinitcpio` on Dracut systems, `kea`, `varnish`, `waydroid`, `dotnet-*`, or official `nvidia` 590+ drops on legacy `nvidia-580xx-dkms` rigs).
+  - High-signal UX: Upstream advisories that do not affect the local system are transparently audited and summarized (`Pre-Flight Gate 4: Arch News checked (7 upstream advisories reviewed; 0 affect your installed packages)`) without interrupting the operator.
+  - Interactive confirmation prompt (`gum confirm`) is now strictly reserved for cases where an advisory explicitly affects an installed package or is marked as a system-wide breaking change.
+- **Upstream Resilience & Local Caching:**
+  - Dual-endpoint failover: fetches from Arch News RSS (`/feeds/news/`) with automatic fallback to CDN-cached HTML table (`/news/`) if upstream rate-limiting (HTTP 429) is encountered.
+  - Persistent 1-hour local cache at `$STATE_DIR/arch-news-cache.json` eliminates repetitive polling, speeds up pre-flight execution, and protects against Cloudflare/Nginx rate limits.
+  - Non-destructive safety fallback: unclassified advisories where package candidates cannot be identified are flagged as `[SYSTEM-WIDE]` and retained for operator review.
+
+---
+
+## [2.14] - 2026-09-25
+
+### Added
+- **Universal Multi-Bootloader Support:** Dynamic detection and post-flight entry verification across `systemd-boot`, `GRUB`, `Limine`, `rEFInd`, and standalone `UKI` (Unified Kernel Images).
+- **ESP & Mount Topology Gate:** Pre-flight inspection using `findmnt` and `/etc/fstab` validating that the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable before package transactions start.
+- **Bootloader Disaster Recovery Hints:** Context-sensitive CLI repair guidance (`bootctl status`, `grub-mkconfig`, `limine.conf`, `efibootmgr`) displayed automatically if bootloader inconsistencies are identified.
+- **Laptop Battery Safety Guardrail (Gate 0):** Hardware ACPI power supply probe detecting battery capacity and charging status; prevents heavy kernel upgrades on discharging laptops below 25% battery.
+- **Enhanced TUI Card Renderer & UX:** High-density report cards, formatted category summaries, and streamlined audit report view directly within the interactive menu.
+
+---
+
+## [2.13] - 2026-09-25
+
+### Added
+- **Multi-Kernel DKMS & Header Synchronization:** Verifies that matching headers and compiled kernel modules exist across all installed kernel series (`linux`, `linux-lts`, `linux-zen`).
+- **Arch News RSS Human-Intervention Scraper:** Proactively parses the top 10 upstream Arch News items, matching advisories requiring manual operator intervention against locally installed packages (`pacman -Qq`).
+- **Filtered Package Integrity Audit (`pacman -Qk`):** Intelligent path filtering that discards benign ephemeral files on `tmpfs` mounts (`/tmp`, `/var/run`, `/var/spool`), eliminating noisy false positives while strictly catching real binary/library corruption.
+- **Kernel Futex2 / Fsync Probe:** Live userspace syscall probe testing `futex_waitv` (syscall 449) availability for low-latency Wine/Proton game synchronization.
+- **Kernel Split-Lock Mitigation & Event Correlation:** Live detection of split-lock penalties and kernel stutter events (`journalctl -k`) impacting modern gaming performance.
+- **SRE-Grade Maintenance Protections:**
+  - Active browser process locks (`pgrep firefox`, `pgrep chromium`) preventing cache clearing during active sessions (protects SQLite WAL files and session restore).
+  - Strict shader cache blacklist (`~/.nv`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, Steam shader pre-caches) to prevent post-maintenance stutter.
+  - Emergency rollback package retention retaining at least 1 version of uninstalled packages (`paccache -u -k 1`).
+
+---
+
+## [2.12] - 2026-09-25
+
+### Added
+- **Guarded System Upgrade (3-Phase SRE Workflow):**
+  - *Phase 1: Pre-Flight Safety Gates* (privileges, network TLS reachability, pacman database lock via `fuser`, disk margins, mirror freshness, Arch News, superseded kernel detection).
+  - *Phase 2: Distribution Upgrade* (canonical pacman / yay / paru / eos-update execution).
+  - *Phase 3: Post-Flight Integrity Verification* (multi-kernel module build validation, boot image parsing, `.pacnew` tracking).
+- **Standalone & Third-Party Software Updates Hub:**
+  - Dynamic discovery and 1-click updates for out-of-band software (`Goose AI Assistant`, `uv` Python toolchain, `AUR`, `Steam`, `Flatpak`).
+  - Binary ownership guard (`is_pacman_owned`) preventing standalone tool updaters from overwriting distribution-managed packages.
+  - Partial upgrade barrier warning against updating AUR packages when official repository updates are pending.
+
+---
+
+## [2.11] - 2026-09-25
+
+### Added
+- **Dynamic Performance Flight Recorder (`--sample [SECS]`):** Zero-sudo, live sampling engine measuring:
+  - Linux Kernel Pressure Stall Information (`/proc/pressure/{cpu,memory,io}`) for microsecond task starvation metrics.
+  - Live GPU utilization, clock states, thermals, and VRAM boundary tracking.
+  - Local gateway ICMP round-trip latency (`min/avg/max/mdev`) and packet loss.
+  - Unprivileged execution mode for background AI agent sampling without sudo prompts.
+
+---
+
+## [2.10] - 2026-09-24
+
+### Added
+- **Gaming & Steam Readiness Suite (`--gaming`):**
+  - Multilib repository state audit.
+  - 32-bit Vulkan ICD driver stack validation (`lib32-vulkan-icd-loader`, `lib32-nvidia-utils`, `lib32-vulkan-radeon`).
+  - Virtual memory map limits (`vm.max_map_count >= 1048576`) and soft file descriptors.
+  - GameMode daemon lifecycle verification (`gamemoded -t`).
+  - GPU VRAM segment telemetry (highlighting the Maxwell 3.5GB boundary).
+- **Silent Troubleshooting & Network Diagnostics:**
+  - Detection of accidental NetworkManager "Metered Connection" flags throttling downloads.
+  - Physical NIC hardware error counter monitoring (`rx_errors`, `tx_errors`, `rx_crc_errors`).
+  - Ethernet link speed negotiation degradation detection (<= 100 Mbps warning on gigabit NICs).
+  - Orphan VPN DNS resolver leak detection in `/etc/resolv.conf`.
+
+---
+
+## [2.9] - 2026-09-24
+
+### Changed
+- Standardized project naming and executable to `sys-health`.
+- Unified telemetry state paths under `~/.local/state/system-health/` (`summary.json`, `system-health.log`, `software-state.txt`).
+- Introduced JSON telemetry schema v2.0 for lightweight, zero-token-waste AI assistant integration.
