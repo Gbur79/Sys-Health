@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.22] - 2026-09-27
+
+### Fixed & Hardened (Cardinal Mandate: Universalism & Mirror Resilience)
+- **Elimination of Rig Bias in Mirror Ranking (`Pre-Flight Gate 3`)**:
+  - Removed hardcoded European countries list (`--country "United Kingdom,France,Netherlands,Germany"`) that previously biased reflector ranking on non-European community installs.
+  - Implemented 100% dynamic universalism: queries the 20 most recently synchronized HTTPS mirrors worldwide, benchmarks connection and download speeds, and ranks the 10 fastest (`--latest 20 --protocol https --sort rate --fastest 10`).
+- **Reflector Python-Argparse Config Syntax Fix**:
+  - Fixed a critical dormant syntax bug where `reflector --config /etc/xdg/reflector/reflector.conf` failed with `unrecognized arguments: --config`.
+  - Replaced with standard Python-argparse file syntax (`reflector @"$ref_conf"`), enabling user-customized `reflector.conf` profiles to be correctly applied.
+- **Dead Primary Mirror Trap & Forum Failure Remediation (EndeavourOS Threads #55583, #62289)**:
+  - Eliminated the critical failure mode where a dead primary mirror (e.g. `mirror.f4st.host`) with fresh file timestamps silently passed Gate 3 and crashed or hung pacman transactions with 3102ms socket timeouts.
+  - Upgraded Gate 3 to dynamically probe primary mirror HTTP status and TTFB latency (`curl`) on `core.db`, trigger smart mirror refresh prompts on dead mirrors, empty mirrorlists, or severe network throttling (> 800ms), and safely fail if no working fallback servers exist.
+  - Added dynamic hardware architecture discovery (`uname -m`) for non-x86_64 systems instead of static strings.
+
+### Added (Dynamic Mirrorlist Health & Atomic Ranking Engine)
+- **Real-Time Mirrorlist Health & Latency Probe (`check_mirrorlist_age`)**:
+  - Upgraded read-only audit check to evaluate active server redundancy and measure live TCP/TTFB round-trip latency to the primary Arch repository (`curl`).
+  - Differentiates lightning-fast regional mirrors (< 150ms), acceptable continental mirrors (150-400ms), and sub-optimal / cross-continental mirrors (> 400ms - raises `INFO ℹ` advisory).
+  - Flags dead primary mirrors (`WARN ⚠`) while verifying general internet reachability.
+  - Dynamic discovery across all active `/etc/pacman.d/*mirrorlist*` topologies (Arch, EndeavourOS, CachyOS, Chaotic-AUR) with per-list server counts.
+- **Universal, Atomic Mirror Ranking Engine (`refresh_and_rank_mirrors`)**:
+  - Standalone engine supporting official `reflector`, AUR `rate-mirrors`, and distribution-specific `eos-rankmirrors`.
+  - **Atomic Staging Gate:** Ranks to isolated temporary files (`mktemp`), validates server count (`>= 3`), verifies live HTTP 200 reachability of the primary mirror, and atomically installs via `install -m 644` with automated `.bak` backups and rollback safety.
+- **CLI & TUI Integration**:
+  - Added `--mirrors` command-line switch for standalone execution.
+  - Added Option 3 ("Refresh & Rank Fastest Regional Mirrors") and updated Option 4 ("Complete Maintenance") in Main Menu Option 6 (Safe Maintenance & System Hygiene).
+
 ## [2.21] - 2026-09-27
+
+### Fixed & Hardened (Zero-False-Alarm Policy: User Sessions & Encrypted DNS)
+- **Transient Desktop App Filtering in User Session Audit (`check_failed_services`)**:
+  - Excluded ephemeral XDG desktop application units (`app-*.service` and `app-*.scope`) from systemd user session failure evaluations across both unprivileged and root multi-seat audits.
+  - Prioritizes core user daemon health (`pipewire`, `wireplumber`, `dunst`, `gpg-agent`) over safely closed or user-cancelled graphical windows (such as `yad` or `eos-welcome` exiting with code 1).
+- **Encrypted & Cold-Cache DNS Fault Tolerance (`check_dns`)**:
+  - Increased `dig` query fault tolerance from `+time=2 +tries=1` to `+time=3 +tries=2`.
+  - Prevents false-positive `WARN` alarms caused by initial TLS negotiation latency / cold cache lookups on upstream encrypted resolvers (DoT/DoH via pfSense NextDNS CLI, Pi-hole, Unbound, AdGuard Home).
 
 ### Added & Hardened (Universal Orphan Triage & Zero-Residue Purge Engine)
 - **Dynamic 3-Tier Orphan Safety Classifier (`triage_orphan_packages`)**:
