@@ -1111,10 +1111,12 @@ run_checked() {
 
 package_manager_busy() {
     local process
+    local pac_db
+    pac_db="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
 
-    [[ -e /var/lib/pacman/db.lck ]] && return 0
+    [[ -e "${pac_db%/}/db.lck" ]] && return 0
 
-    for process in pacman yay paru makepkg; do
+    for process in pacman yay paru pikaur makepkg pamac-daemon packagekitd eos-update; do
         if pgrep -x "$process" >/dev/null 2>&1; then
             return 0
         fi
@@ -2182,7 +2184,7 @@ detect_boot_directories() {
         fi
     done < <(findmnt -n -r -t vfat -o TARGET 2>/dev/null || true)
 
-    # 2. Inspect /etc/fstab for vfat or boot mounts
+    # 2. Inspect /etc/fstab for active (uncommented) vfat or boot mounts
     local fstab_mnt
     while IFS= read -r fstab_mnt; do
         [[ -n "$fstab_mnt" && -d "$fstab_mnt" ]] || continue
@@ -2190,7 +2192,7 @@ detect_boot_directories() {
             dirs+=("$fstab_mnt")
             seen+="$fstab_mnt "
         fi
-    done < <(awk '$3 == "vfat" || $2 ~ /^\/(boot|efi|boot\/efi)$/ {print $2}' /etc/fstab 2>/dev/null || true)
+    done < <(awk '!/^[[:space:]]*#/ && ($3 == "vfat" || $2 ~ /^\/(boot|efi|boot\/efi)$/) {print $2}' /etc/fstab 2>/dev/null || true)
 
     # 3. Dedicated /boot, /efi, or /boot/efi directories if present
     for cand in /boot /efi /boot/efi; do
@@ -2212,7 +2214,7 @@ _find_pacnew_files() {
     for b in "${boot_dirs[@]}"; do
         [[ -d "$b" ]] && scan_dirs+=("$b")
     done
-    find "${scan_dirs[@]}" -maxdepth 4 -type f -name '*.pacnew' 2>/dev/null | sort -u || true
+    find "${scan_dirs[@]}" -maxdepth 7 -type f -name '*.pacnew' 2>/dev/null | sort -u || true
 }
 
 _resolve_kernel_and_initramfs() {
@@ -2227,18 +2229,22 @@ _resolve_kernel_and_initramfs() {
     k_mode=""
     k_sz=0
 
-    # 1. UKI Check (Unified Kernel Image - Type #2 BLS)
+    local uki_pat="^(.*[-_])?${pkgb}([-_.][0-9].*)?$"
+
+    # 1. UKI Check (Unified Kernel Image - Type #2 BLS with strict boundary matching)
     for bdir in "${boot_dirs[@]}"; do
-        local uki_match
-        uki_match="$(compgen -G "${bdir}/EFI/Linux/*${pkgb}*.efi" 2>/dev/null | head -n1 || true)"
-        [[ -z "$uki_match" && -n "$kver" ]] && uki_match="$(compgen -G "${bdir}/EFI/Linux/*${kver}*.efi" 2>/dev/null | head -n1 || true)"
-        if [[ -n "$uki_match" && -f "$uki_match" ]]; then
-            k_vmlinuz="$uki_match"
-            k_initrd="$uki_match"
-            k_mode="uki"
-            k_sz="$(stat -c %s "$uki_match" 2>/dev/null || echo 0)"
-            return 0
-        fi
+        for u_cand in "${bdir}/EFI/Linux"/*.efi "${bdir}/EFI/BOOT"/*.efi "${bdir}"/*.efi; do
+            [[ -f "$u_cand" ]] || continue
+            local bname="${u_cand%.efi}"
+            bname="${bname##*/}"
+            if [[ "$bname" =~ $uki_pat || ( -n "$kver" && "$bname" == *"$kver"* ) ]]; then
+                k_vmlinuz="$u_cand"
+                k_initrd="$u_cand"
+                k_mode="uki"
+                k_sz="$(stat -c %s "$u_cand" 2>/dev/null || echo 0)"
+                return 0
+            fi
+        done
     done
 
     # 2. Type #1 BLS (systemd-boot entries / kernel-install layout)
@@ -2246,18 +2252,32 @@ _resolve_kernel_and_initramfs() {
         if [[ -d "${bdir}/loader/entries" ]]; then
             for entry in "${bdir}"/loader/entries/*.conf; do
                 [[ -f "$entry" ]] || continue
-                if grep -qiE "linux.*(${pkgb}|${kver})" "$entry" 2>/dev/null || grep -qiE "(title|version).*(${pkgb}|${kver})" "$entry" 2>/dev/null; then
-                    local l_rel i_rel
-                    l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' "$entry" | head -n1 || true)"
-                    i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' "$entry" | tail -n1 || true)"
-                    if [[ -n "$l_rel" && -f "${bdir}/${l_rel#/}" ]]; then
-                        k_vmlinuz="${bdir}/${l_rel#/}"
+                local l_rel i_rel
+                l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' "$entry" | head -n1 || true)"
+                i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' "$entry" | tail -n1 || true)"
+
+                local entry_matches=false
+                if [[ -n "$l_rel" ]]; then
+                    local l_base="${l_rel##*/}"
+                    if [[ "$l_base" =~ $uki_pat || ( -n "$kver" && "$l_rel" == *"$kver"* ) ]]; then
+                        entry_matches=true
                     fi
-                    if [[ -n "$i_rel" && -f "${bdir}/${i_rel#/}" ]]; then
-                        k_initrd="${bdir}/${i_rel#/}"
-                        k_mode="bls"
-                        k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
-                    fi
+                fi
+                if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "linux[[:space:]]+.*${kver}" "$entry" 2>/dev/null; then
+                    entry_matches=true
+                fi
+
+                if $entry_matches; then
+                    for cand_dir in "${boot_dirs[@]}"; do
+                        if [[ -n "$l_rel" && -f "${cand_dir}/${l_rel#/}" && -z "$k_vmlinuz" ]]; then
+                            k_vmlinuz="${cand_dir}/${l_rel#/}"
+                        fi
+                        if [[ -n "$i_rel" && -f "${cand_dir}/${i_rel#/}" && -z "$k_initrd" ]]; then
+                            k_initrd="${cand_dir}/${i_rel#/}"
+                            k_mode="bls"
+                            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                        fi
+                    done
                     if [[ -n "$k_vmlinuz" && -n "$k_initrd" ]]; then
                         break 2
                     fi
@@ -2334,6 +2354,7 @@ _resolve_kernel_and_initramfs() {
         if [[ -z "$k_fallback" ]]; then
             for fcand in \
                 "${bdir}/initramfs-${pkgb}-fallback.img" \
+                "${bdir}/initramfs-${pkgb}_fallback.img" \
                 "${bdir}/initramfs-${kver}-fallback.img" \
                 "${bdir}/initrd-${pkgb}-fallback.img"; do
                 if [[ -f "$fcand" ]]; then
@@ -2344,12 +2365,16 @@ _resolve_kernel_and_initramfs() {
         fi
     done
 
-    # 4. Fallback for single-kernel systems
-    if [[ -z "$k_vmlinuz" && -f "/boot/vmlinuz" ]]; then
-        k_vmlinuz="/boot/vmlinuz"
-    fi
-    if [[ -z "$k_vmlinuz" && -f "/efi/vmlinuz" ]]; then
-        k_vmlinuz="/efi/vmlinuz"
+    # 4. Fallback for strictly single-kernel systems (avoids masking missing multi-kernel images)
+    local k_count=0
+    k_count="$(find /usr/lib/modules -maxdepth 2 -name pkgbase 2>/dev/null | wc -l || echo 0)"
+    if (( k_count <= 1 )); then
+        if [[ -z "$k_vmlinuz" && -f "/boot/vmlinuz" ]]; then
+            k_vmlinuz="/boot/vmlinuz"
+        fi
+        if [[ -z "$k_vmlinuz" && -f "/efi/vmlinuz" ]]; then
+            k_vmlinuz="/efi/vmlinuz"
+        fi
     fi
 }
 
@@ -2444,11 +2469,24 @@ check_efi_mount() {
         return
     fi
 
+    local efi_opts
+    efi_opts="$(findmnt -n -o OPTIONS -T "$efi_mnt" 2>/dev/null || true)"
+    if [[ "$efi_opts" =~ (^|,)ro(,|$) ]]; then
+        add_row "EFI partition ($efi_mnt)" "FAIL ✖ (mounted READ-ONLY!)"
+        ((ERRORS++))
+        log "HEALTH efi=FAIL mount=$efi_mnt status=read_only"
+        return
+    fi
+
     local avail_mb
     avail_mb="$(df -BM "$efi_mnt" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4}')"
 
-    if [[ -n "$avail_mb" ]] && (( avail_mb < 30 )); then
-        add_row "EFI partition ($efi_mnt)" "WARN ⚠ (low free space: ${avail_mb}MB)"
+    if [[ -n "$avail_mb" ]] && (( avail_mb < 50 )); then
+        add_row "EFI partition ($efi_mnt)" "FAIL ✖ (critically low space: ${avail_mb}MB < 50MB)"
+        ((ERRORS++))
+        log "HEALTH efi=FAIL low_space=${avail_mb}MB mount=$efi_mnt"
+    elif [[ -n "$avail_mb" ]] && (( avail_mb < 100 )); then
+        add_row "EFI partition ($efi_mnt)" "WARN ⚠ (low free space: ${avail_mb}MB < 100MB)"
         ((WARNINGS++))
         log "HEALTH efi=WARN low_space=${avail_mb}MB mount=$efi_mnt"
     else
@@ -3416,7 +3454,7 @@ check_root_space() {
         local extra_mnts
         extra_mnts="$(findmnt -lno TARGET -t btrfs,ext4,ext3,ext2,xfs,f2fs,zfs 2>/dev/null || true)"
         while read -r m; do
-            [[ -z "$m" || "$m" =~ ^/boot(/.*)?$ ]] && continue
+            [[ -z "$m" || "$m" =~ ^/(\.snapshots|var/lib/(docker|containers)|run|proc|sys|boot|efi)(/|$) ]] && continue
             if [[ ! " ${target_mounts[*]} " =~ " ${m} " ]]; then
                 target_mounts+=("$m")
             fi
@@ -3430,7 +3468,7 @@ check_root_space() {
     for mnt in "${target_mounts[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null || [[ "$mnt" == "/" ]]; then
             local usage
-            usage="$(df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
+            usage="$(df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}')"
             [[ -z "$usage" ]] && continue
             checked_mounts+=("$mnt: ${usage}%")
             if (( usage > worst_usage )); then
@@ -3611,9 +3649,10 @@ check_pacman_lock() {
         return
     fi
 
-    if pgrep -x "pacman|yay|paru|pamac-daemon|packagekitd" &>/dev/null || \
+    if pgrep -x "pacman|yay|paru|pikaur|makepkg|pamac-daemon|packagekitd|eos-update" &>/dev/null || \
        sudo -n fuser "$lock_file" &>/dev/null 2>&1 || \
-       fuser "$lock_file" &>/dev/null 2>&1; then
+       fuser "$lock_file" &>/dev/null 2>&1 || \
+       lsof "$lock_file" &>/dev/null 2>&1; then
         add_row "Pacman DB lock" "INFO ℹ (package manager is active)" "SYS"
         ((INFO_COUNT++))
         log "HEALTH pacman_lock=ACTIVE"
@@ -3632,22 +3671,33 @@ check_package_integrity() {
     fi
 
     local integrity_file="$RUN_RAW/pacman-integrity.txt"
-    spinner "Checking package file integrity (filtering ephemeral tmpfs)..."         bash -c 'sudo -n pacman -Qk > "$1" 2>&1 || pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
+        bash -c 'LC_ALL=C sudo -n pacman -Qk > "$1" 2>&1 || LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
     PACMAN_INTEGRITY_TEXT="$(cat "$integrity_file" 2>/dev/null || true)"
 
-    # Identify candidate packages reporting missing files
+    # Identify candidate packages reporting missing files (matches singular '1 missing file' and plural 'N missing files')
     local bad_pkgs
-    bad_pkgs="$(awk '/[1-9][0-9]* missing files/ {sub(/:$/, "", $1); print $1}' "$integrity_file" 2>/dev/null || true)"
+    bad_pkgs="$(awk '/[1-9][0-9]* missing file/ {sub(/:$/, "", $1); print $1}' "$integrity_file" 2>/dev/null || true)"
 
     local real_problems=()
     if [[ -n "$bad_pkgs" ]]; then
         for pkg in $bad_pkgs; do
             [[ -z "$pkg" ]] && continue
             # Filter out benign ephemeral directories (/var, /run, /tmp, /dev, /proc, /sys)
-            # Flag ONLY packages with missing critical binaries, libraries, or system configs (/usr, /etc, /opt)
+            # Flag ONLY packages with genuinely missing critical binaries, libraries, or system configs (/usr, /etc, /opt)
             local missing_crit
             missing_crit="$(pacman -Ql "$pkg" 2>/dev/null | while read -r _ f; do
                 if [[ ! -e "$f" && ! "$f" =~ ^/(var|run|tmp|dev|proc|sys)/ ]]; then
+                    # Double-check elevated existence if unprivileged to avoid false alarms on restricted directories
+                    if [[ "$EUID" -ne 0 ]] && sudo -n test -e "$f" 2>/dev/null; then
+                        continue
+                    fi
+                    local pdir
+                    pdir="$(dirname "$f")"
+                    # If parent directory is unreadable by current user and sudo is unavailable, skip false positive
+                    if [[ "$EUID" -ne 0 && ! -r "$pdir" ]]; then
+                        continue
+                    fi
                     echo "$f"
                     break
                 fi
@@ -3752,13 +3802,42 @@ check_network() {
     fi
 
     local dev gw is_ipv6_only=false
-    dev="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
-    gw="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+    # Parse default route with metric sorting and point-to-point (VPN/tunnel) tolerance
+    read -r gw dev <<< "$(awk '
+        /default via/ {
+            gw=$3; dev=$5;
+            metric=999999;
+            for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+            print metric, gw, dev;
+            next
+        }
+        /default dev/ {
+            dev=$3;
+            metric=999999;
+            for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+            print metric, "p2p", dev;
+            next
+        }
+    ' <(ip -4 route show default 2>/dev/null || true) | sort -n -k1,1 | head -n1 | awk '{print $2, $3}')"
 
     # Dual-stack fallback: support pure IPv6 networks
     if [[ -z "$dev" || -z "$gw" ]]; then
-        dev="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
-        gw="$(ip -6 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+        read -r gw dev <<< "$(awk '
+            /default via/ {
+                gw=$3; dev=$5;
+                metric=999999;
+                for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+                print metric, gw, dev;
+                next
+            }
+            /default dev/ {
+                dev=$3;
+                metric=999999;
+                for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+                print metric, "p2p", dev;
+                next
+            }
+        ' <(ip -6 route show default 2>/dev/null || true) | sort -n -k1,1 | head -n1 | awk '{print $2, $3}')"
         [[ -n "$dev" && -n "$gw" ]] && is_ipv6_only=true
     fi
 
@@ -3803,7 +3882,16 @@ check_network() {
     fi
 
     local ping_ms="<1" gw_stealth=false
-    if command -v ping &>/dev/null; then
+    if [[ "$gw" == "p2p" ]]; then
+        if ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+            ping_ms="p2p"
+        else
+            add_row "Network link & Gateway" "FAIL ✖ (p2p tunnel $dev has no internet reachability)" "NET"
+            ((ERRORS++))
+            log "HEALTH network=FAIL iface=$dev gateway=p2p ping=unreachable"
+            return
+        fi
+    elif command -v ping &>/dev/null; then
         local ping_cmd=(ping -c 1 -W 1 "$gw")
         $is_ipv6_only && ping_cmd=(ping -6 -c 1 -W 1 "$gw")
 
@@ -3893,22 +3981,32 @@ check_network() {
         if [[ "$metered_status" =~ ^yes ]]; then
             local conn_name
             conn_name="$(nmcli -t -f GENERAL.CONNECTION dev show "$dev" 2>/dev/null | cut -d: -f2- || echo "$dev")"
-            add_row "Network link & Gateway" "WARN ⚠ ($dev: metered connection enabled)" "NET"
-            ((WARNINGS++))
-            log "HEALTH network=WARN metered=yes dev=$dev connection=\"$conn_name\""
-            {
-                echo "### NETWORK COMMUNITY GOTCHA (METERED CONNECTION)"
-                echo "[COMMUNITY-GOTCHA] Interface $dev (connection: '$conn_name') has metered connection ENABLED ($metered_status)."
-                echo "Known issue in Arch/EOS: NetworkManager auto-metering causes severe network throughput drops after updates."
-                echo "Fix: sudo nmcli connection modify '$conn_name' connection.metered no && sudo nmcli connection up '$conn_name'"
-                echo ""
-            } >> "$LOG_FILE"
-            return
+            if [[ "$dev" =~ ^(en|eth) ]]; then
+                add_row "Network link & Gateway" "WARN ⚠ ($dev: metered connection enabled on wired Ethernet)" "NET"
+                ((WARNINGS++))
+                log "HEALTH network=WARN metered=yes dev=$dev connection=\"$conn_name\""
+                {
+                    echo "### NETWORK COMMUNITY GOTCHA (METERED CONNECTION)"
+                    echo "[COMMUNITY-GOTCHA] Wired interface $dev (connection: '$conn_name') has metered connection ENABLED ($metered_status)."
+                    echo "Known issue in Arch/EOS: NetworkManager auto-metering causes severe network throughput drops after updates."
+                    echo "Fix: sudo nmcli connection modify '$conn_name' connection.metered no && sudo nmcli connection up '$conn_name'"
+                    echo ""
+                } >> "$LOG_FILE"
+                return
+            else
+                add_row "Network link & Gateway" "INFO ℹ ($dev: metered connection active)" "NET"
+                ((INFO_COUNT++))
+                log "HEALTH network=INFO metered=yes dev=$dev connection=\"$conn_name\""
+            fi
         fi
     fi
 
     local gw_display="${gw} ${ping_ms}ms"
-    $gw_stealth && gw_display="${gw} (stealth ICMP OK)"
+    if [[ "$gw" == "p2p" ]]; then
+        gw_display="p2p tunnel (endpoint OK)"
+    elif $gw_stealth; then
+        gw_display="${gw} (stealth ICMP OK)"
+    fi
 
     add_row "Network link & Gateway" "PASS ✔ ($dev: ${speed_str}gw: ${gw_display}${ipv6_tag})" "NET"
     log "HEALTH network=PASS iface=$dev speed=${speed:-auto} gateway=$gw ping=${ping_ms} errors=0 metered=${metered_status:-no}"
@@ -4347,6 +4445,11 @@ check_arch_audit() {
 # ------------------------------------------------------------------------------
 
 detect_gaming_system() {
+    local user_home="${HOME}"
+    if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
+    fi
+
     # Check for gaming client binaries
     if command -v steam &>/dev/null || command -v wine &>/dev/null || command -v lutris &>/dev/null || \
        command -v heroic &>/dev/null || command -v bottles &>/dev/null; then
@@ -4354,9 +4457,9 @@ detect_gaming_system() {
     fi
 
     # Check for gaming data directories in user home
-    if [[ -d "$HOME/.local/share/Steam" || -d "$HOME/.steam" || -d "$HOME/.wine" || \
-          -d "$HOME/.local/share/lutris" || -d "$HOME/.config/heroic" || \
-          -d "$HOME/.var/app/com.usebottles.bottles" || -d "$HOME/.var/app/com.valvesoftware.Steam" ]]; then
+    if [[ -d "$user_home/.local/share/Steam" || -d "$user_home/.steam" || -d "$user_home/.wine" || \
+          -d "$user_home/.local/share/lutris" || -d "$user_home/.config/heroic" || \
+          -d "$user_home/.var/app/com.usebottles.bottles" || -d "$user_home/.var/app/com.valvesoftware.Steam" ]]; then
         return 0
     fi
 
@@ -4405,13 +4508,8 @@ check_gaming() {
 
     # 2. Vulkan & 32-bit driver stack
     local vga_info drivers="" driver_list="" gpu_name=""
+    driver_list="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
-    if [[ -n "$vga_info" ]]; then
-        drivers="$(printf '%s
-' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u || true)"
-        driver_list="$(echo $drivers | tr '
-' ' ' | sed 's/ $//')"
-    fi
 
     local vulkan_64_ok=false vulkan_32_loader=false vulkan_32_driver=false
     if command -v vulkaninfo &>/dev/null; then
@@ -4421,6 +4519,15 @@ check_gaming() {
         [[ -n "$gpu_name" ]] && vulkan_64_ok=true
     elif [[ -f /usr/share/vulkan/icd.d/nvidia_icd.json || -f /usr/share/vulkan/icd.d/radeon_icd.json || -f /usr/share/vulkan/icd.d/intel_icd.json ]]; then
         vulkan_64_ok=true
+    fi
+    if [[ -z "$gpu_name" && -n "$vga_info" ]]; then
+        local raw_g
+        raw_g="$(printf '%s\n' "$vga_info" | grep -iE 'VGA|3D|Display' | head -n1 || true)"
+        if [[ "$raw_g" =~ \[([^\]]+)\] ]]; then
+            gpu_name="${BASH_REMATCH[1]}"
+        else
+            gpu_name="$(echo "$raw_g" | sed -E 's/^[^:]+: //; s/ \(rev [0-9a-f]+\)$//')"
+        fi
     fi
 
     [[ -f /usr/lib32/libvulkan.so.1 ]] && vulkan_32_loader=true
@@ -4512,6 +4619,7 @@ check_gaming() {
 
     # 4. Kernel Synchronization Primitives (fsync / futex_waitv syscall probe)
     local futex_ok=false
+    local futex_method="syscall probe"
     if command -v python3 &>/dev/null; then
         local py_res
         py_res="$(python3 -c '
@@ -4531,9 +4639,29 @@ except Exception as e:
         fi
     fi
 
+    # Native kernel version fallback if python3 is unavailable or ctypes restricted
+    if ! $futex_ok; then
+        local k_rel k_major k_minor
+        k_rel="$(uname -r 2>/dev/null || echo "")"
+        k_major="${k_rel%%.*}"
+        local rem="${k_rel#*.}"
+        k_minor="${rem%%.*}"
+        k_minor="${k_minor%%[^0-9]*}"
+        if [[ "$k_major" =~ ^[0-9]+$ && "$k_minor" =~ ^[0-9]+$ ]]; then
+            if (( k_major > 5 || (k_major == 5 && k_minor >= 16) )); then
+                futex_ok=true
+                futex_method="kernel >= 5.16"
+            fi
+        fi
+    fi
+
     if $futex_ok; then
-        add_row "Kernel sync (fsync)" "PASS ✔ (futex_waitv syscall 449 verified)" "GAME"
-        log "HEALTH futex_waitv=PASS syscall=449"
+        if [[ "$futex_method" == "syscall probe" ]]; then
+            add_row "Kernel sync (fsync)" "PASS ✔ (futex_waitv syscall 449 verified)" "GAME"
+        else
+            add_row "Kernel sync (fsync)" "PASS ✔ (futex_waitv natively supported by kernel)" "GAME"
+        fi
+        log "HEALTH futex_waitv=PASS method='$futex_method' syscall=449"
     else
         add_row "Kernel sync (fsync)" "INFO ℹ (futex_waitv not verified via syscall probe)" "GAME"
         log "HEALTH futex_waitv=INFO"
@@ -4628,10 +4756,33 @@ except Exception as e:
         log "HEALTH desktop_session=PASS session=$session_type"
     fi
 
-    # 9. Steam & Custom Proton runtime (GE-Proton detection)
+    # 9. Steam & Custom Proton runtime (GE-Proton detection across native, Flatpak & Heroic)
+    local target_home="${HOME}"
+    if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        target_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
+    fi
+
     local has_steam=false custom_protons=""
-    command -v steam &>/dev/null && has_steam=true
-    custom_protons="$(find "$HOME/.local/share/Steam/compatibilitytools.d/" "$HOME/.steam/root/compatibilitytools.d/" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -u | paste -sd ", " - || true)"
+    if command -v steam &>/dev/null || [[ -d "$target_home/.local/share/Steam" || -d "$target_home/.steam" || -d "$target_home/.var/app/com.valvesoftware.Steam" ]]; then
+        has_steam=true
+    fi
+
+    local -a proton_scan_dirs=(
+        "$target_home/.local/share/Steam/compatibilitytools.d"
+        "$target_home/.steam/root/compatibilitytools.d"
+        "$target_home/.steam/steam/compatibilitytools.d"
+        "$target_home/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+        "$target_home/.config/heroic/tools/proton"
+    )
+    local -a found_protons=()
+    for pdir in "${proton_scan_dirs[@]}"; do
+        [[ -d "$pdir" ]] || continue
+        while IFS= read -r p; do
+            [[ -n "$p" ]] && found_protons+=("$p")
+        done < <(find "$pdir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null || true)
+    done
+
+    custom_protons="$(printf '%s\n' "${found_protons[@]}" | sort -u | paste -sd ", " - || true)"
     GAMING_CUSTOM_PROTON="$custom_protons"
 
     local proton_disp="$custom_protons"
@@ -5828,10 +5979,24 @@ run_dynamic_sample() {
         dur=60
     fi
 
-    # Network targets
-    local dev gw
-    dev="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $5; exit}')"
-    gw="$(ip -4 route show default 2>/dev/null | awk '/default via/ {print $3; exit}')"
+    # Network targets (Metric-aware default route with p2p & IPv6 support)
+    local dev="" gw=""
+    read -r gw dev <<< "$(awk '
+        /default via/ {
+            gw=$3; dev=$5;
+            metric=999999;
+            for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+            print metric, gw, dev;
+            next
+        }
+        /default dev/ {
+            dev=$3;
+            metric=999999;
+            for(i=1;i<=NF;i++) if($i=="metric") metric=$(i+1);
+            print metric, "1.1.1.1", dev;
+            next
+        }
+    ' <(ip -4 route show default 2>/dev/null || true; ip -6 route show default 2>/dev/null || true) | sort -n -k1,1 | head -n1 | awk '{print $2, $3}')"
 
     # Initial PSI read
     local psi_supported=false
@@ -5854,7 +6019,7 @@ run_dynamic_sample() {
         t0_tx_drop="$(cat "/sys/class/net/$dev/statistics/tx_dropped" 2>/dev/null || echo 0)"
     fi
 
-    # Background ping during the sample window
+    # Background ping during the sample window with lifecycle cleanup trap
     local ping_file
     ping_file="$(mktemp -t syshealth-ping.XXXXXX 2>/dev/null || echo "/tmp/syshealth-ping.$$")"
     local pings_count=$(( dur * 3 ))
@@ -5862,6 +6027,12 @@ run_dynamic_sample() {
     (( pings_count > 25 )) && pings_count=25
 
     local ping_pid=""
+    _cleanup_sample() {
+        [[ -n "${ping_pid:-}" ]] && kill "$ping_pid" 2>/dev/null || true
+        [[ -n "${ping_file:-}" && -f "$ping_file" ]] && rm -f "$ping_file" 2>/dev/null || true
+    }
+    trap '_cleanup_sample' RETURN INT TERM
+
     if [[ -n "$gw" ]] && command -v ping &>/dev/null; then
         ping -c "$pings_count" -i 0.25 -q -W 1 "$gw" > "$ping_file" 2>&1 &
         ping_pid=$!
@@ -5927,17 +6098,18 @@ run_dynamic_sample() {
     if [[ -f "$ping_file" ]]; then
         pkts_tx="$(awk -F',' '/packets transmitted/ {print $1}' "$ping_file" | awk '{print $1}' || echo 0)"
         pkts_rx="$(awk -F',' '/received/ {for(i=1;i<=NF;i++) if($i ~ /received/) print $i}' "$ping_file" | awk '{print $1}' || echo 0)"
-        loss_pct="$(grep -oP '\d+(?=% packet loss)' "$ping_file" 2>/dev/null || echo 0)"
-        if grep -q "rtt min" "$ping_file" 2>/dev/null; then
-            rtt_min="$(awk -F'[ =/]+' '/rtt min/ {print $6}' "$ping_file" || echo "0.000")"
-            rtt_avg="$(awk -F'[ =/]+' '/rtt min/ {print $7}' "$ping_file" || echo "0.000")"
-            rtt_max="$(awk -F'[ =/]+' '/rtt min/ {print $8}' "$ping_file" || echo "0.000")"
-            rtt_mdev="$(awk -F'[ =/]+' '/rtt min/ {print $9}' "$ping_file" || echo "0.000")"
+        loss_pct="$(awk -F'%' '/packet loss/ {sub(/.*[ ,]/, "", $1); print $1+0}' "$ping_file" 2>/dev/null || echo 0)"
+        [[ -z "$loss_pct" ]] && loss_pct=0
+        if grep -qE "(rtt|round-trip) min" "$ping_file" 2>/dev/null; then
+            rtt_min="$(awk -F'[ =/]+' '/(rtt|round-trip) min/ {print $6}' "$ping_file" || echo "0.000")"
+            rtt_avg="$(awk -F'[ =/]+' '/(rtt|round-trip) min/ {print $7}' "$ping_file" || echo "0.000")"
+            rtt_max="$(awk -F'[ =/]+' '/(rtt|round-trip) min/ {print $8}' "$ping_file" || echo "0.000")"
+            rtt_mdev="$(awk -F'[ =/]+' '/(rtt|round-trip) min/ {print $9}' "$ping_file" || echo "0.000")"
         fi
         rm -f "$ping_file" 2>/dev/null || true
     fi
 
-    # GPU telemetry
+    # GPU telemetry (NVIDIA smi + AMD /sys/class/drm fallback)
     local gpu_avail=false gpu_name="" gpu_util=0 gpu_mem_util=0 vram_used=0 vram_total=0
     local gpu_temp=0 gpu_pstate="" gpu_pcie_gen="" gpu_pcie_width="" maxwell_vram_warn=false
     if command -v nvidia-smi &>/dev/null; then
@@ -5961,10 +6133,62 @@ run_dynamic_sample() {
         fi
     fi
 
+    if ! $gpu_avail; then
+        for card_dev in /sys/class/drm/card*/device; do
+            [[ -d "$card_dev" ]] || continue
+            if [[ -f "$card_dev/gpu_busy_percent" ]]; then
+                gpu_avail=true
+                gpu_util="$(cat "$card_dev/gpu_busy_percent" 2>/dev/null || echo 0)"
+                local v_used_b v_tot_b
+                v_used_b="$(cat "$card_dev/mem_info_vram_used" 2>/dev/null || echo 0)"
+                v_tot_b="$(cat "$card_dev/mem_info_vram_total" 2>/dev/null || echo 0)"
+                if (( v_tot_b > 0 )); then
+                    vram_used=$(( v_used_b / 1048576 ))
+                    vram_total=$(( v_tot_b / 1048576 ))
+                    gpu_mem_util=$(( (vram_used * 100) / vram_total ))
+                fi
+                local raw_card
+                raw_card="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D' | grep -iE 'AMD|Radeon' | head -n1 || true)"
+                if [[ "$raw_card" =~ \[([^\]]+)\] ]]; then
+                    gpu_name="${BASH_REMATCH[1]}"
+                else
+                    gpu_name="AMD Radeon GPU"
+                fi
+                for h_hw in "$card_dev"/hwmon/hwmon*; do
+                    if [[ -f "$h_hw/temp1_input" ]]; then
+                        local t_raw
+                        t_raw="$(cat "$h_hw/temp1_input" 2>/dev/null || echo 0)"
+                        (( t_raw > 0 )) && gpu_temp=$(( t_raw / 1000 ))
+                        break
+                    fi
+                done
+                break
+            fi
+        done
+    fi
+
     # System metrics
     local sys_gov sys_temp sys_load
     sys_gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
-    sys_temp="$(sensors 2>/dev/null | grep -iE 'Package id 0|Tctl|Core 0|temp1' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || echo "unknown")"
+    if command -v sensors &>/dev/null; then
+        sys_temp="$(sensors 2>/dev/null | grep -iE 'Package id 0|Tctl|Tdie|Core 0|CPU Temperature' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
+    fi
+    if [[ -z "$sys_temp" ]]; then
+        for h in /sys/class/hwmon/hwmon*; do
+            [[ -d "$h" ]] || continue
+            local hname
+            hname="$(cat "$h/name" 2>/dev/null || echo "")"
+            if [[ "$hname" =~ ^(coretemp|k10temp|zenpower|cpu_thermal)$ ]]; then
+                local raw_t
+                raw_t="$(cat "$h/temp1_input" 2>/dev/null || true)"
+                if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
+                    sys_temp="$(( raw_t / 1000 ))°C"
+                    break
+                fi
+            fi
+        done
+    fi
+    sys_temp="${sys_temp:-unknown}"
     sys_load="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")"
 
     # Status evaluation
@@ -6213,7 +6437,7 @@ check_binary_ownership() {
     [[ -z "$resolved" ]] && { echo "missing"; return 1; }
 
     # Detect language version manager shims and virtual environments
-    if [[ "$resolved" =~ \.(pyenv|asdf|mise|nvm|cargo|rustup)(/|$) ]]; then
+    if [[ "$resolved" =~ (/shims/|/\.pyenv/|/\.asdf/|/\.nvm/|/mise/shims/|/\.rustup/toolchains/) ]]; then
         echo "shim"
         return 0
     fi
@@ -6226,7 +6450,7 @@ check_binary_ownership() {
     local real
     real="$(realpath -e "$resolved" 2>/dev/null || true)"
     if [[ -n "$real" && "$real" != "$resolved" ]]; then
-        if [[ "$real" =~ \.(pyenv|asdf|mise|nvm|cargo|rustup)(/|$) ]]; then
+        if [[ "$real" =~ (/shims/|/\.pyenv/|/\.asdf/|/\.nvm/|/mise/shims/|/\.rustup/toolchains/) ]]; then
             echo "shim"
             return 0
         fi
@@ -6255,9 +6479,10 @@ can_self_update_binary() {
     [[ -z "$bin_path" ]] && return 1
     local real
     real="$(realpath -e "$bin_path" 2>/dev/null || echo "$bin_path")"
-    local dir
+    local dir link_dir
     dir="$(dirname "$real")"
-    [[ -w "$real" && -w "$dir" ]]
+    link_dir="$(dirname "$bin_path")"
+    [[ -w "$real" && -w "$dir" && -w "$link_dir" ]]
 }
 
 # Guardrail checking whether official repo updates are pending before AUR upgrade
@@ -6266,33 +6491,55 @@ check_partial_upgrade_risk() {
     # 0 = No official updates pending (SAFE)
     # 1 = Official updates pending (RISK OF PARTIAL UPGRADE) - echo count
     # 2 = Cannot verify (pacman-contrib missing or network/database error)
-    if ! command -v checkupdates &>/dev/null; then
-        return 2
+    if command -v checkupdates &>/dev/null; then
+        local checkup_out checkup_rc=0
+        checkup_out="$(checkupdates 2>/dev/null)" || checkup_rc=$?
+
+        if (( checkup_rc == 0 )); then
+            local count
+            count="$(awk '/^[a-zA-Z0-9@._+-]/ {c++} END {print c+0}' <<< "$checkup_out")"
+            if (( count > 0 )); then
+                echo "$count"
+                return 1
+            fi
+            return 0
+        elif (( checkup_rc == 2 )); then
+            # Exit code 2 from checkupdates explicitly indicates database is synced and 0 updates pending
+            return 0
+        fi
     fi
 
-    local checkup_out checkup_rc=0
-    checkup_out="$(checkupdates 2>/dev/null)" || checkup_rc=$?
-
-    if (( checkup_rc == 0 )); then
-        local count
-        count="$(grep -c '^[a-zA-Z0-9@._+-]' <<< "$checkup_out" || true)"
-        if (( count > 0 )); then
-            echo "$count"
+    # Fallback to local sync DB check via pacman -Qu if checkupdates is unavailable
+    if command -v pacman &>/dev/null; then
+        local p_out
+        p_out="$(pacman -Qu 2>/dev/null || true)"
+        local p_count
+        p_count="$(awk '/^[a-zA-Z0-9@._+-]/ {c++} END {print c+0}' <<< "$p_out")"
+        if (( p_count > 0 )); then
+            echo "$p_count"
             return 1
         fi
-        return 0
-    elif (( checkup_rc == 2 )); then
-        # Exit code 2 from checkupdates explicitly indicates database is synced and 0 updates pending
-        return 0
-    else
-        return 2
     fi
+
+    return 2
 }
 
 run_software_updates() {
     local json_mode="${1:-0}"
     local is_interactive=false
     [[ "$json_mode" -eq 0 && -t 0 ]] && is_interactive=true
+
+    # Security & Multi-User Isolation Guardrail:
+    # Standalone tools (~/.local/bin, pipx, rustup, uv, goose) and AUR packages must NEVER be updated or scanned as root.
+    if [[ "$EUID" -eq 0 ]]; then
+        echo ""
+        fail "SECURITY GUARDRAIL: Standalone & AUR updates cannot be executed as root!"
+        info "Running user-space updates (AUR, ~/.local/bin, uv, goose, pipx, rustup) as root causes"
+        info "permission corruption (root-owned files in user \$HOME), broken environments, and build failures."
+        info "Please run 'sys-health --software' directly from your standard user terminal account without sudo."
+        echo ""
+        return 1
+    fi
 
     # State tracking persisted across interactive menu loops (Gemini Pro regression fix)
     local exit_summary=0
@@ -6709,8 +6956,11 @@ run_software_updates() {
                 if "$aur_helper" -Sua; then
                     ok "AUR update completed successfully."
                 else
-                    if [[ -f /var/lib/pacman/db.lck ]]; then
-                        fail "Pacman database lock error: /var/lib/pacman/db.lck held by another process."
+                    local pac_db pac_lck
+                    pac_db="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
+                    pac_lck="${pac_db%/}/db.lck"
+                    if [[ -f "$pac_lck" ]]; then
+                        fail "Pacman database lock error: $pac_lck held by another process."
                     else
                         warn "$aur_helper -Sua returned non-zero exit code or was cancelled."
                     fi
@@ -7018,13 +7268,13 @@ check_laptop_battery_preflight() {
     # If no system batteries exist (e.g. desktop workstation), pass immediately
     (( ${#sys_batteries[@]} == 0 )) && return 0
 
-    # 3. Check AC connection
+    # 3. Check AC connection (Universal discovery across Mains, Brick, and USB-C PD power supplies)
     local ac_connected=false
     for psu_dir in /sys/class/power_supply/*; do
         [[ -d "$psu_dir" ]] || continue
         local psu_type=""
         [[ -r "$psu_dir/type" ]] && psu_type="$(< "$psu_dir/type")"
-        if [[ "$psu_type" == "Mains" || "$psu_type" == "USB" ]]; then
+        if [[ "$psu_type" != "Battery" ]]; then
             local online="0"
             [[ -r "$psu_dir/online" ]] && online="$(< "$psu_dir/online")"
             if [[ "$online" == "1" ]]; then
@@ -7148,8 +7398,8 @@ if not items:
             pass
 
 if not items:
-    print("IGNORED:0")
-    sys.exit(0)
+    print("UNREACHABLE")
+    sys.exit(1)
 
 pattern = re.compile(r"(manual intervention|intervention required|breaking change|requires manual|drops .* support)", re.IGNORECASE)
 
@@ -7243,6 +7493,7 @@ run_guarded_upgrade() {
 
     # Background sudo keepalive (terminated safely via RETURN trap)
     local sudo_loop_pid=""
+    local tmp_repo="" tmp_aur=""
     ( while true; do sudo -n -v 2>/dev/null || exit 0; sleep 50 & wait $!; done ) &
     sudo_loop_pid=$!
     _cleanup_guarded_upgrade() {
@@ -7250,6 +7501,8 @@ run_guarded_upgrade() {
             kill "$sudo_loop_pid" 2>/dev/null || true
             wait "$sudo_loop_pid" 2>/dev/null || true
         fi
+        [[ -n "${tmp_repo:-}" && -f "$tmp_repo" ]] && rm -f "$tmp_repo" 2>/dev/null || true
+        [[ -n "${tmp_aur:-}" && -f "$tmp_aur" ]] && rm -f "$tmp_aur" 2>/dev/null || true
     }
     trap '_cleanup_guarded_upgrade' RETURN
 
@@ -7516,6 +7769,8 @@ run_guarded_upgrade() {
                 fail "Arch News contains manual intervention notices affecting installed packages. Aborting unattended upgrade for safety."
                 preflight_passed=false
             fi
+        elif [[ "$news_alerts" == "UNREACHABLE" ]] || (( news_rc == 1 )); then
+            info "Pre-Flight Gate 4: Arch News feed unreachable (offline or timeout); skipping check."
         elif [[ "$news_alerts" =~ IGNORED:([0-9]+) ]]; then
             local ign_cnt="${BASH_REMATCH[1]}"
             if (( ign_cnt > 0 )); then
@@ -7527,7 +7782,7 @@ run_guarded_upgrade() {
             ok "Pre-Flight Gate 4: Arch News checked (no active advisories affecting installed packages)."
         fi
     else
-        ok "Pre-Flight Gate 4: python3 not available to parse RSS, skipping feed check."
+        info "Pre-Flight Gate 4: python3 not available to parse RSS, skipping feed check."
     fi
 
     # --------------------------------------------------------------------------
@@ -7542,15 +7797,14 @@ run_guarded_upgrade() {
     fi
 
     if $has_maxwell; then
-        if ! pacman -Q nvidia-580xx-dkms &>/dev/null || ! pacman -Q nvidia-580xx-utils &>/dev/null; then
-            fail "Pre-Flight Gate 5: NVIDIA GTX 970 Maxwell requires 'nvidia-580xx-dkms' and 'nvidia-580xx-utils'!"
-            preflight_passed=false
+        if pacman -Qq 2>/dev/null | grep -qE '^nvidia-580xx'; then
+            if pacman -Qq 2>/dev/null | grep -qxE "(nvidia|nvidia-open|nvidia-open-dkms|nvidia-lts)"; then
+                fail "Pre-Flight Gate 5: Conflicting modern NVIDIA driver package detected! GTX 970 will fail with black screen."
+                preflight_passed=false
+            else
+                ok "Pre-Flight Gate 5: Hardware GPU & legacy driver branch validated (nvidia-580xx)."
+            fi
         fi
-        if pacman -Qq 2>/dev/null | grep -qxE "(nvidia|nvidia-open|nvidia-open-dkms|nvidia-lts)"; then
-            fail "Pre-Flight Gate 5: Conflicting modern NVIDIA driver package detected! GTX 970 will fail with black screen."
-            preflight_passed=false
-        fi
-        ok "Pre-Flight Gate 5: Hardware GPU & legacy driver branch validated (nvidia-580xx)."
     fi
 
     # 2. Kernel headers invariant for every installed kernel (if DKMS is in use)
@@ -7720,7 +7974,7 @@ run_guarded_upgrade() {
     fi
 
     # Categorize and format package manifest
-    local core_regex='^(linux|linux-lts|linux-zen|linux-hardened|nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|grub|mkinitcpio|xorg|wayland)'
+    local core_regex='^(linux([-_].*)?|systemd([-_].*)?|glibc|dracut([-_].*)?|mkinitcpio([-_].*)?|booster([-_].*)?|grub([-_].*)?|systemd-boot|limine([-_].*)?|refind([-_].*)?|nvidia([-_].*)?|mesa([-_].*)?|vulkan([-_].*)?|wayland([-_].*)?|xorg([-_].*)?|pipewire([-_].*)?|wireplumber([-_].*)?)'
     local -a core_detected=()
     local repo_table="" aur_table=""
     local max_display=25
