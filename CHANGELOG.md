@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.25] - 2026-09-27
+
+### Fixed & Hardened (Luna SRE Architectural Audit 2.20 Remediation)
+- **Elimination of Hybrid GPU Model-Driver Mismatch (`check_gpu` & `check_gpu_errors`)**:
+  - Replaced crude single-line extraction with discrete PCI device block scanning (`lspci -k`).
+  - Resolved fatal desynchronization on hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) where NVIDIA temperature was falsely assigned to an Intel GPU label.
+  - Added multi-GPU enumeration displaying all active controllers and strictly flagging unmanaged/driverless secondary GPUs.
+  - Hardened driver extraction in `check_gpu_errors` and `generate_summary_json` using multi-line `awk` block parsing.
+- **Remediation of Partial-Permission False PASS Trap (`check_smart`)**:
+  - Fixed logic trap where mixed setups (e.g. unprivileged SATA/NVMe alongside USB/VM disks) bypassed checks and yielded false `PASS ✔ (0/1 OK)`.
+  - Disks in standby or returning I/O read errors are strictly flagged (`WARN ⚠`), eliminating silent drive degradation.
+  - Added structured remediation codes in `generate_summary_json` (`HW_STORAGE_SMART_FAILURE` vs `HW_STORAGE_SMART_UNVERIFIED`).
+- **Universal Multi-Socket & Die Thermal Aggregation (`check_temperature`)**:
+  - Implemented dynamic MAX temperature discovery across all package IDs, dies (`Tctl`/`Tdie`), and chiplets (`Tccd*`), resolving blindspots on multi-socket and Threadripper systems.
+  - Eliminated synthetic `.0°C` string formatting in sysfs fallbacks.
+  - Added strict SRE threshold gating: introduced `FAIL ✖` and `HW_CPU_CRITICAL_OVERHEAT` for critical silicon overheating (> 90°C) and neutral `INFO ℹ` for offline 0°C sensors.
+- **Multi-Disk SSD Discard Awareness (`check_fstrim`)**:
+  - Eliminated monolithic root mount bias: scans all mounted filesystems across active storage disks when `fstrim.timer` is inactive.
+  - Verified explicit `nodiscard` mount options on Btrfs to ensure accurate TRIM lifecycle validation on secondary SSD arrays.
+- **Table Reconstruction Synchronization & Power Telemetry Gap (`reconstruct_tables_from_log`)**:
+  - Added missing `power` case under Hardware & Drivers, preventing "Power & Battery" from spilling into a rogue `OTHER CHECKS` section in log viewers.
+  - Preserved GPU driver telemetry and added structured decoding for uninstalled smartmontools and offline thermal sensors.
+
 ## [2.24] - 2026-09-27
 
 ### Fixed & Hardened (Luna SRE Architectural Audit 2.21/2.22 Remediation)
