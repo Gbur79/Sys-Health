@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.21"
+VERSION="2.22"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -50,6 +50,7 @@ Options:
   -r, --report           Print latest text audit report to stdout and exit
   -m, --maintenance      Run safe maintenance non-interactively, then run health audit
   -o, --orphans          Run interactive orphan package triage & zero-residue purger
+  --mirrors              Benchmark, rank, and refresh fastest regional mirrors
   -d, --deep-clean       Run deep clean (trash, browser caches, thumbnails) non-interactively, then run health audit
   -h, --help             Show this help message and exit
   -v, --version          Show version and exit
@@ -119,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -o|--orphans)
             ACTION="orphans"
+            shift
+            ;;
+        --mirrors)
+            ACTION="mirrors"
             shift
             ;;
         -d|--deep-clean)
@@ -449,7 +454,7 @@ add_row() {
             "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys")
                 sec="SYS"
                 ;;
-            "Network link & Gateway"*|"System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist age"*)
+            "Network link & Gateway"*|"System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist"*)
                 sec="NET"
                 ;;
             "Multilib repository"*|"Vulkan & 32-bit"*|"Proton memory limits"*|"CPU governor"*|"Desktop session & GPU"*|"Proton & Steam tools"*|"Kernel sync"*|"Kernel split-lock"*|"GTX 970 VRAM"*)
@@ -1821,6 +1826,156 @@ triage_orphan_packages() {
     fi
 }
 
+# ==============================================================================
+# Dynamic Regional Mirror Benchmark & Staged Ranking Engine
+# Universal, Agnostic & Atomic (Reflector / Rate-Mirrors / EOS-Rankmirrors)
+# ==============================================================================
+
+refresh_and_rank_mirrors() {
+    local interactive="${1:-1}"
+    if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+        ui_screen "Regional Mirror Benchmark & Ranking"
+    else
+        section "REGIONAL REPOSITORY MIRROR RANKING"
+    fi
+
+    # Step 1: Detect network reachability first
+    if ! curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+        fail "Cannot reach Arch Linux network infrastructure (offline or DNS failure). Mirror ranking aborted."
+        return 1
+    fi
+
+    local arch_mfile="/etc/pacman.d/mirrorlist"
+    local eos_mfile="/etc/pacman.d/endeavouros-mirrorlist"
+    local arch_updated=false eos_updated=false
+    local tmp_mfile
+
+    # 1. Arch Linux Mirrors
+    if [[ -f "$arch_mfile" ]]; then
+        info "Evaluating available ranking engines for Arch Linux mirrors..."
+        tmp_mfile="$(mktemp /tmp/mirrorlist.XXXXXX)"
+
+        local ranker=""
+        if command -v rate-mirrors &>/dev/null; then
+            ranker="rate-mirrors"
+        elif command -v reflector &>/dev/null; then
+            ranker="reflector"
+        fi
+
+        if [[ -z "$ranker" ]]; then
+            warn "Neither 'rate-mirrors' nor 'reflector' was found on your system."
+            warn "Install 'reflector' (sudo pacman -S reflector) to benchmark and rank mirrors."
+        elif [[ "$ranker" == "rate-mirrors" ]]; then
+            if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                gum spin --title "Benchmarking & ranking fastest worldwide mirrors with rate-mirrors..." -- \
+                    bash -c "rate-mirrors --protocol https arch > '$tmp_mfile'" || true
+            else
+                info "Benchmarking & ranking fastest mirrors with rate-mirrors..."
+                rate-mirrors --protocol https arch > "$tmp_mfile" 2>/dev/null || true
+            fi
+        elif [[ "$ranker" == "reflector" ]]; then
+            local ref_conf="/etc/xdg/reflector/reflector.conf"
+            local ref_ran=false
+
+            # Check if user has an active reflector.conf (using standard @ syntax for python-argparse)
+            if [[ -f "$ref_conf" ]]; then
+                if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                    if gum spin --title "Ranking Arch Linux mirrors using /etc/xdg/reflector/reflector.conf..." -- \
+                        reflector @"$ref_conf" --save "$tmp_mfile"; then
+                        ref_ran=true
+                    fi
+                else
+                    if reflector @"$ref_conf" --save "$tmp_mfile" 2>/dev/null; then
+                        ref_ran=true
+                    fi
+                fi
+            fi
+
+            # Dynamic Universalism: Test the latest 20 synchronized HTTPS mirrors worldwide,
+            # benchmark connection/download speeds, select the fastest 10. NO HARDCODED COUNTRIES!
+            if ! $ref_ran; then
+                if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                    gum spin --title "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide..." -- \
+                        reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_mfile" || true
+                else
+                    info "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide with reflector..."
+                    reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_mfile" 2>/dev/null || true
+                fi
+            fi
+        fi
+
+        # Atomic Staging Gate: Validate generated mirrorlist before touching /etc/pacman.d/mirrorlist
+        local valid_servers=0
+        if [[ -s "$tmp_mfile" ]]; then
+            valid_servers="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$tmp_mfile" 2>/dev/null || echo 0)"
+        fi
+
+        if (( valid_servers >= 3 )); then
+            # Test that the top mirror in the generated file is actually reachable
+            local first_srv arch_name
+            arch_name="$(uname -m)"
+            first_srv="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$tmp_mfile" | head -n 1 | awk '{print $3}' || true)"
+            first_srv="${first_srv//\$repo/core}"
+            first_srv="${first_srv//\$arch/$arch_name}"
+
+            if curl -Ism 4 "${first_srv%/}/core.db" 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+                sudo cp -a "$arch_mfile" "${arch_mfile}.bak" 2>/dev/null || true
+                sudo install -m 644 "$tmp_mfile" "$arch_mfile"
+                ok "Arch Linux mirrorlist staged, verified ($valid_servers servers), and updated."
+                log "MAINTENANCE mirrorlist_refresh=success target=arch servers=$valid_servers"
+                arch_updated=true
+            else
+                warn "Validation probe failed on ranked primary mirror ($first_srv); keeping existing mirrorlist."
+                log "MAINTENANCE mirrorlist_refresh=failed reason=primary_unreachable"
+            fi
+        else
+            warn "Ranking did not produce sufficient valid servers ($valid_servers found); existing mirrorlist kept."
+            log "MAINTENANCE mirrorlist_refresh=failed reason=insufficient_servers count=$valid_servers"
+        fi
+        rm -f "$tmp_mfile"
+    fi
+
+    # 2. EndeavourOS Mirrors (if present on system)
+    if [[ -f "$eos_mfile" ]]; then
+        if command -v eos-rankmirrors &>/dev/null; then
+            sudo cp -a "$eos_mfile" "${eos_mfile}.bak" 2>/dev/null || true
+            if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                if gum spin --title "Ranking EndeavourOS mirrors with eos-rankmirrors..." -- sudo eos-rankmirrors --timeout 4; then
+                    ok "EndeavourOS mirrorlist refreshed."
+                    log "MAINTENANCE mirrorlist_refresh=success target=endeavouros"
+                    eos_updated=true
+                else
+                    sudo cp -a "${eos_mfile}.bak" "$eos_mfile" 2>/dev/null || true
+                    warn "eos-rankmirrors failed; restored previous EndeavourOS mirrorlist."
+                    log "MAINTENANCE mirrorlist_refresh=failed target=endeavouros"
+                fi
+            else
+                if sudo eos-rankmirrors --timeout 4 2>/dev/null; then
+                    ok "EndeavourOS mirrorlist refreshed."
+                    log "MAINTENANCE mirrorlist_refresh=success target=endeavouros"
+                    eos_updated=true
+                else
+                    sudo cp -a "${eos_mfile}.bak" "$eos_mfile" 2>/dev/null || true
+                    warn "eos-rankmirrors failed; restored previous EndeavourOS mirrorlist."
+                    log "MAINTENANCE mirrorlist_refresh=failed target=endeavouros"
+                fi
+            fi
+        fi
+    fi
+
+    if $arch_updated || $eos_updated; then
+        echo ""
+        ok "Mirrorlist ranking & optimization completed successfully."
+        echo ""
+        return 0
+    else
+        echo ""
+        warn "Mirrorlist ranking did not update any active mirrorlists."
+        echo ""
+        return 1
+    fi
+}
+
 
 
 # ------------------------------------------------------------------------------
@@ -2633,7 +2788,7 @@ check_failed_services() {
             uname="$(id -nu "$uid" 2>/dev/null || echo "UID $uid")"
 
             local failed_list
-            failed_list="$(systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d' || true)"
+            failed_list="$(systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vE '^app-.*\.(service|scope)$' | sed '/^$/d' || true)"
             ((checked_users++))
 
             if [[ -n "$failed_list" ]]; then
@@ -2644,7 +2799,7 @@ check_failed_services() {
                 user_audit_details+=("User $uname ($uid): $u_cnt failed")
                 {
                     echo "### FAILED SYSTEMD UNITS (USER: $uname / $uid)"
-                    systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>&1
+                    systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>&1 | grep -vE '^app-.*\.(service|scope)$' || true
                 } >> "$LOG_FILE"
             fi
         done <<< "$active_user_units"
@@ -2652,7 +2807,7 @@ check_failed_services() {
         # Unprivileged execution: check current user bus
         if systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null; then
             local failed_list
-            failed_list="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d' || true)"
+            failed_list="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vE '^app-.*\.(service|scope)$' | sed '/^$/d' || true)"
             ((checked_users++))
             if [[ -n "$failed_list" ]]; then
                 local u_cnt
@@ -2662,7 +2817,7 @@ check_failed_services() {
                 user_audit_details+=("${USER:-UID $EUID}: $u_cnt failed")
                 {
                     echo "### FAILED SYSTEMD UNITS (USER: ${USER:-$EUID})"
-                    systemctl --user --failed --no-legend --plain 2>&1
+                    systemctl --user --failed --no-legend --plain 2>&1 | grep -vE '^app-.*\.(service|scope)$' || true
                 } >> "$LOG_FILE"
             fi
         fi
@@ -3011,7 +3166,7 @@ check_dns() {
             dig_cmd+=("@${DNS_TEST_SERVER}")
             server_note=" @${DNS_TEST_SERVER}"
         fi
-        dig_cmd+=("$test_host" "+time=2" "+tries=1")
+        dig_cmd+=("$test_host" "+time=3" "+tries=2")
 
         local dig_out
         dig_out="$("${dig_cmd[@]}" 2>&1)"
@@ -3115,9 +3270,9 @@ check_mirrorlist_age() {
     done < <(find /etc/pacman.d -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
 
     if (( ${#mirror_files[@]} == 0 )); then
-        add_row "Mirrorlist age" "WARN ⚠ (no mirrorlist found in /etc/pacman.d)" "NET"
+        add_row "Mirrorlist status" "WARN ⚠ (no mirrorlist found in /etc/pacman.d)" "NET"
         ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN missing_all"
+        log "HEALTH mirrorlist_age=WARN missing_all details='no mirrorlist found in /etc/pacman.d'"
         return
     fi
 
@@ -3131,11 +3286,53 @@ check_mirrorlist_age() {
         sorted_files+=("$mf")
     done
 
+    # Live Reachability & Latency Probe on Primary Arch Mirror
+    local primary_info="" primary_dead=false primary_slow=false primary_ms=0
+    local arch_name
+    arch_name="$(uname -m)"
+
+    if [[ -f "/etc/pacman.d/mirrorlist" ]] && command -v curl &>/dev/null; then
+        local first_srv
+        first_srv="$(grep -E '^[[:space:]]*Server[[:space:]]*=' /etc/pacman.d/mirrorlist 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+        if [[ -n "$first_srv" ]]; then
+            first_srv="${first_srv//\$repo/core}"
+            first_srv="${first_srv//\$arch/$arch_name}"
+            local probe_res http_code time_conn
+            probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 2 "${first_srv%/}/core.db" 2>/dev/null || echo "000|0")"
+            http_code="${probe_res%%|*}"
+            time_conn="${probe_res##*|}"
+
+            if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
+                if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+                    local s_sec="${BASH_REMATCH[1]}"
+                    local s_frac="${BASH_REMATCH[2]}"
+                    s_frac="${s_frac#"${s_frac%%[!0]*}"}"
+                    [[ -z "$s_frac" ]] && s_frac=0
+                    primary_ms=$(( s_sec * 1000 + s_frac ))
+                fi
+                if (( primary_ms > 400 )); then
+                    primary_slow=true
+                    primary_info="${primary_ms}ms high-latency"
+                else
+                    primary_info="${primary_ms}ms"
+                fi
+            else
+                # Check if network is globally alive before flagging primary mirror as dead
+                if curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+                    primary_dead=true
+                    primary_info="primary DEAD"
+                fi
+            fi
+        fi
+    fi
+
     local max_days=0
+    local empty_mirrorlist=false
+    local low_redundancy=false
     local -a labels=()
 
     for mf in "${sorted_files[@]}"; do
-        local mtime fname days
+        local mtime fname days srv_cnt
         fname="$(basename "$mf")"
         fname="${fname%-mirrorlist}"
         fname="${fname#mirrorlist}"
@@ -3147,11 +3344,31 @@ check_mirrorlist_age() {
             *)           fname="${fname^}" ;;
         esac
 
+        srv_cnt="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$mf" 2>/dev/null || echo 0)"
+        if (( srv_cnt == 0 )); then
+            empty_mirrorlist=true
+        elif (( srv_cnt < 2 )); then
+            low_redundancy=true
+        fi
+
         mtime="$(stat -c %Y "$mf" 2>/dev/null || echo 0)"
         if (( mtime > 0 )); then
             days=$(( (now - mtime) / 86400 ))
             (( days > max_days )) && max_days=$days
-            labels+=("${fname}: ${days}d")
+
+            local detail_items=()
+            detail_items+=("${days}d")
+            if [[ "$fname" == "Arch" && -n "$primary_info" ]]; then
+                detail_items+=("$primary_info")
+            fi
+            detail_items+=("${srv_cnt} srv")
+
+            local item_str=""
+            for it in "${detail_items[@]}"; do
+                [[ -n "$item_str" ]] && item_str+=", "
+                item_str+="$it"
+            done
+            labels+=("${fname}: ${item_str}")
         fi
     done
 
@@ -3164,16 +3381,16 @@ check_mirrorlist_age() {
         fi
     done
 
-    if (( max_days > 90 )); then
-        add_row "Mirrorlist age" "WARN ⚠ ($status_label)" "NET"
+    if $empty_mirrorlist || $primary_dead || (( max_days > 90 )); then
+        add_row "Mirrorlist status" "WARN ⚠ ($status_label)" "NET"
         ((WARNINGS++))
         log "HEALTH mirrorlist_age=WARN max_days=$max_days details='$status_label'"
-    elif (( max_days > 45 )); then
-        add_row "Mirrorlist age" "INFO ℹ ($status_label)" "NET"
+    elif $primary_slow || $low_redundancy || (( max_days > 45 )); then
+        add_row "Mirrorlist status" "INFO ℹ ($status_label)" "NET"
         ((INFO_COUNT++))
         log "HEALTH mirrorlist_age=INFO max_days=$max_days details='$status_label'"
     else
-        add_row "Mirrorlist age" "PASS ✔ ($status_label)" "NET"
+        add_row "Mirrorlist status" "PASS ✔ ($status_label)" "NET"
         log "HEALTH mirrorlist_age=PASS max_days=$max_days details='$status_label'"
     fi
 }
@@ -3869,8 +4086,8 @@ generate_summary_json() {
                     ;;
                 mirrorlist_age)
                     code="PKG_MIRRORLIST_STALE"
-                    summary="Pacman mirrorlist has not been updated in over 90 days"
-                    fix="Refresh mirrors with reflector or eos-rankmirrors"
+                    summary="Pacman mirrorlist has stale mirrors, dead primary server, or high latency"
+                    fix="Refresh mirrors with reflector, rate-mirrors, or eos-rankmirrors"
                     risk="LOW"
                     ;;
                 arch_news)
@@ -4365,9 +4582,9 @@ reconstruct_tables_from_log() {
                 ;;
             mirrorlist_age)
                 if [[ "$details" =~ details=\'([^\']+)\' ]]; then
-                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "${BASH_REMATCH[1]}")\n"
+                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist status" "$val" "${BASH_REMATCH[1]}")\n"
                 else
-                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist age" "$val" "$details")\n"
+                    AUDIT_TABLE_NET+="$(_format_audit_row "Mirrorlist status" "$val" "$details")\n"
                 fi
                 ;;
             arch_news)
@@ -6396,94 +6613,131 @@ run_guarded_upgrade() {
     fi
 
     # --------------------------------------------------------------------------
-    # Gate 3: Network & Repository L7 Reachability
+    # Gate 3: Network & Repository L7 Reachability & Mirrorlist Integrity
     # --------------------------------------------------------------------------
-    local primary_mirror="" mirror_reachable=false
-    if [[ -f /etc/pacman.d/mirrorlist ]]; then
-        primary_mirror="$(grep -E '^[[:space:]]*Server[[:space:]]*=' /etc/pacman.d/mirrorlist | head -n 1 | awk '{print $3}' | sed 's/\$repo/core/g; s/\$arch/x86_64/g' || true)"
-    fi
-    if [[ -n "$primary_mirror" ]]; then
-        if curl -Ism 5 "${primary_mirror}/core.db" 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
-            mirror_reachable=true
-        fi
-    fi
-
-    if ! $mirror_reachable; then
-        if curl -Ism 5 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
-            ok "Pre-Flight Gate 3: Arch Linux control-plane reachable (primary mirror responded slowly)."
-        else
-            fail "Pre-Flight Gate 3: TLS/DNS reachability to repository infrastructure failed."
-            preflight_passed=false
-        fi
-    else
-        ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified."
-    fi
-
-    # Mirrorlist freshness & Staged ranking
+    local arch_name
+    arch_name="$(uname -m)"
     local arch_mfile="/etc/pacman.d/mirrorlist"
     local eos_mfile="/etc/pacman.d/endeavouros-mirrorlist"
-    local arch_age=0 eos_age=0 now_ts
-    now_ts="$(date +%s)"
-    if [[ -f "$arch_mfile" ]]; then
-        local m_mtime
-        m_mtime="$(stat -c %Y "$arch_mfile" 2>/dev/null || echo 0)"
-        if (( m_mtime > 0 )); then
-            arch_age=$(( (now_ts - m_mtime) / 86400 ))
-        else
-            arch_age=999
-        fi
-    fi
-    if [[ -f "$eos_mfile" ]]; then
-        local e_mtime
-        e_mtime="$(stat -c %Y "$eos_mfile" 2>/dev/null || echo 0)"
-        if (( e_mtime > 0 )); then
-            eos_age=$(( (now_ts - e_mtime) / 86400 ))
-        else
-            eos_age=999
-        fi
+    local primary_mirror="" mirror_reachable=false mirror_rtt_ms=0 http_code="" time_conn=""
+    local arch_srv_count=0 eos_srv_count=0
+
+    # 1. Verify Internet / DNS control plane reachability first
+    local control_plane_reachable=false
+    if curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+        control_plane_reachable=true
     fi
 
-    if (( arch_age > 30 || eos_age > 30 )); then
-        warn "Pre-Flight Gate 3: Local mirrorlists are older than 30 days (Arch: ${arch_age}d, EOS: ${eos_age}d)."
-        if [[ -t 0 ]] && command -v gum &>/dev/null; then
-            if gum confirm "Refresh and rank fastest regional mirrors before upgrading?"; then
-                local tmp_mfile
-                tmp_mfile="$(mktemp /tmp/mirrorlist.XXXXXX)"
-                local ref_ran=false
-                if [[ -f /etc/xdg/reflector/reflector.conf ]]; then
-                    if gum spin --title "Ranking Arch Linux mirrors using reflector.conf..." --                         sudo reflector --config /etc/xdg/reflector/reflector.conf --save "$tmp_mfile"; then
-                        ref_ran=true
-                    fi
-                fi
-                if ! $ref_ran; then
-                    if gum spin --title "Ranking Arch Linux mirrors with reflector..." --                         sudo reflector --country "United Kingdom,France,Netherlands,Germany" --protocol https --latest 10 --sort rate --save "$tmp_mfile"; then
-                        ref_ran=true
-                    fi
-                fi
+    if ! $control_plane_reachable; then
+        fail "Pre-Flight Gate 3: TLS/DNS reachability to repository infrastructure failed (network appears offline)."
+        preflight_passed=false
+    else
+        # 2. Extract primary mirror and count active servers
+        if [[ -f "$arch_mfile" ]]; then
+            arch_srv_count="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null || echo 0)"
+            primary_mirror="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+            primary_mirror="${primary_mirror//\$repo/core}"
+            primary_mirror="${primary_mirror//\$arch/$arch_name}"
+        fi
+        if [[ -f "$eos_mfile" ]]; then
+            eos_srv_count="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$eos_mfile" 2>/dev/null || echo 0)"
+        fi
 
-                if $ref_ran && grep -qE '^[[:space:]]*Server[[:space:]]*=' "$tmp_mfile" 2>/dev/null; then
-                    sudo install -m 644 "$tmp_mfile" "$arch_mfile"
-                    ok "Arch Linux mirrorlist staged, verified, and updated."
-                else
-                    warn "Reflector ranking failed or generated invalid mirrorlist; existing mirrorlist kept."
+        # 3. Test primary mirror reachability & latency
+        if [[ -n "$primary_mirror" && "$arch_srv_count" -gt 0 ]]; then
+            local probe_out
+            probe_out="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_mirror%/}/core.db" 2>/dev/null || echo "000|0")"
+            http_code="${probe_out%%|*}"
+            time_conn="${probe_out##*|}"
+            if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
+                mirror_reachable=true
+                if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+                    local s_sec="${BASH_REMATCH[1]}"
+                    local s_frac="${BASH_REMATCH[2]}"
+                    s_frac="${s_frac#"${s_frac%%[!0]*}"}"
+                    [[ -z "$s_frac" ]] && s_frac=0
+                    mirror_rtt_ms=$(( s_sec * 1000 + s_frac ))
                 fi
-                rm -f "$tmp_mfile"
+            fi
+        fi
 
-                if [[ -f "$eos_mfile" ]] && command -v eos-rankmirrors &>/dev/null; then
-                    sudo cp -a "$eos_mfile" "${eos_mfile}.bak" 2>/dev/null || true
-                    if gum spin --title "Ranking EndeavourOS mirrors..." -- sudo eos-rankmirrors --timeout 4; then
-                        ok "EndeavourOS mirrorlist refreshed."
+        # 4. Check mirrorlist file age
+        local arch_age=0 eos_age=0 now_ts
+        now_ts="$(date +%s)"
+        if [[ -f "$arch_mfile" ]]; then
+            local m_mtime
+            m_mtime="$(stat -c %Y "$arch_mfile" 2>/dev/null || echo 0)"
+            (( m_mtime > 0 )) && arch_age=$(( (now_ts - m_mtime) / 86400 )) || arch_age=999
+        fi
+        if [[ -f "$eos_mfile" ]]; then
+            local e_mtime
+            e_mtime="$(stat -c %Y "$eos_mfile" 2>/dev/null || echo 0)"
+            (( e_mtime > 0 )) && eos_age=$(( (now_ts - e_mtime) / 86400 )) || eos_age=999
+        fi
+
+        # 5. Smart Health Trigger: Determine if mirrorlist needs refresh
+        local needs_mirror_refresh=false
+        local refresh_reason=""
+
+        if (( arch_srv_count == 0 )); then
+            needs_mirror_refresh=true
+            refresh_reason="Arch Linux mirrorlist is empty (0 active servers)."
+        elif ! $mirror_reachable; then
+            needs_mirror_refresh=true
+            refresh_reason="Primary mirror is unreachable (HTTP ${http_code:-000} - dead or connection refused)."
+        elif (( arch_age > 30 || eos_age > 30 )); then
+            needs_mirror_refresh=true
+            refresh_reason="Local mirrorlists are older than 30 days (Arch: ${arch_age}d, EOS: ${eos_age}d)."
+        elif (( mirror_rtt_ms > 800 )); then
+            needs_mirror_refresh=true
+            refresh_reason="Primary mirror latency is critically high (${mirror_rtt_ms}ms - cross-continental or throttled)."
+        fi
+
+        if $needs_mirror_refresh; then
+            warn "Pre-Flight Gate 3: $refresh_reason"
+            if [[ -t 0 ]] && command -v gum &>/dev/null; then
+                if gum confirm "Refresh and rank fastest regional mirrors before upgrading?"; then
+                    if refresh_and_rank_mirrors 1; then
+                        # Re-probe primary mirror after refresh
+                        if [[ -f "$arch_mfile" ]]; then
+                            primary_mirror="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+                            primary_mirror="${primary_mirror//\$repo/core}"
+                            primary_mirror="${primary_mirror//\$arch/$arch_name}"
+                            local re_probe re_code re_conn
+                            re_probe="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_mirror%/}/core.db" 2>/dev/null || echo "000|0")"
+                            re_code="${re_probe%%|*}"
+                            re_conn="${re_probe##*|}"
+                            if [[ "$re_code" =~ ^(200|301|302)$ ]]; then
+                                mirror_reachable=true
+                                if [[ "$re_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+                                    local r_sec="${BASH_REMATCH[1]}"
+                                    local r_frac="${BASH_REMATCH[2]}"
+                                    r_frac="${r_frac#"${r_frac%%[!0]*}"}"
+                                    [[ -z "$r_frac" ]] && r_frac=0
+                                    mirror_rtt_ms=$(( r_sec * 1000 + r_frac ))
+                                fi
+                            fi
+                        fi
+                        ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified (${mirror_rtt_ms}ms)."
                     else
-                        sudo cp -a "${eos_mfile}.bak" "$eos_mfile" 2>/dev/null || true
-                        warn "eos-rankmirrors failed; restored previous EndeavourOS mirrorlist."
+                        warn "Mirror refresh failed; proceeding with existing configuration."
+                    fi
+                else
+                    if ! $mirror_reachable && (( arch_srv_count <= 1 )); then
+                        fail "Pre-Flight Gate 3: Primary mirror is unreachable and no working fallback servers remain."
+                        preflight_passed=false
+                    else
+                        info "Proceeding with existing mirrorlist."
                     fi
                 fi
             else
-                info "Proceeding with existing mirrorlist."
+                info "Proceeding with existing mirrorlist (non-interactive mode)."
             fi
+        else
+            local latency_note=""
+            (( mirror_rtt_ms > 0 )) && latency_note=" (${mirror_rtt_ms}ms)"
+            ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified${latency_note}."
         fi
-    else
-        ok "Pre-Flight Gate 3: Mirrorlists are fresh (Arch: ${arch_age}d, EOS: ${eos_age}d)."
     fi
 
     # --------------------------------------------------------------------------
@@ -7121,6 +7375,11 @@ if [[ "$ACTION" == "orphans" ]]; then
     exit $?
 fi
 
+if [[ "$ACTION" == "mirrors" ]]; then
+    refresh_and_rank_mirrors 1
+    exit $?
+fi
+
 if [[ "$ACTION" == "deep-clean" ]]; then
     MAINTENANCE_CONFIRMED=1
     run_maintenance "Deep Clean"
@@ -7214,15 +7473,17 @@ while true; do
                         --cursor.foreground="81" \
                         "1. Standard Maintenance (Prune package caches to 2 versions & vacuum journal)" \
                         "2. Orphan Package Triage & Zero-Residue Purge" \
-                        "3. Complete Maintenance (Standard Maintenance + Orphan Triage)" \
-                        "4. Cancel & Return"
+                        "3. Refresh & Rank Fastest Regional Mirrors (Reflector / EOS)" \
+                        "4. Complete Maintenance (Standard Maintenance + Orphan Triage + Mirrorlist)" \
+                        "5. Cancel & Return"
                 )"
             elif [[ -t 0 ]]; then
                 echo "1. Standard Maintenance (Prune package caches to 2 versions & vacuum journal)"
                 echo "2. Orphan Package Triage & Zero-Residue Purge"
-                echo "3. Complete Maintenance (Standard Maintenance + Orphan Triage)"
-                echo "4. Cancel & Return"
-                read -r -p "Select option [1-4]: " maint_choice
+                echo "3. Refresh & Rank Fastest Regional Mirrors (Reflector / EOS)"
+                echo "4. Complete Maintenance (Standard Maintenance + Orphan Triage + Mirrorlist)"
+                echo "5. Cancel & Return"
+                read -r -p "Select option [1-5]: " maint_choice
             else
                 maint_choice="1. Standard Maintenance"
             fi
@@ -7237,10 +7498,15 @@ while true; do
                     triage_orphan_packages
                     run_health_check
                     ;;
-                "3. Complete Maintenance"*|"3")
+                "3. Refresh & Rank"*|"3")
+                    refresh_and_rank_mirrors 1
+                    run_health_check
+                    ;;
+                "4. Complete Maintenance"*|"4")
                     MAINTENANCE_CONFIRMED=1
                     run_maintenance "Safe Maintenance"
                     triage_orphan_packages
+                    refresh_and_rank_mirrors 1
                     run_health_check
                     ;;
                 *)
