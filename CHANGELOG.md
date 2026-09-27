@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.23] - 2026-09-27
+
+### Added & Hardened (Universal Bootloader & Kernel Synchronization Engine)
+- **Universal Multi-Bootloader Synchronization Audit (`check_bootloader_sync` / `_boot_sync_audit`)**:
+  - Implemented an intelligent, read-only audit engine in `BOOT & CORE OS` that cross-references all installed kernel families (`/usr/lib/modules/*/pkgbase`) directly against active bootloader configurations.
+  - Resolves the **Silent Kernel-Bootloader Drift Trap**: In Arch Linux, kernel packages run ALPM hooks that compile DKMS modules and build initramfs via dracut/mkinitcpio, but Arch intentionally omits automatic `grub-mkconfig` hooks (avoiding lengthy `os-prober` multi-drive scanning delays). Users installing additional kernels (e.g. `linux-zen`) had valid kernel files on disk, yet bootloader menus lacked boot entries for them.
+  - **Universal Ecosystem Support (Cardinal Dual-Lens Standard):**
+    - **GRUB:** Dynamically scans `/boot/grub/grub.cfg`, `${esp}/grub/grub.cfg`, `/grub/grub.cfg`, and `grub2` paths across mounted partitions and `/etc/fstab`.
+    - **systemd-boot:** Evaluates Type #1 entry files (`${esp}/loader/entries/*.conf`), live UEFI loader state (`bootctl --no-pager list`), and Type #2 standalone UKIs.
+    - **Limine:** Parses active `limine.conf` and `limine.cfg` across boot and ESP paths.
+    - **rEFInd:** Features dynamic auto-discovery awareness—checks static `refind_linux.conf` without generating false-positive desync warnings on installations leveraging rEFInd's dynamic kernel scanning.
+    - **UKI (Unified Kernel Images):** Validates standalone `.efi` kernel binaries in `${esp}/EFI/Linux/`.
+- **Non-Root Privilege Boundary & Zero False Alarms**:
+  - Respects standard `0600 root:root` permissions on `/boot/grub/grub.cfg` without hanging on interactive password prompts.
+  - Non-interactively verifies elevated read access via `sudo -n`. If unprivileged, emits a neutral advisory (`INFO ℹ (grub: grub.cfg permissions 0600; run with sudo to audit boot entries)`) rather than raising false `WARN` or `FAIL` alerts.
+- **Boundary-Safe Kernel Regex Matching**:
+  - Implemented strict boundary matching regex (`(vmlinuz-|initramfs-|initrd-|Linux[[:space:]]+)${base}([[:space:]/'".,)]|$)`) to eliminate substring collisions between related kernel variants (e.g. guaranteeing `linux-lts` or `linux-zen` does not trigger a false positive match for vanilla `linux`).
+- **Structured Actionable Remediation (`BOOTLOADER_KERNEL_DESYNC`)**:
+  - Integrates structured actionable remediation in both terminal reports and `summary.json` telemetry (`BOOTLOADER_KERNEL_DESYNC`), surfacing tailored recovery commands (e.g., `sudo grub-mkconfig -o /boot/grub/grub.cfg` or `reinstall-kernels`).
+
+### Changed & Unified (Post-Flight Upgrade Verification)
+- **Harmonized Post-Flight Bootloader Check (`verify_bootloader_post_flight`)**:
+  - Replaced legacy static bootloader presence checks in Phase 3 of Guarded Upgrade with the unified `_boot_sync_audit 0` engine.
+  - Guarantees that newly installed kernels are actively registered in bootloader menus before the user reboots.
+
+---
+
 ## [2.22] - 2026-09-27
 
 ### Fixed & Hardened (Cardinal Mandate: Universalism & Mirror Resilience)
