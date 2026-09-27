@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.24
+# Arch System Health & Diagnostics v2.25
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.24"
+VERSION="2.25"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2920,57 +2920,114 @@ check_bootloader_sync() {
 }
 
 check_gpu() {
-    local vga_info
-    vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
+    local lspci_out
+    lspci_out="$(lspci -k 2>/dev/null || true)"
 
-    if [[ -z "$vga_info" ]]; then
+    if [[ -z "$lspci_out" ]]; then
         add_row "GPU runtime" "INFO ℹ (No GPU detected)" "HW"
         log "HEALTH gpu=not_detected"
         return
     fi
 
-    local drivers driver_list
-    drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u || true)"
-    driver_list="$(echo $drivers | tr '\n' ' ' | sed 's/ $//')"
+    # Dynamic extraction of discrete PCI device blocks for all display controllers
+    local -a gpu_blocks=()
+    local current_block="" in_gpu=false
 
-    # Extract clean model name for all GPU vendors from lspci
-    local raw_model gpu_model
-    raw_model="$(printf '%s\n' "$vga_info" | grep -iE 'VGA|3D|Display' | head -n1 || true)"
-    if [[ "$raw_model" =~ \[([^\]]+)\] ]]; then
-        gpu_model="${BASH_REMATCH[1]}"
-    else
-        gpu_model="$(echo "$raw_model" | sed -E 's/^[^:]+: //; s/ \(rev [0-9a-f]+\)$//')"
-    fi
-    [[ -z "$gpu_model" ]] && gpu_model="GPU"
-
-    if [[ "$driver_list" == *"nvidia"* ]]; then
-        local gpu_temp=""
-        if command -v nvidia-smi &>/dev/null; then
-            gpu_temp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1 || true)"
-            local temp_display=""
-            if [[ -n "$gpu_temp" && "$gpu_temp" =~ ^[0-9]+$ ]]; then
-                temp_display=" | ${gpu_temp}°C"
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\. ]]; then
+            if $in_gpu && [[ -n "$current_block" ]]; then
+                gpu_blocks+=("$current_block")
+                current_block=""
             fi
-            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_model}${temp_display})" "HW"
-            log "HEALTH gpu=NVIDIA driver=nvidia model='$gpu_model' temp='${gpu_temp:-suspended}'"
-        else
-            add_row "GPU runtime (NVIDIA)" "PASS ✔ (${gpu_model} - driver: nvidia)" "HW"
-            log "HEALTH gpu=NVIDIA driver=nvidia model='$gpu_model'"
+            if [[ "$line" =~ (VGA compatible controller|3D controller|Display controller) ]]; then
+                in_gpu=true
+                current_block="$line"
+            else
+                in_gpu=false
+            fi
+        elif $in_gpu; then
+            current_block+=$'\n'"$line"
         fi
-    elif [[ -n "$driver_list" ]]; then
-        add_row "GPU runtime" "PASS ✔ (${gpu_model} - $driver_list)" "HW"
-        log "HEALTH gpu=PASS model='$gpu_model' drivers=$driver_list"
-    else
-        add_row "GPU runtime" "WARN ⚠ (No kernel driver in use for $gpu_model)" "HW"
+    done <<< "$lspci_out"
+    if $in_gpu && [[ -n "$current_block" ]]; then
+        gpu_blocks+=("$current_block")
+    fi
+
+    if (( ${#gpu_blocks[@]} == 0 )); then
+        add_row "GPU runtime" "INFO ℹ (No GPU detected)" "HW"
+        log "HEALTH gpu=not_detected"
+        return
+    fi
+
+    local -a gpu_descs=()
+    local has_driver_missing=false
+    local missing_model=""
+    local has_nvidia=false primary_model="" primary_driver="" primary_temp=""
+
+    for block in "${gpu_blocks[@]}"; do
+        local raw_hdr="${block%%$'\n'*}"
+        local dev_model=""
+        if [[ "$raw_hdr" =~ \[([^\]]+)\] ]]; then
+            dev_model="${BASH_REMATCH[1]}"
+        else
+            dev_model="$(echo "$raw_hdr" | sed -E 's/^[^:]+: //; s/ \(rev [0-9a-f]+\)$//')"
+        fi
+        [[ -z "$dev_model" ]] && dev_model="GPU"
+
+        local dev_driver=""
+        if [[ "$block" =~ Kernel\ driver\ in\ use:\ +([a-zA-Z0-9_-]+) ]]; then
+            dev_driver="${BASH_REMATCH[1]}"
+        fi
+
+        [[ -z "$primary_model" ]] && primary_model="$dev_model"
+        [[ -z "$primary_driver" ]] && primary_driver="$dev_driver"
+
+        if [[ -z "$dev_driver" ]]; then
+            has_driver_missing=true
+            missing_model="$dev_model"
+            gpu_descs+=("${dev_model} [NO DRIVER]")
+        elif [[ "$dev_driver" == *"nvidia"* ]]; then
+            has_nvidia=true
+            primary_model="$dev_model"
+            primary_driver="nvidia"
+            local nv_t=""
+            if command -v nvidia-smi &>/dev/null; then
+                nv_t="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -n1 || true)"
+                nv_t="${nv_t//[^0-9]/}"
+            fi
+            primary_temp="$nv_t"
+            if [[ -n "$nv_t" ]]; then
+                gpu_descs+=("${dev_model} | ${nv_t}°C")
+            else
+                gpu_descs+=("${dev_model} [nvidia]")
+            fi
+        else
+            gpu_descs+=("${dev_model} [${dev_driver}]")
+        fi
+    done
+
+    local old_ifs="$IFS"
+    IFS=', '
+    local combined_desc="${gpu_descs[*]}"
+    IFS="$old_ifs"
+
+    if $has_driver_missing; then
+        add_row "GPU runtime" "WARN ⚠ (No kernel driver in use for $missing_model)" "HW"
         ((WARNINGS++))
-        log "HEALTH gpu=WARN no_kernel_driver model='$gpu_model'"
+        log "HEALTH gpu=WARN no_kernel_driver model='$missing_model'"
+    elif $has_nvidia; then
+        add_row "GPU runtime (NVIDIA)" "PASS ✔ ($combined_desc)" "HW"
+        log "HEALTH gpu=NVIDIA driver=nvidia model='$primary_model' temp='${primary_temp:-suspended}' details='$combined_desc'"
+    else
+        add_row "GPU runtime" "PASS ✔ ($combined_desc)" "HW"
+        log "HEALTH gpu=PASS model='$primary_model' drivers='${primary_driver}' details='$combined_desc'"
     fi
 }
 
 check_gpu_errors() {
     local vga_info drivers_in_use
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -Ei 'VGA|3D|Display' || true)"
-    drivers_in_use="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u | tr '\n' ' ' || true)"
+    drivers_in_use="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' || true)"
 
     local target_uid="${EUID}"
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
@@ -3099,30 +3156,53 @@ check_dkms() {
 
 check_temperature() {
     local cpu_temp=""
+    local max_temp=0
 
-    # 1. Primary: lm_sensors with strict CPU priority (Tctl/Tdie for AMD, Package id for Intel)
+    # 1. Primary: lm_sensors - compute MAX temperature across all CPU packages and dies
     if command -v sensors &>/dev/null; then
         local sensors_out
         sensors_out="$(sensors 2>&1 || true)"
         printf '%s\n' "$sensors_out" > "$RUN_RAW/sensors.txt"
 
-        # Prioritize true CPU package/die sensors before generic temp1 diodes
-        cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'Package id 0|Tctl|Tdie' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
-        [[ -z "$cpu_temp" ]] && cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'Core 0|CPU Temperature' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
-        [[ -z "$cpu_temp" ]] && cpu_temp="$(printf '%s\n' "$sensors_out" | grep -iE 'temp1' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
+        local raw_lines
+        raw_lines="$(printf '%s\n' "$sensors_out" | grep -iE 'Package id [0-9]|Tctl|Tdie|Tccd[0-9]|Core [0-9]|CPU Temperature' || true)"
+        [[ -z "$raw_lines" ]] && raw_lines="$(printf '%s\n' "$sensors_out" | grep -iE 'temp1' || true)"
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ \+?([0-9]+)\.?[0-9]*°C ]]; then
+                local t_val="${BASH_REMATCH[1]}"
+                if (( t_val > max_temp )); then
+                    max_temp=$t_val
+                fi
+            fi
+        done <<< "$raw_lines"
+
+        if (( max_temp > 0 )); then
+            cpu_temp="${max_temp}°C"
+        fi
     fi
 
-    # 2. Universal Native Fallback: Kernel sysfs /sys/class/hwmon (No external tools required)
+    # 2. Universal Native Fallback: Kernel sysfs /sys/class/hwmon
     if [[ -z "$cpu_temp" ]]; then
         for h in /sys/class/hwmon/hwmon*; do
             [[ -d "$h" ]] || continue
             local hname
             hname="$(cat "$h/name" 2>/dev/null || echo "")"
             if [[ "$hname" =~ ^(coretemp|k10temp|zenpower|cpu_thermal)$ ]]; then
-                local raw_t
-                raw_t="$(cat "$h/temp1_input" 2>/dev/null || true)"
-                if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
-                    cpu_temp="$(( raw_t / 1000 )).0°C"
+                for inp in "$h"/temp*_input; do
+                    [[ -f "$inp" ]] || continue
+                    local raw_t
+                    raw_t="$(cat "$inp" 2>/dev/null || true)"
+                    if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
+                        local cur_t=$(( raw_t / 1000 ))
+                        if (( cur_t > max_temp )); then
+                            max_temp=$cur_t
+                        fi
+                    fi
+                done
+                if (( max_temp > 0 )); then
+                    cpu_temp="${max_temp}°C"
                     break
                 fi
             fi
@@ -3139,25 +3219,29 @@ check_temperature() {
                 local raw_t
                 raw_t="$(cat "$z/temp" 2>/dev/null || true)"
                 if [[ -n "$raw_t" && "$raw_t" =~ ^[0-9]+$ ]] && (( raw_t > 0 )); then
-                    cpu_temp="$(( raw_t / 1000 )).0°C"
-                    break
+                    local cur_t=$(( raw_t / 1000 ))
+                    if (( cur_t > max_temp )); then
+                        max_temp=$cur_t
+                    fi
                 fi
             fi
         done
+        if (( max_temp > 0 )); then
+            cpu_temp="${max_temp}°C"
+        fi
     fi
 
-    if [[ -n "$cpu_temp" ]]; then
-        local temp_int="${cpu_temp%%.*}"
-        temp_int="${temp_int//[^0-9]/}"
-
-        if [[ -n "$temp_int" ]] && (( 10#${temp_int:-0} > 85 )); then
-            add_row "CPU temperature" "WARN ⚠ ($cpu_temp)" "HW"
-            ((WARNINGS++))
-            log "HEALTH cpu_temperature=WARN value=$cpu_temp"
-        else
-            add_row "CPU temperature" "PASS ✔ ($cpu_temp)" "HW"
-            log "HEALTH cpu_temperature=PASS value=$cpu_temp"
-        fi
+    if (( max_temp > 90 )); then
+        add_row "CPU temperature" "FAIL ✖ ($cpu_temp - critical overheating)" "HW"
+        ((ERRORS++))
+        log "HEALTH cpu_temperature=FAIL value=$cpu_temp"
+    elif (( max_temp > 80 )); then
+        add_row "CPU temperature" "WARN ⚠ ($cpu_temp)" "HW"
+        ((WARNINGS++))
+        log "HEALTH cpu_temperature=WARN value=$cpu_temp"
+    elif (( max_temp > 0 )); then
+        add_row "CPU temperature" "PASS ✔ ($cpu_temp)" "HW"
+        log "HEALTH cpu_temperature=PASS value=$cpu_temp"
     else
         add_row "CPU temperature" "INFO ℹ (sensor unavailable)" "HW"
         ((INFO_COUNT++))
@@ -3200,20 +3284,26 @@ check_smart() {
         fi
     done
 
+    local smart_capable=$(( total - unsupported ))
+
     if (( failed > 0 )); then
         add_row "SMART disk health" "FAIL ✖ ($failed/$total disk(s) failed)" "HW"
         ((ERRORS++))
-        log "HEALTH smart=FAIL failed=$failed"
-    elif (( no_perm == total )); then
-        add_row "SMART disk health" "INFO ℹ (root required)" "HW"
-        ((INFO_COUNT++))
-        log "HEALTH smart=INFO root_required"
-    elif (( unsupported == total )); then
+        log "HEALTH smart=FAIL failed=$failed total=$total"
+    elif (( smart_capable == 0 )); then
         add_row "SMART disk health" "INFO ℹ (VM or non-SMART storage)" "HW"
         ((INFO_COUNT++))
         log "HEALTH smart=INFO reason=unsupported_storage"
+    elif (( no_perm > 0 && passed == 0 )); then
+        add_row "SMART disk health" "INFO ℹ (root required)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH smart=INFO root_required"
+    elif (( passed < smart_capable )); then
+        local unverified=$(( smart_capable - passed ))
+        add_row "SMART disk health" "WARN ⚠ ($passed/$smart_capable OK; $unverified unverified/standby)" "HW"
+        ((WARNINGS++))
+        log "HEALTH smart=WARN passed=$passed capable=$smart_capable total=$total"
     else
-        local smart_capable=$(( total - unsupported ))
         add_row "SMART disk health" "PASS ✔ ($passed/$smart_capable OK)" "HW"
         log "HEALTH smart=PASS passed=$passed capable=$smart_capable total=$total"
     fi
@@ -3278,7 +3368,32 @@ check_fstrim() {
     if [[ "$status" == "active" ]]; then
         add_row "SSD/NVMe TRIM timer" "PASS ✔ (active)" "HW"
         log "HEALTH fstrim=PASS active=YES"
-    elif findmnt -no FSTYPE / 2>/dev/null | grep -q 'btrfs' || findmnt -no OPTIONS / 2>/dev/null | grep -q 'discard'; then
+        return
+    fi
+
+    # If fstrim.timer is inactive, check if ALL SSD mountpoints use native continuous/async discard
+    local unmanaged_ssd_mounts=false
+    if command -v findmnt &>/dev/null; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local mnt fstype opts
+            read -r mnt fstype opts <<< "$line"
+            case "$fstype" in
+                btrfs)
+                    # Btrfs defaults to async discard on kernel >= 6.2 unless nodiscard is specified
+                    [[ "$opts" =~ (^|,)nodiscard(,|$) ]] && unmanaged_ssd_mounts=true
+                    ;;
+                ext4|xfs|f2fs)
+                    # Traditional filesystems require explicit discard option if timer is inactive
+                    [[ ! "$opts" =~ (^|,)discard(,|$) ]] && unmanaged_ssd_mounts=true
+                    ;;
+            esac
+        done < <(findmnt -lno TARGET,FSTYPE,OPTIONS -t btrfs,ext4,xfs,f2fs 2>/dev/null || true)
+    else
+        unmanaged_ssd_mounts=true
+    fi
+
+    if ! $unmanaged_ssd_mounts; then
         add_row "SSD/NVMe TRIM timer" "PASS ✔ (btrfs async/continuous discard enabled)" "HW"
         log "HEALTH fstrim=PASS mode=filesystem_discard"
     else
@@ -4583,11 +4698,7 @@ generate_summary_json() {
     local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
 
-    local vga_info
-    vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
-    if [[ -n "$vga_info" ]]; then
-        drivers="$(printf '%s\n' "$vga_info" | grep 'Kernel driver in use:' | awk '{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
-    fi
+    drivers="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
 
     local status_str="ALL_CLEAR"
     if (( ERRORS > 0 )); then
@@ -4660,16 +4771,30 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 cpu_temperature)
-                    code="HW_CPU_HIGH_TEMP"
-                    summary="CPU temperature exceeded threshold"
-                    fix="Check cooler mount, thermal paste, and fan curves"
-                    risk="MEDIUM"
+                    if [[ "$sev" == "FAIL" ]]; then
+                        code="HW_CPU_CRITICAL_OVERHEAT"
+                        summary="CPU critical overheating threshold exceeded (>90°C)"
+                        fix="Check CPU cooler, fan operation, thermal paste, and reduce CPU load immediately"
+                        risk="CRITICAL"
+                    else
+                        code="HW_CPU_HIGH_TEMP"
+                        summary="CPU temperature exceeded threshold (>80°C)"
+                        fix="Check cooler mount, thermal paste, and fan curves"
+                        risk="MEDIUM"
+                    fi
                     ;;
                 smart)
-                    code="HW_STORAGE_SMART_FAILURE"
-                    summary="Storage drive SMART self-test reporting failure"
-                    fix="Backup critical data immediately and inspect with smartctl -a"
-                    risk="HIGH"
+                    if [[ "$sev" == "FAIL" ]]; then
+                        code="HW_STORAGE_SMART_FAILURE"
+                        summary="Storage drive SMART self-test reporting failure"
+                        fix="Backup critical data immediately and inspect with smartctl -a"
+                        risk="HIGH"
+                    else
+                        code="HW_STORAGE_SMART_UNVERIFIED"
+                        summary="Storage drive SMART status unverified or disk offline"
+                        fix="Inspect drive health manually: sudo smartctl -a <device>"
+                        risk="MEDIUM"
+                    fi
                     ;;
                 fstrim)
                     code="STORAGE_TRIM_INACTIVE"
@@ -5116,18 +5241,26 @@ reconstruct_tables_from_log() {
 
             # --- HARDWARE & DRIVERS ---
             gpu)
-                local gmodel=""
+                local gmodel="" gdriver="" gtemp=""
                 if [[ "$details" =~ model=\'([^\']+)\' ]]; then
                     gmodel="${BASH_REMATCH[1]}"
                 fi
+                if [[ "$details" =~ details=\'([^\']+)\' ]]; then
+                    gdriver="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$details" =~ temp=\'([0-9]+)\' ]]; then
+                    gtemp=" | ${BASH_REMATCH[1]}°C"
+                fi
                 if [[ "$val" == "NVIDIA" ]]; then
-                    local gtemp=""
-                    if [[ "$details" =~ temp=\'([0-9]+)\' ]]; then
-                        gtemp=" | ${BASH_REMATCH[1]}°C"
+                    if [[ -n "$gdriver" ]]; then
+                        AUDIT_TABLE_HW+="GPU runtime (NVIDIA) | PASS ✔ (${gdriver})\n"
+                    else
+                        AUDIT_TABLE_HW+="GPU runtime (NVIDIA) | PASS ✔ (${gmodel:-GPU}${gtemp})\n"
                     fi
-                    AUDIT_TABLE_HW+="GPU runtime (NVIDIA) | PASS ✔ (${gmodel:-GPU}${gtemp})\n"
                 elif [[ "$val" == "PASS" ]]; then
-                    AUDIT_TABLE_HW+="GPU runtime | PASS ✔ (${gmodel:-GPU})\n"
+                    AUDIT_TABLE_HW+="GPU runtime | PASS ✔ (${gdriver:-${gmodel:-GPU}})\n"
+                elif [[ "$val" == "not_detected" ]]; then
+                    AUDIT_TABLE_HW+="GPU runtime | INFO ℹ (No GPU detected)\n"
                 else
                     AUDIT_TABLE_HW+="$(_format_audit_row "GPU runtime" "$val" "$details")\n"
                 fi
@@ -5139,7 +5272,11 @@ reconstruct_tables_from_log() {
                 AUDIT_TABLE_HW+="$(_format_audit_row "DKMS modules" "$val" "$details")\n"
                 ;;
             cpu_temperature)
-                AUDIT_TABLE_HW+="$(_format_audit_row "CPU temperature" "$val" "${details#value=}")\n"
+                if [[ "$val" == "not_detected" ]]; then
+                    AUDIT_TABLE_HW+="CPU temperature | INFO ℹ (sensor unavailable)\n"
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "CPU temperature" "$val" "${details#value=}")\n"
+                fi
                 ;;
             smart)
                 if [[ "$val" == "PASS" ]]; then
@@ -5147,6 +5284,15 @@ reconstruct_tables_from_log() {
                     [[ "$details" =~ passed=([0-9]+) ]] && passed="${BASH_REMATCH[1]}"
                     [[ "$details" =~ capable=([0-9]+) ]] && capable="${BASH_REMATCH[1]}"
                     AUDIT_TABLE_HW+="SMART disk health | PASS ✔ (${passed}/${capable} OK)\n"
+                elif [[ "$val" == "WARN" ]]; then
+                    local passed="?" capable="?"
+                    [[ "$details" =~ passed=([0-9]+) ]] && passed="${BASH_REMATCH[1]}"
+                    [[ "$details" =~ capable=([0-9]+) ]] && capable="${BASH_REMATCH[1]}"
+                    local unverified=0
+                    if [[ "$passed" =~ ^[0-9]+$ && "$capable" =~ ^[0-9]+$ ]] && (( capable > passed )); then
+                        unverified=$(( capable - passed ))
+                    fi
+                    AUDIT_TABLE_HW+="SMART disk health | WARN ⚠ (${passed}/${capable} OK; ${unverified} unverified/standby)\n"
                 elif [[ "$val" == "INFO" ]]; then
                     if [[ "$details" =~ root_required ]]; then
                         AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (root required)\n"
@@ -5155,8 +5301,31 @@ reconstruct_tables_from_log() {
                     else
                         AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (${details})\n"
                     fi
+                elif [[ "$val" == "not_installed" ]]; then
+                    AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (smartmontools not installed)\n"
+                elif [[ "$val" == "no_disks" ]]; then
+                    AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (no physical disks detected)\n"
                 else
                     AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$details")\n"
+                fi
+                ;;
+            power)
+                if [[ "$val" == "PASS" ]]; then
+                    if [[ "$details" =~ chassis=desktop ]]; then
+                        AUDIT_TABLE_HW+="Power & Battery | PASS ✔ (AC Desktop power)\n"
+                    else
+                        local bat_cap="" bat_stat=""
+                        [[ "$details" =~ battery=([^ ]+) ]] && bat_cap="${BASH_REMATCH[1]}"
+                        [[ "$details" =~ status=([^ ]+) ]] && bat_stat="${BASH_REMATCH[1]}"
+                        AUDIT_TABLE_HW+="Power & Battery | PASS ✔ (${bat_cap:+${bat_cap}% }${bat_stat:+[${bat_stat}]})\n"
+                    fi
+                elif [[ "$val" == "WARN" ]]; then
+                    local bat_low="" bat_stat=""
+                    [[ "$details" =~ battery_low=([^ ]+) ]] && bat_low="${BASH_REMATCH[1]}"
+                    [[ "$details" =~ status=([^ ]+) ]] && bat_stat="${BASH_REMATCH[1]}"
+                    AUDIT_TABLE_HW+="Power & Battery | WARN ⚠ (Battery low: ${bat_low}% [${bat_stat}])\n"
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "Power & Battery" "$val" "$details")\n"
                 fi
                 ;;
             fstrim)
@@ -5308,6 +5477,22 @@ reconstruct_tables_from_log() {
                 ;;
             steam_runtime)
                 AUDIT_TABLE_GAME+="$(_format_audit_row "Proton & Steam tools" "$val" "$details")\n"
+                ;;
+            futex_waitv)
+                local sc="${details#syscall=}"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Kernel sync (fsync)" "$val" "futex_waitv syscall ${sc:-449} verified")\n"
+                ;;
+            split_lock)
+                local st="${details#state=}"
+                local note="Mitigation disabled - optimal for Proton"
+                [[ "$st" == "1" ]] && note="Mitigation active"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "Kernel split-lock" "$val" "$note")\n"
+                ;;
+            gtx970_vram)
+                local usd="" tot=""
+                [[ "$details" =~ used=([0-9]+) ]] && usd="${BASH_REMATCH[1]}"
+                [[ "$details" =~ total=([0-9]+) ]] && tot="${BASH_REMATCH[1]}"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "GTX 970 VRAM allocation" "$val" "${usd}/${tot} MB used - 3.5GB fast segment OK")\n"
                 ;;
 
             # --- UNMAPPED CHECKS ---
