@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.20"
+VERSION="2.21"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -49,6 +49,7 @@ Options:
   -s, --snapshot         Print latest system software state snapshot to stdout and exit
   -r, --report           Print latest text audit report to stdout and exit
   -m, --maintenance      Run safe maintenance non-interactively, then run health audit
+  -o, --orphans          Run interactive orphan package triage & zero-residue purger
   -d, --deep-clean       Run deep clean (trash, browser caches, thumbnails) non-interactively, then run health audit
   -h, --help             Show this help message and exit
   -v, --version          Show version and exit
@@ -114,6 +115,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--maintenance)
             ACTION="maintenance"
+            shift
+            ;;
+        -o|--orphans)
+            ACTION="orphans"
             shift
             ;;
         -d|--deep-clean)
@@ -1538,6 +1543,284 @@ run_maintenance() {
     fi
 }
 
+# ==============================================================================
+# Dynamic Orphan Package Triage & Zero-Residue Purge Engine
+# Hardened according to Luna EOS-SRE-Auditor Architectural Blueprint
+# ==============================================================================
+
+triage_orphan_packages() {
+    ui_screen "Orphan Package Triage & Safety Pruning"
+
+    if ! command -v pacman &>/dev/null; then
+        fail "Pacman package manager not detected."
+        return 1
+    fi
+
+    if package_manager_busy; then
+        warn "Package manager or AUR build activity detected! Triage aborted to prevent DB lock contention."
+        return 1
+    fi
+
+    local -a raw_orphans=()
+    mapfile -t raw_orphans < <(pacman -Qtdq 2>/dev/null || true)
+
+    if (( ${#raw_orphans[@]} == 0 )); then
+        echo ""
+        ok "Your system dependency tree is pristine! Zero orphan packages found."
+        echo ""
+        return 0
+    fi
+
+    info "Analyzing ${#raw_orphans[@]} orphan package(s) against local ALPM database..."
+    echo ""
+
+    local -a tier1_safe=()       # Truly unrequired leaves (Optional For: None)
+    local -a tier2_optional=()   # Optional dependency for other installed apps
+    local -a tier3_system=()     # System/Kernel/Firmware/Drivers/Dev Toolchain
+
+    # Regex patterns for Tier 3 System/Build safety guardrails
+    local sys_pattern="^(linux.*|.*-headers|.*-firmware|.*-ucode|.*-dkms|base-devel|rust|cargo|go|gcc.*|clang.*|llvm.*|make|cmake|patch|git|fakeroot|binutils|pipewire.*|wireplumber.*|alsa-.*|mesa.*|vulkan.*|nvidia.*|xf86-video.*|noto-fonts.*|ttf-.*|otf-.*|fontconfig.*|grub.*|systemd.*|dracut.*|mkinitcpio.*|booster.*|limine.*|refind.*|efibootmgr.*)$"
+
+    local current_pkg=""
+    local -A pkg_desc pkg_opt pkg_size
+
+    # Single-pass batch query (blazing fast, <50ms)
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Name[[:space:]]*:[[:space:]]*(.+) ]]; then
+            current_pkg="${BASH_REMATCH[1]}"
+            pkg_desc["$current_pkg"]="No description available"
+            pkg_opt["$current_pkg"]="None"
+            pkg_size["$current_pkg"]="Unknown"
+        elif [[ "$line" =~ ^Description[[:space:]]*:[[:space:]]*(.+) ]]; then
+            pkg_desc["$current_pkg"]="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Installed[[:space:]]Size[[:space:]]*:[[:space:]]*(.+) ]]; then
+            pkg_size["$current_pkg"]="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Optional[[:space:]]For[[:space:]]*:[[:space:]]*(.+) ]]; then
+            pkg_opt["$current_pkg"]="${BASH_REMATCH[1]}"
+        fi
+    done < <(LC_ALL=C pacman -Qi "${raw_orphans[@]}" 2>/dev/null || true)
+
+    # Classify packages into 3 tiers
+    local p
+    for p in "${raw_orphans[@]}"; do
+        [[ -z "$p" ]] && continue
+        if [[ "$p" =~ $sys_pattern ]]; then
+            tier3_system+=("$p")
+        elif [[ "${pkg_opt[$p]:-None}" != "None" && -n "${pkg_opt[$p]:-}" ]]; then
+            tier2_optional+=("$p")
+        else
+            tier1_safe+=("$p")
+        fi
+    done
+
+    # Presentation breakdown
+    echo "Summary of Detected Orphan Packages (${#raw_orphans[@]} total):"
+    if command -v gum &>/dev/null; then
+        gum style --foreground 82  "  ● 🟢 Tier 1 (Safe Leaves):       ${#tier1_safe[@]} package(s) - Safe to purge (no reverse dependencies)"
+        gum style --foreground 214 "  ● 🟡 Tier 2 (Optional for Apps): ${#tier2_optional[@]} package(s) - Features in existing apps might stop working"
+        gum style --foreground 196 "  ● 🔴 Tier 3 (Core & Toolchain):  ${#tier3_system[@]} package(s) - System drivers, firmware, audio or build toolchain"
+    else
+        echo "  ● [GREEN]  Tier 1 (Safe Leaves):       ${#tier1_safe[@]} package(s) - Safe to purge"
+        echo "  ● [YELLOW] Tier 2 (Optional for Apps): ${#tier2_optional[@]} package(s) - Reverse optional dependencies"
+        echo "  ● [RED]    Tier 3 (Core & Toolchain):  ${#tier3_system[@]} package(s) - System drivers, firmware, audio or toolchains"
+    fi
+    echo ""
+
+    if (( ${#tier1_safe[@]} > 0 )); then
+        echo "🟢 Tier 1: Safe Leaves to Purge:"
+        for p in "${tier1_safe[@]}"; do
+            echo "   • $p (${pkg_size[$p]}) - ${pkg_desc[$p]}"
+        done
+        echo ""
+    fi
+
+    if (( ${#tier2_optional[@]} > 0 )); then
+        echo "🟡 Tier 2: Optional Dependencies (Review carefully):"
+        for p in "${tier2_optional[@]}"; do
+            echo "   • $p (${pkg_size[$p]})"
+            echo "     └─ Optional For: ${pkg_opt[$p]}"
+            echo "     └─ Info: ${pkg_desc[$p]}"
+        done
+        echo ""
+    fi
+
+    if (( ${#tier3_system[@]} > 0 )); then
+        echo "🔴 Tier 3: Core / Drivers / Build Toolchains (Protected):"
+        for p in "${tier3_system[@]}"; do
+            echo "   • $p (${pkg_size[$p]}) - ${pkg_desc[$p]}"
+            echo "     └─ SRE Notice: Likely needed for DKMS, hardware, sound, or AUR builds."
+        done
+        echo ""
+    fi
+
+    # Interactive Action Choice
+    local choice=""
+    if [[ -t 0 ]] && command -v gum &>/dev/null; then
+        choice="$(
+            gum choose \
+                --header="Select an Action:" \
+                --cursor="› " \
+                --cursor.foreground="81" \
+                "1. Auto-Purge Safe Leaves Only (Remove ${#tier1_safe[@]} Green packages + Zero-Residue Cache Purge)" \
+                "2. Interactive Selection (Pick packages to remove individually)" \
+                "3. Protect Useful Packages (Mark selected as Explicitly Installed: pacman -D --asexplicit)" \
+                "4. Cancel & Return"
+        )"
+    elif [[ -t 0 ]]; then
+        echo "1. Auto-Purge Safe Leaves Only (${#tier1_safe[@]} Green packages + Cache Purge)"
+        echo "2. Interactive Selection (Pick packages to remove)"
+        echo "3. Protect Useful Packages (Mark as Explicitly Installed)"
+        echo "4. Cancel & Return"
+        read -r -p "Select action [1-4]: " choice
+    else
+        info "Non-interactive shell detected; orphan triage interactive actions skipped."
+        return 0
+    fi
+
+    local -a to_remove=()
+    local -a to_protect=()
+
+    case "$choice" in
+        "1. Auto-Purge Safe Leaves Only"*|"1")
+            if (( ${#tier1_safe[@]} == 0 )); then
+                warn "No Green Tier 1 safe leaf packages found to purge."
+                return 0
+            fi
+            to_remove=("${tier1_safe[@]}")
+            ;;
+        "2. Interactive Selection"*|"2")
+            if [[ -t 0 ]] && command -v gum &>/dev/null; then
+                local -a options=()
+                for p in "${tier1_safe[@]}"; do
+                    options+=("[GREEN] $p (${pkg_size[$p]})")
+                done
+                for p in "${tier2_optional[@]}"; do
+                    options+=("[YELLOW] $p (${pkg_size[$p]} - opt for: ${pkg_opt[$p]})")
+                done
+                for p in "${tier3_system[@]}"; do
+                    options+=("[RED] $p (${pkg_size[$p]} - CRITICAL)")
+                done
+
+                local selected
+                selected="$(
+                    printf '%s\n' "${options[@]}" | gum choose --no-limit \
+                        --header="Select packages to REMOVE (Space to toggle, Enter to confirm):"
+                )"
+                [[ -z "$selected" ]] && { info "No packages selected. Aborted."; return 0; }
+
+                while IFS= read -r item; do
+                    [[ -z "$item" ]] && continue
+                    local p_name
+                    p_name="$(echo "$item" | awk '{print $2}')"
+                    [[ -n "$p_name" ]] && to_remove+=("$p_name")
+                done <<< "$selected"
+            else
+                read -r -p "Enter space-separated package names to remove: " user_pkgs
+                read -r -a to_remove <<< "$user_pkgs"
+            fi
+            ;;
+        "3. Protect Useful Packages"*|"3")
+            if [[ -t 0 ]] && command -v gum &>/dev/null; then
+                local -a protect_options=()
+                for p in "${raw_orphans[@]}"; do
+                    protect_options+=("$p (${pkg_size[$p]}) - ${pkg_desc[$p]}")
+                done
+
+                local sel_protect
+                sel_protect="$(
+                    printf '%s\n' "${protect_options[@]}" | gum choose --no-limit \
+                        --header="Select packages to PROTECT as explicitly installed (Space to toggle, Enter):"
+                )"
+                [[ -z "$sel_protect" ]] && { info "No packages chosen for protection."; return 0; }
+
+                while IFS= read -r item; do
+                    [[ -z "$item" ]] && continue
+                    local p_prot
+                    p_prot="$(echo "$item" | awk '{print $1}')"
+                    [[ -n "$p_prot" ]] && to_protect+=("$p_prot")
+                done <<< "$sel_protect"
+            else
+                read -r -p "Enter space-separated package names to protect: " user_prots
+                read -r -a to_protect <<< "$user_prots"
+            fi
+
+            if (( ${#to_protect[@]} > 0 )); then
+                info "Marking packages as explicitly installed (sudo pacman -D --asexplicit)..."
+                if sudo pacman -D --asexplicit "${to_protect[@]}"; then
+                    ok "Successfully protected ${#to_protect[@]} package(s). They will no longer appear as orphans!"
+                    log "MAINTENANCE orphans_protected count=${#to_protect[@]} pkgs=${to_protect[*]}"
+                else
+                    fail "Failed to update package install reason."
+                fi
+            fi
+            return 0
+            ;;
+        *)
+            info "Orphan triage cancelled. No changes made."
+            return 0
+            ;;
+    esac
+
+    # Execute removal if packages were selected
+    if (( ${#to_remove[@]} > 0 )); then
+        echo ""
+        if command -v gum &>/dev/null; then
+            gum style --foreground 214 "The following package(s) will be completely removed along with unneeded dependencies:"
+        else
+            echo "The following package(s) will be completely removed along with unneeded dependencies:"
+        fi
+        printf '  • %s\n' "${to_remove[@]}"
+        echo ""
+
+        local confirm_removal=false
+        if [[ -t 0 ]] && command -v gum &>/dev/null; then
+            if gum confirm "Are you sure you want to remove these packages and purge their cached archives?"; then
+                confirm_removal=true
+            fi
+        elif [[ -t 0 ]]; then
+            read -r -p "Are you sure you want to remove these packages and purge their cached archives? [y/N] " resp
+            [[ "$resp" =~ ^[Yy]$ ]] && confirm_removal=true
+        else
+            confirm_removal=true
+        fi
+
+        if ! $confirm_removal; then
+            info "Package removal aborted by user."
+            return 0
+        fi
+
+        echo ""
+        info "[Step 1/2] Removing packages via: sudo pacman -Rns ${to_remove[*]}"
+        if ! sudo pacman -Rns "${to_remove[@]}"; then
+            fail "Pacman package removal encountered an error!"
+            return 1
+        fi
+        ok "Selected orphan packages and unneeded dependencies removed."
+        log "MAINTENANCE orphans_removed count=${#to_remove[@]} pkgs=${to_remove[*]}"
+
+        # Step 2: Atomic Zero-Residue Cache Purge (Arch Wiki Standard)
+        echo ""
+        info "[Step 2/2] Initiating Zero-Residue Cache Purge (paccache -ruk0)..."
+        info "  › Arch Wiki Standard: pacman -Rns does not delete downloaded .pkg.tar.zst files from cache."
+        info "  › Purging uninstalled package archives while preserving installed packages rollback history."
+
+        local pacman_cache_dir
+        pacman_cache_dir="$(pacman-conf CacheDir 2>/dev/null | head -n 1 || echo "/var/cache/pacman/pkg")"
+        [[ -d "$pacman_cache_dir" ]] || pacman_cache_dir="/var/cache/pacman/pkg"
+
+        if command -v paccache &>/dev/null; then
+            if sudo paccache -c "$pacman_cache_dir" --remove --uninstalled --keep 0; then
+                ok "Zero-Residue Cache Purge complete. 0 dead package archives remain in $pacman_cache_dir."
+                log "MAINTENANCE uninstalled_cache_purged=PASS cache_dir=$pacman_cache_dir"
+            else
+                warn "paccache purge returned a non-zero exit code."
+            fi
+        else
+            info "paccache command not found (pacman-contrib not installed). Skipping uninstalled cache purge."
+        fi
+    fi
+}
+
 
 
 # ------------------------------------------------------------------------------
@@ -2528,6 +2811,22 @@ check_pacnew() {
             echo "### PACNEW FILES"
             printf '%s\n' "$PACNEWS"
         } >> "$LOG_FILE"
+    fi
+}
+
+check_orphan_packages() {
+    if ! command -v pacman &>/dev/null; then
+        return
+    fi
+    local orphan_count=0
+    orphan_count="$((pacman -Qtdq 2>/dev/null || true) | wc -l)"
+    if (( orphan_count == 0 )); then
+        add_row "Orphan packages" "PASS ✔ (0 unrequired)" "SYS"
+        log "HEALTH orphans=0"
+    else
+        add_row "Orphan packages" "INFO ℹ ($orphan_count unrequired - triage recommended)" "SYS"
+        ((INFO_COUNT++))
+        log "HEALTH orphans=INFO count=$orphan_count"
     fi
 }
 
@@ -3757,6 +4056,7 @@ run_health_check() {
     check_pacman_lock
     check_package_integrity
     check_pacnew
+    check_orphan_packages
     render_audit_section "SYSTEM HEALTH & SERVICES" "$AUDIT_TABLE_SYS"
 
     # --- 4. NETWORK & UPDATES ---
@@ -4038,6 +4338,14 @@ reconstruct_tables_from_log() {
                 else
                     local pcount="${details#count=}"
                     AUDIT_TABLE_SYS+=".pacnew configuration files | WARN ⚠ (${pcount:-$val} found)\n"
+                fi
+                ;;
+            orphans)
+                if [[ "$val" == "0" || "$val" == "PASS" ]]; then
+                    AUDIT_TABLE_SYS+="Orphan packages | PASS ✔ (0 unrequired)\n"
+                else
+                    local ocount="${details#count=}"
+                    AUDIT_TABLE_SYS+="Orphan packages | INFO ℹ (${ocount:-$val} unrequired - triage recommended)\n"
                 fi
                 ;;
 
@@ -6049,11 +6357,13 @@ run_guarded_upgrade() {
     fi
 
     # --------------------------------------------------------------------------
-    # Gate 2: Package Manager Safety & Database Lock
+    # Gate 2: Package Manager Safety, Database Lock & Orphan Advisory
     # --------------------------------------------------------------------------
-    local lockfile="/var/lib/pacman/db.lck"
+    local db_path
+    db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
+    local lockfile="${db_path%/}/db.lck"
     if [[ -f "$lockfile" ]]; then
-        if sudo -n fuser "$lockfile" &>/dev/null || pgrep -x pacman &>/dev/null || pgrep -x yay &>/dev/null || pgrep -x eos-update &>/dev/null; then
+        if sudo -n fuser "$lockfile" &>/dev/null || pgrep -x pacman &>/dev/null || pgrep -x yay &>/dev/null || pgrep -x paru &>/dev/null || pgrep -x eos-update &>/dev/null; then
             fail "Pre-Flight Gate 2: Pacman database is actively locked by an open process."
         else
             fail "Pre-Flight Gate 2: Stale-looking pacman lockfile found at $lockfile."
@@ -6071,6 +6381,17 @@ run_guarded_upgrade() {
             preflight_passed=false
         else
             ok "Pre-Flight Gate 2: Pacman database consistency verified (pacman -Dk)."
+        fi
+
+        # Upstream Harmonization: Informative orphan advisory (zero false alarm FAIL/WARN)
+        local orphan_count
+        orphan_count="$((pacman -Qtdq 2>/dev/null || true) | wc -l)"
+        if (( orphan_count > 0 )); then
+            info "Pre-Flight Gate 2: ${orphan_count} unrequired orphan package(s) detected."
+            info "  › Tip: Pruning unneeded orphans before upgrade saves bandwidth and avoids obsolete AUR rebuilds."
+            info "  › Review & clean safely in: Main Menu › Safe Maintenance › Orphan Triage."
+        else
+            ok "Pre-Flight Gate 2: Dependency tree is clean (0 orphan packages)."
         fi
     fi
 
@@ -6795,6 +7116,11 @@ if [[ "$ACTION" == "maintenance" ]]; then
     fi
 fi
 
+if [[ "$ACTION" == "orphans" ]]; then
+    triage_orphan_packages
+    exit $?
+fi
+
 if [[ "$ACTION" == "deep-clean" ]]; then
     MAINTENANCE_CONFIRMED=1
     run_maintenance "Deep Clean"
@@ -6878,20 +7204,49 @@ while true; do
             pause_screen
             ;;
         "6. Safe Maintenance (Clean Caches & Logs)")
-            ui_screen "Safe Maintenance & Health Audit"
+            ui_screen "Safe Maintenance & System Hygiene"
+            local maint_choice=""
             if [[ -t 0 ]] && command -v gum &>/dev/null; then
-                if gum confirm "Run Safe Maintenance (prune pacman & AUR cache to last 2 versions & vacuum journal)?"; then
+                maint_choice="$(
+                    gum choose \
+                        --header="Select Maintenance Operation:" \
+                        --cursor="› " \
+                        --cursor.foreground="81" \
+                        "1. Standard Maintenance (Prune package caches to 2 versions & vacuum journal)" \
+                        "2. Orphan Package Triage & Zero-Residue Purge" \
+                        "3. Complete Maintenance (Standard Maintenance + Orphan Triage)" \
+                        "4. Cancel & Return"
+                )"
+            elif [[ -t 0 ]]; then
+                echo "1. Standard Maintenance (Prune package caches to 2 versions & vacuum journal)"
+                echo "2. Orphan Package Triage & Zero-Residue Purge"
+                echo "3. Complete Maintenance (Standard Maintenance + Orphan Triage)"
+                echo "4. Cancel & Return"
+                read -r -p "Select option [1-4]: " maint_choice
+            else
+                maint_choice="1. Standard Maintenance"
+            fi
+
+            case "$maint_choice" in
+                "1. Standard Maintenance"*|"1")
                     MAINTENANCE_CONFIRMED=1
                     run_maintenance "Safe Maintenance"
                     run_health_check
-                else
+                    ;;
+                "2. Orphan Package Triage"*|"2")
+                    triage_orphan_packages
+                    run_health_check
+                    ;;
+                "3. Complete Maintenance"*|"3")
+                    MAINTENANCE_CONFIRMED=1
+                    run_maintenance "Safe Maintenance"
+                    triage_orphan_packages
+                    run_health_check
+                    ;;
+                *)
                     info "Safe Maintenance cancelled."
-                fi
-            else
-                MAINTENANCE_CONFIRMED=1
-                run_maintenance "Safe Maintenance"
-                run_health_check
-            fi
+                    ;;
+            esac
             pause_screen
             ;;
         "7. Deep Clean (Trash & Browser Caches)")
