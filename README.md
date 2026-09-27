@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.21](https://img.shields.io/badge/Version-2.21-orange.svg)](CHANGELOG.md)
+[![Version: 2.22](https://img.shields.io/badge/Version-2.22-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -85,7 +85,7 @@ sys-health AI Session:
   * Pacman lockfile inspection with active process holder identification via `fuser`.
   * Ephemeral-filtered package integrity checking (`pacman -Qk`).
   * Unmerged configuration file detection (`.pacnew`).
-  * Mirror sync freshness tracking (`core.db`).
+  * **Dynamic Mirrorlist Health & Latency Probe:** Interrogates all active `/etc/pacman.d/*mirrorlist*` topologies. Measures real-time TCP/TTFB latency to primary repositories (`curl`), detects dead or hanging primary mirrors (preventing package download socket timeouts), warns on cross-continental high latency (> 400ms), and audits mirrorlist redundancy and age.
   * **Smart Arch News Correlator:** Proactively scrapes upstream Arch News with HTTP 429 rate-limiting resilience and local caching, correlating manual intervention advisories against locally installed packages (`pacman -Qq`) to eliminate false-positive alarm fatigue.
   * Official Arch Security Tracker (`arch-audit`) integration, separating actionable repository fixes from unclosed upstream backlog.
 
@@ -96,7 +96,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   2. *Laptop Battery Gate (Gate 0):* Detects ACPI battery power; refuses upgrades on discharging laptops below 25% battery.
   3. *Substrate & Mount Topology Gate (Gate 1):* Confirms ESP and `/boot` are mounted and writable; enforces safe disk margins (6 GB root, 4 GB pacman cache, 100 MB ESP).
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
-  5. *Network & Mirror Freshness Gate (Gate 3):* Verifies TLS/DNS reachability to official infrastructure and offers 1-click regional mirror ranking (`reflector` / `eos-rankmirrors`) if lists are older than 30 days.
+  5. *Network & Mirror Resilience Gate (Gate 3):* Verifies control-plane TLS/DNS connectivity, probes primary mirror reachability, and triggers smart self-healing ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) if the primary mirror is dead (preventing fatal 3102ms socket timeouts), if the mirrorlist is empty/corrupt, if cross-continental latency exceeds 800ms, or if lists are older than 30 days. Employs 100% dynamic universalism (zero hardcoded countries or regional bias) and atomic staging (`mktemp` + HTTP verification + `install`).
   6. *Smart Arch News Correlator Gate (Gate 4):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
   7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants (e.g., legacy Maxwell GTX 970 vs modern drivers), kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
@@ -150,6 +150,7 @@ Designed to demystify package maintenance and eliminate the operational hazards 
 * **Strict Shader Cache Blacklist:** Hardcoded blacklist permanently safeguarding graphics shader caches (`~/.nv`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, Steam shader pre-caches, DXVK caches), eliminating post-cleanup in-game stutter.
 * **Offline Rollback Lifeline:** Prunes package cache retaining the last 2 versions of installed packages, while retaining **at least 1 version of uninstalled packages** (`paccache -r -u -k 1`), preserving emergency offline rollback capabilities.
 * **FreeDesktop Trash & Journal Clean:** Native `gio trash --empty` and safe systemd journal vacuuming (> 30 days).
+* **On-Demand Regional Mirror Ranking:** Integrates 1-click regional mirror benchmarking and atomic ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) directly into the Safe Maintenance menu, allowing on-demand mirrorlist optimization without running a full upgrade.
 
 ---
 
@@ -231,6 +232,7 @@ All non-interactive flags output plain text or structured JSON, perfect for scri
 | `sys-health --report` (or `-r`) | Output full plain-text audit report log. |
 | `sys-health --maintenance` (or `-m`)| Run safe maintenance non-interactively, then execute health audit. |
 | `sys-health --orphans` (or `-o`)| Run interactive 3-tier orphan package triage & zero-residue purger. |
+| `sys-health --mirrors` | Benchmark, rank, and refresh fastest regional repository mirrors. |
 | `sys-health --deep-clean` (or `-d`)| Run safe deep cleaning non-interactively, then execute health audit. |
 
 ---
@@ -265,3 +267,4 @@ SKIP_INTEGRITY=0
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
