@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.25] - 2026-09-27
 
+### Fixed & Hardened (SRE Architectural Audit Priority 4 Remediation)
+- **Universal Multi-Vendor Telemetry in Dynamic Flight Recorder (`run_dynamic_sample`)**:
+  - Added native kernel sysfs fallback for AMD Radeon GPUs via `/sys/class/drm/card*/device/` (`gpu_busy_percent`, `mem_info_vram_used`, `mem_info_vram_total`, and GPU hwmon temperature), extending live sampling beyond NVIDIA rigs to AMD community users.
+  - Implemented background ping process and temporary file lifecycle cleanup traps (`RETURN`, `INT`, `TERM`), preventing zombie ping processes and `/tmp` residues upon cancellation.
+  - Hardened ping packet loss calculation (`awk -F'%' '{sub(/.*[ ,]/, "", $1); print $1+0}'`), resolving edge-case string misparsing that previously grabbed transmitted packet counts instead of actual loss.
+  - Metric-aware gateway discovery with P2P VPN tunnel fallback (`1.1.1.1`) and multi-stage sysfs CPU temperature fallback (`coretemp`, `k10temp`, `zenpower`).
+
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 3 Remediation)
+- **Multi-Route Metric Sorting & P2P Tunnel Tolerance (`check_network`)**:
+  - Replaced crude single-line default route extraction with metric-aware evaluation (`awk ... | sort -n -k1,1`), accurately selecting the active primary route on multi-interface systems (e.g. wired Ethernet prioritized over Wi-Fi).
+  - Added native support for point-to-point VPN and tunnel interfaces (`default dev wg0` / WireGuard, Tailscale, OpenVPN p2p) where no gateway IP exists, validating tunnel health via upstream DNS reachability instead of false route failures.
+  - Contextualized NetworkManager metered connection detection: flags unintended throttling on wired Ethernet connections (`WARN ⚠`) while treating metered Wi-Fi or LTE modems as informative (`INFO ℹ`).
+- **Universal Multi-User & Multi-Client Steam Detection (`detect_gaming_system` & `check_gaming`)**:
+  - Dynamically resolves user home directory under `SUDO_USER` when run with elevated privileges, preventing false non-gaming classifications during administrative audits.
+  - Expanded custom Proton runner discovery across native Steam (`compatibilitytools.d`), Flatpak Steam (`~/.var/app/com.valvesoftware.Steam/...`), and Heroic Games Launcher (`~/.config/heroic/tools/proton`).
+  - Added robust kernel version fallback (`uname -r >= 5.16`) for `futex_waitv` (fsync) when Python3 is unavailable or restricted.
+  - Added fallback GPU name resolution from `vga_info` when `vulkaninfo` is not installed.
+
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 2B Remediation)
+- **Universal Locale & Grammar Independence in Package Integrity (`check_package_integrity`)**:
+  - Enforced `LC_ALL=C` across all `pacman -Qk` subshell queries, preventing localized output (e.g. Polish `brakujący plik`, German `fehlende Datei`) from blinding the audit engine on non-English desktop installations.
+  - Corrected grammatical regex to match singular `1 missing file` as well as plural `N missing files` (`/[1-9][0-9]* missing file/`).
+  - Added non-root privilege boundary verification: avoids falsely reporting packages as corrupt when unprivileged users audit files located inside `0700 root:root` directories (`/etc/sudoers.d`, `/var/named`).
+- **Snapshot & Nested Container Mount Filtering in Storage Audit (`check_root_space`)**:
+  - Filtered out Btrfs snapshot trees (`/.snapshots`) and container engine storage (`/var/lib/docker`, `/var/lib/containers`) from active mount audits, eliminating performance stalls and false alerts on Snapper/Timeshift setups.
+  - Sanitized percentage extraction with numeric awk accumulators (`awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}'`), preventing arithmetic syntax errors.
+- **Deep Configuration .pacnew Scanning (`_find_pacnew_files`)**:
+  - Expanded search depth in `/etc` from 4 to 7, guaranteeing detection of nested system configurations (e.g. `/etc/systemd/system/*.service.d/*.pacnew`, `/etc/polkit-1/rules.d/`).
+- **Comprehensive Process Lock Detection (`check_pacman_lock`)**:
+  - Expanded process detection regex to include `pikaur`, `makepkg`, and `eos-update`. Added `lsof` fallback when `fuser` (`psmisc`) is not installed.
+
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 2A Remediation)
+- **Immediate Root Privilege Guardrail in Standalone Hub (`run_software_updates`)**:
+  - Enforced an upfront non-root execution barrier (`EUID == 0`) at the very top of `run_software_updates()`, completely blocking discovery probes (`yay -Qua`, `uv self update`, `goose update`) from ever executing under `sudo` or as root.
+  - Prevents root-owned cache contamination in `/root/.cache` and eliminates user home directory permission hijacking.
+- **Dynamic Pacman DBPath Standardization (`package_manager_busy` & Software Hub)**:
+  - Replaced legacy static `/var/lib/pacman/db.lck` checks with dynamic runtime resolution via `pacman-conf DBPath`.
+  - Expanded `package_manager_busy()` process detection to include `pikaur`, `pamac-daemon`, `packagekitd`, and `eos-update`.
+- **Accurate Runtime Shim & Standalone Classifier (`check_binary_ownership`)**:
+  - Refined regex pattern matching to target specific shim directories (`/shims/`, `/\.pyenv/`, `/\.asdf/`, `/\.nvm/`, `/mise/shims/`, `/\.rustup/toolchains/`), ensuring user-compiled tools installed via `cargo install` in `~/.cargo/bin` are accurately recognized as standalone binaries rather than shims.
+- **Multi-Path Symlink Writability Assurance (`can_self_update_binary`)**:
+  - Validates write permissions for both the canonical target file/directory and the symlink's parent directory (`link_dir`), ensuring in-place atomic self-updates succeed across complex symlink setups.
+- **Graceful Local DB Fallback for Partial Upgrade Risk (`check_partial_upgrade_risk`)**:
+  - Added fallback evaluation using `pacman -Qu` when `checkupdates` (`pacman-contrib`) is unavailable, enabling immediate partial upgrade risk detection even without optional contrib utilities.
+
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 1 Remediation)
+- **Universal Multi-Kernel & UKI Resolution Hardening (`_resolve_kernel_and_initramfs`)**:
+  - Implemented boundary-safe regex matching (`^(.*[-_])?${pkgb}([-_.][0-9].*)?$`) for Unified Kernel Images (`.efi`), eliminating substring collisions where `arch-linux-lts.efi` or `linux-zen.efi` falsely matched plain `linux`.
+  - Added multi-candidate path scanning across `/EFI/Linux`, `/EFI/BOOT`, and boot roots.
+  - Type #1 BLS: verified `linux` entry relative targets against all discovered candidate boot mountpoints rather than exclusively `${bdir}`.
+  - Eliminated broad `/boot/vmlinuz` and `/efi/vmlinuz` fallbacks when multiple kernels are detected in `/usr/lib/modules/*/pkgbase`, preventing missing custom kernels from silently reporting false PASS.
+- **Boot Mount Discovery & /etc/fstab Comment Filtering (`detect_boot_directories`)**:
+  - Hardened `/etc/fstab` parsing to strictly exclude commented lines (`!/^[[:space:]]*#/`), preventing deactivated or historical mount targets from contaminating boot scans.
+- **ESP Space Margins & Read-Only Protection (`check_efi_mount`)**:
+  - Added direct read-only mount detection (`findmnt -o OPTIONS -T "$efi_mnt"`), logging `FAIL ✖ (mounted READ-ONLY!)` before upgrades attempt writes.
+  - Harmonized space threshold grading with SRE guardrails: `< 50MB` triggers `FAIL ✖` (prevents aborted initramfs generation mid-upgrade) and `< 100MB` emits `WARN ⚠`.
+- **Pre-Flight Power & USB-PD Universalism (`check_laptop_battery_preflight` - Gate 0)**:
+  - Upgraded AC mains detection to dynamically accept modern USB-C Power Delivery and external power supply bricks (`type != "Battery"` with `online == 1`).
+- **Arch News Network Resilience & Cache Hardening (`scan_arch_news_feed` - Gate 4)**:
+  - Decoupled offline/unreachable states from the zero-manual-intervention pass (`IGNORED:0`). When upstream feeds are unreachable or timeout, emits explicit `UNREACHABLE` status handled as neutral `INFO ℹ` instead of falsely reporting 0 upstream advisories.
+- **Rig-Bias Elimination in Hardware Upgrade Gates (`run_guarded_upgrade` - Gate 5)**:
+  - Removed strict hardcoded requirement for `nvidia-580xx-dkms` on systems with Maxwell GPUs. If a community user runs modern open drivers (`nouveau` or NVK) or alternative branches on a Maxwell card, the gate no longer blocks upgrades, while still protecting proprietary 580xx users from black screens caused by official repo `nvidia` meta-package overwrites.
+  - Expanded `core_regex` package classifier to include modern audio servers (`pipewire`, `wireplumber`), alternative initramfs generators (`booster`), and modern bootloaders (`systemd-boot`, `limine`, `refind`).
+- **Temporary File Lifecycle & Trap Cleanup (`run_guarded_upgrade`)**:
+  - Registered `tmp_repo` and `tmp_aur` in the function's `RETURN` cleanup trap (`_cleanup_guarded_upgrade`), ensuring zero `/tmp` orphan residues even upon Ctrl+C interruption.
+
 ### Fixed & Hardened (Luna SRE Architectural Audit 2.20 Remediation)
 - **Elimination of Hybrid GPU Model-Driver Mismatch (`check_gpu` & `check_gpu_errors`)**:
   - Replaced crude single-line extraction with discrete PCI device block scanning (`lspci -k`).
