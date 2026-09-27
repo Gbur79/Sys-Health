@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.22"
+VERSION="2.23"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -445,7 +445,7 @@ add_row() {
 
     if [[ -z "$sec" ]]; then
         case "$comp" in
-            "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending"|"Previous session shutdown")
+            "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending"|"Previous session shutdown"|"Bootloader"*)
                 sec="BOOT"
                 ;;
             "GPU runtime"*|"GPU errors & lockups"|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer"|"Power & Battery"*)
@@ -1827,6 +1827,113 @@ triage_orphan_packages() {
 }
 
 # ==============================================================================
+# Dynamic Mirror Topology Discovery & Primary Probe Engine
+# 100% Portable & Agnostic across all Arch-based distributions
+# ==============================================================================
+
+discover_active_mirrorlists() {
+    local -a files=()
+    local seen=" "
+
+    # 1. Parse active Include directives from /etc/pacman.conf
+    if [[ -f /etc/pacman.conf ]]; then
+        local inc_f
+        while IFS= read -r inc_f; do
+            [[ -f "$inc_f" ]] || continue
+            if [[ "$seen" != *" $inc_f "* ]]; then
+                files+=("$inc_f")
+                seen+="$inc_f "
+            fi
+        done < <(grep -E '^[[:space:]]*Include[[:space:]]*=' /etc/pacman.conf 2>/dev/null | awk '{print $3}' || true)
+    fi
+
+    # 2. Discover any additional mirrorlists in /etc/pacman.d
+    if [[ -d /etc/pacman.d ]]; then
+        local d_f
+        while IFS= read -r d_f; do
+            [[ -f "$d_f" ]] || continue
+            if [[ "$seen" != *" $d_f "* ]]; then
+                files+=("$d_f")
+                seen+="$d_f "
+            fi
+        done < <(find /etc/pacman.d -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
+    fi
+
+    # 3. Sort: prioritize standard Arch mirrorlist (/etc/pacman.d/mirrorlist) first if present
+    local -a sorted=()
+    for f in "${files[@]}"; do
+        if [[ "$f" == "/etc/pacman.d/mirrorlist" ]]; then
+            sorted+=("$f")
+            break
+        fi
+    done
+    for f in "${files[@]}"; do
+        [[ "$f" == "/etc/pacman.d/mirrorlist" ]] && continue
+        sorted+=("$f")
+    done
+
+    printf '%s\n' "${sorted[@]}"
+}
+
+probe_primary_mirror() {
+    # Returns: "PRIMARY_URL|HTTP_CODE|TIME_MS|REPO_NAME"
+    local target_repo="core"
+    local primary_url=""
+
+    if command -v pacman-conf &>/dev/null; then
+        local -a repos=()
+        mapfile -t repos < <(pacman-conf --repo-list 2>/dev/null || true)
+        if [[ " ${repos[*]} " =~ [[:space:]]core[[:space:]] ]]; then
+            target_repo="core"
+        elif (( ${#repos[@]} > 0 )); then
+            target_repo="${repos[0]}"
+        fi
+        primary_url="$(pacman-conf -r "$target_repo" Server 2>/dev/null | head -n 1 || true)"
+    fi
+
+    # Fallback to scanning discovered mirrorlists if pacman-conf returned nothing
+    if [[ -z "$primary_url" ]]; then
+        local mfile=""
+        while IFS= read -r mfile; do
+            [[ -n "$mfile" && -f "$mfile" ]] || continue
+            if grep -qE '^[[:space:]]*Server[[:space:]]*=' "$mfile" 2>/dev/null; then
+                primary_url="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+                local arch_name
+                arch_name="$(uname -m)"
+                primary_url="${primary_url//\$repo/$target_repo}"
+                primary_url="${primary_url//\$arch/$arch_name}"
+                break
+            fi
+        done < <(discover_active_mirrorlists)
+    fi
+
+    if [[ -z "$primary_url" ]]; then
+        echo "||0|$target_repo"
+        return 1
+    fi
+
+    if ! command -v curl &>/dev/null; then
+        echo "$primary_url|200|0|$target_repo"
+        return 0
+    fi
+
+    local probe_res http_code time_conn time_ms=0
+    probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_url%/}/${target_repo}.db" 2>/dev/null || echo "000|0")"
+    http_code="${probe_res%%|*}"
+    time_conn="${probe_res##*|}"
+
+    if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+        local s_sec="${BASH_REMATCH[1]}"
+        local s_frac="${BASH_REMATCH[2]}"
+        s_frac="${s_frac#"${s_frac%%[!0]*}"}"
+        [[ -z "$s_frac" ]] && s_frac=0
+        time_ms=$(( s_sec * 1000 + s_frac ))
+    fi
+
+    echo "$primary_url|$http_code|$time_ms|$target_repo"
+}
+
+# ==============================================================================
 # Dynamic Regional Mirror Benchmark & Staged Ranking Engine
 # Universal, Agnostic & Atomic (Reflector / Rate-Mirrors / EOS-Rankmirrors)
 # ==============================================================================
@@ -1963,7 +2070,35 @@ refresh_and_rank_mirrors() {
         fi
     fi
 
-    if $arch_updated || $eos_updated; then
+    # 3. CachyOS Mirrors (if present on system)
+    local cachy_mfile="/etc/pacman.d/cachyos-mirrorlist"
+    local cachy_updated=false
+    if [[ -f "$cachy_mfile" ]] && command -v cachyos-rate-mirrors &>/dev/null; then
+        sudo cp -a "$cachy_mfile" "${cachy_mfile}.bak" 2>/dev/null || true
+        if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+            if gum spin --title "Ranking CachyOS mirrors with cachyos-rate-mirrors..." -- sudo cachyos-rate-mirrors; then
+                ok "CachyOS mirrorlist refreshed."
+                log "MAINTENANCE mirrorlist_refresh=success target=cachyos"
+                cachy_updated=true
+            else
+                sudo cp -a "${cachy_mfile}.bak" "$cachy_mfile" 2>/dev/null || true
+                warn "cachyos-rate-mirrors failed; restored previous CachyOS mirrorlist."
+                log "MAINTENANCE mirrorlist_refresh=failed target=cachyos"
+            fi
+        else
+            if sudo cachyos-rate-mirrors 2>/dev/null; then
+                ok "CachyOS mirrorlist refreshed."
+                log "MAINTENANCE mirrorlist_refresh=success target=cachyos"
+                cachy_updated=true
+            else
+                sudo cp -a "${cachy_mfile}.bak" "$cachy_mfile" 2>/dev/null || true
+                warn "cachyos-rate-mirrors failed; restored previous CachyOS mirrorlist."
+                log "MAINTENANCE mirrorlist_refresh=failed target=cachyos"
+            fi
+        fi
+    fi
+
+    if $arch_updated || $eos_updated || $cachy_updated; then
         echo ""
         ok "Mirrorlist ranking & optimization completed successfully."
         echo ""
@@ -2320,6 +2455,417 @@ check_previous_boot() {
         add_row "Previous session shutdown" "PASS ✔ (clean shutdown)"
         log "HEALTH previous_boot=PASS"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Kernel <-> Bootloader Synchronization Engine (Universal Arch Ecosystem)
+# ---------------------------------------------------------------------------
+
+boot_sync_collect_paths() {
+    local kind="$1"
+    local raw root path
+
+    {
+        findmnt -rn -o TARGET 2>/dev/null || :
+        findmnt --fstab -rn -o TARGET 2>/dev/null || :
+    } | sort -u |
+        while IFS= read -r raw; do
+            [[ -n "$raw" ]] || continue
+            printf -v root '%b' "$raw"
+            [[ "$root" == /* && -d "$root" ]] || continue
+            [[ "$root" == "/" ]] && root=""
+
+            case "$kind" in
+                grub)
+                    for path in \
+                        "$root/grub/grub.cfg" \
+                        "$root/boot/grub/grub.cfg" \
+                        "$root/grub2/grub.cfg" \
+                        "$root/boot/grub2/grub.cfg" \
+                        "$root/EFI/grub/grub.cfg" \
+                        "$root/efi/grub/grub.cfg" \
+                        "$root/grub.cfg"; do
+                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+                loader)
+                    for path in \
+                        "$root/loader/entries" \
+                        "$root/boot/loader/entries" \
+                        "$root/efi/loader/entries"; do
+                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+                uki)
+                    for path in \
+                        "$root/EFI/Linux" \
+                        "$root/efi/EFI/Linux" \
+                        "$root/boot/EFI/Linux"; do
+                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+                limine)
+                    for path in \
+                        "$root/limine.conf" \
+                        "$root/limine.cfg" \
+                        "$root/boot/limine.conf" \
+                        "$root/boot/limine.cfg" \
+                        "$root/EFI/limine/limine.conf" \
+                        "$root/EFI/limine/limine.cfg"; do
+                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+                refind)
+                    for path in \
+                        "$root/refind_linux.conf" \
+                        "$root/boot/refind_linux.conf" \
+                        "$root/EFI/refind/refind_linux.conf" \
+                        "$root/efi/EFI/refind/refind_linux.conf"; do
+                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+                refind-dir)
+                    for path in \
+                        "$root/EFI/refind" \
+                        "$root/efi/EFI/refind" \
+                        "$root/boot/EFI/refind"; do
+                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                    done
+                    ;;
+            esac
+        done | sort -u
+}
+
+boot_sync_cat() {
+    local path="$1"
+
+    if [[ -r "$path" ]] || (( EUID == 0 )); then
+        cat -- "$path" 2>/dev/null
+        return 0
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -n cat -- "$path" 2>/dev/null
+        return
+    fi
+
+    return 1
+}
+
+boot_sync_kernel_bases() {
+    local pkgbase_file base
+    for pkgbase_file in /usr/lib/modules/*/pkgbase; do
+        [[ -r "$pkgbase_file" ]] || continue
+        IFS= read -r base < "$pkgbase_file" || continue
+        base="${base//[[:space:]]/}"
+        [[ "$base" =~ ^[[:alnum:]_.+-]+$ ]] || continue
+        echo "$base"
+    done | sort -u
+}
+
+boot_sync_config_has_kernel() {
+    local content="$1"
+    local base="$2"
+    local pat="(vmlinuz-|initramfs-|initrd-|Linux[[:space:]]+)${base}([[:space:]/'\".,)]|$)"
+    grep -qiE "$pat" <<< "$content"
+}
+
+boot_sync_filename_has_kernel() {
+    local filename="$1"
+    local base="$2"
+    local pat="(^|[-_.])${base}([-_.]|$)"
+    grep -qiE "$pat" <<< "$filename"
+}
+
+boot_sync_systemd_boot_active() {
+    if command -v bootctl >/dev/null 2>&1; then
+        local status
+        status=$(bootctl --no-pager status 2>/dev/null || :)
+        if grep -Eiq 'systemd-boot|Boot Loader:.*systemd' <<< "$status"; then
+            return 0
+        fi
+    fi
+
+    compgen -G '/sys/firmware/efi/efivars/LoaderInfo-*' >/dev/null 2>&1 && \
+    grep -Eiq 'systemd-boot' /sys/firmware/efi/efivars/LoaderInfo-* 2>/dev/null
+}
+
+boot_sync_report() {
+    local engine="$1"
+    local result="$2"
+    local detail="$3"
+    local emit_row="${4:-1}"
+
+    log "HEALTH bootloader_sync=${result} engine=${engine} detail='${detail}'"
+
+    if (( emit_row )); then
+        case "$result" in
+            PASS)
+                add_row "Bootloader sync" "PASS ✔ ($engine: $detail)" "BOOT"
+                ;;
+            WARN)
+                add_row "Bootloader sync" "WARN ⚠ ($engine: $detail)" "BOOT"
+                ;;
+            INFO)
+                add_row "Bootloader sync" "INFO ℹ ($engine: $detail)" "BOOT"
+                ((INFO_COUNT++)) || :
+                ;;
+            FAIL)
+                add_row "Bootloader sync" "FAIL ✖ ($engine: $detail)" "BOOT"
+                ((ERRORS++)) || :
+                ;;
+        esac
+    fi
+
+    [[ "$result" != "WARN" && "$result" != "FAIL" ]]
+}
+
+_boot_sync_audit() {
+    local emit_row="${1:-1}"
+    local engine=""
+    local content=""
+    local bootctl_list=""
+    local missing_csv=""
+    local readable=0
+    local systemd_active=0
+    local family_count=0
+    local has_refind=0
+    local kernel=""
+    local file=""
+    local found=0
+
+    local -a kernels=()
+    local -a grub_configs=()
+    local -a loader_dirs=()
+    local -a uki_dirs=()
+    local -a limine_configs=()
+    local -a refind_configs=()
+    local -a refind_dirs=()
+    local -a loader_files=()
+    local -a uki_files=()
+    local -a missing=()
+
+    mapfile -t kernels < <(boot_sync_kernel_bases)
+
+    if (( ${#kernels[@]} == 0 )); then
+        boot_sync_report "unknown" "INFO" "no installed kernel pkgbase discovered" "$emit_row"
+        return 0
+    fi
+
+    mapfile -t grub_configs < <(boot_sync_collect_paths grub)
+    mapfile -t loader_dirs < <(boot_sync_collect_paths loader)
+    mapfile -t uki_dirs < <(boot_sync_collect_paths uki)
+    mapfile -t limine_configs < <(boot_sync_collect_paths limine)
+    mapfile -t refind_configs < <(boot_sync_collect_paths refind)
+    mapfile -t refind_dirs < <(boot_sync_collect_paths refind-dir)
+
+    for dir in "${loader_dirs[@]}"; do
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && loader_files+=("$f")
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.conf" 2>/dev/null)
+    done
+
+    for dir in "${uki_dirs[@]}"; do
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && uki_files+=("$f")
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.efi" 2>/dev/null)
+    done
+
+    if boot_sync_systemd_boot_active; then
+        systemd_active=1
+    fi
+
+    if (( systemd_active )); then
+        engine="systemd-boot"
+    else
+        (( ${#grub_configs[@]} > 0 )) && ((family_count++))
+        (( ${#limine_configs[@]} > 0 )) && ((family_count++))
+        if (( ${#refind_configs[@]} > 0 || ${#refind_dirs[@]} > 0 )); then
+            has_refind=1
+            ((family_count++))
+        fi
+
+        if (( family_count > 1 )); then
+            local active_bl
+            active_bl="$(detect_active_bootloader 2>/dev/null || echo "ambiguous")"
+            if [[ "$active_bl" =~ ^(grub|limine|refind|systemd-boot|uki)$ ]]; then
+                engine="$active_bl"
+            else
+                boot_sync_report "ambiguous" "INFO" "multiple bootloader layouts detected; active loader not safely identifiable" "$emit_row"
+                return 0
+            fi
+        elif (( ${#grub_configs[@]} > 0 )); then
+            engine="grub"
+        elif (( ${#limine_configs[@]} > 0 )); then
+            engine="limine"
+        elif (( has_refind )); then
+            engine="refind"
+        elif (( ${#uki_files[@]} > 0 )); then
+            engine="uki"
+        else
+            boot_sync_report "unknown" "INFO" "no supported bootloader layout discovered" "$emit_row"
+            return 0
+        fi
+    fi
+
+    case "$engine" in
+        grub)
+            for file in "${grub_configs[@]}"; do
+                if content=$(boot_sync_cat "$file"); then
+                    readable=1
+                    break
+                fi
+            done
+
+            if (( ! readable )); then
+                boot_sync_report "grub" "INFO" "grub.cfg permissions 0600; run with sudo to audit boot entries" "$emit_row"
+                return 0
+            fi
+
+            for kernel in "${kernels[@]}"; do
+                found=0
+                for file in "${grub_configs[@]}"; do
+                    if content=$(boot_sync_cat "$file") && boot_sync_config_has_kernel "$content" "$kernel"; then
+                        found=1
+                        break
+                    fi
+                done
+                (( found )) || missing+=("$kernel")
+            done
+            ;;
+
+        systemd-boot)
+            bootctl_list=""
+            if command -v bootctl >/dev/null 2>&1; then
+                bootctl_list=$(bootctl --no-pager list 2>/dev/null || :)
+            fi
+
+            for kernel in "${kernels[@]}"; do
+                found=0
+
+                for file in "${loader_files[@]}"; do
+                    if content=$(boot_sync_cat "$file"); then
+                        readable=1
+                        if boot_sync_config_has_kernel "$content" "$kernel"; then
+                            found=1
+                            break
+                        fi
+                    fi
+                done
+
+                if (( ! found )); then
+                    for file in "${uki_files[@]}"; do
+                        if boot_sync_filename_has_kernel "$(basename -- "$file")" "$kernel"; then
+                            found=1
+                            break
+                        fi
+                    done
+                fi
+
+                if (( ! found )) && [[ -n "$bootctl_list" ]] && boot_sync_config_has_kernel "$bootctl_list" "$kernel"; then
+                    found=1
+                fi
+
+                (( found )) || missing+=("$kernel")
+            done
+
+            if (( ! readable )) && [[ -z "$bootctl_list" ]] && (( ${#uki_files[@]} == 0 )); then
+                boot_sync_report "systemd-boot" "INFO" "loader entries are not readable; run with sudo to audit boot entries" "$emit_row"
+                return 0
+            fi
+            ;;
+
+        limine)
+            for kernel in "${kernels[@]}"; do
+                found=0
+                for file in "${limine_configs[@]}"; do
+                    if content=$(boot_sync_cat "$file"); then
+                        readable=1
+                        if boot_sync_config_has_kernel "$content" "$kernel"; then
+                            found=1
+                            break
+                        fi
+                    fi
+                done
+                (( found )) || missing+=("$kernel")
+            done
+
+            if (( ! readable )); then
+                boot_sync_report "limine" "INFO" "limine configuration not readable; run with sudo to audit entries" "$emit_row"
+                return 0
+            fi
+            ;;
+
+        refind)
+            if (( ${#refind_configs[@]} == 0 )); then
+                boot_sync_report "refind" "INFO" "rEFInd auto-discovery active; static per-kernel audit unavailable" "$emit_row"
+                return 0
+            fi
+
+            for kernel in "${kernels[@]}"; do
+                found=0
+                for file in "${refind_configs[@]}"; do
+                    if content=$(boot_sync_cat "$file"); then
+                        readable=1
+                        if boot_sync_config_has_kernel "$content" "$kernel"; then
+                            found=1
+                            break
+                        fi
+                    fi
+                done
+                (( found )) || missing+=("$kernel")
+            done
+
+            if (( ! readable )); then
+                boot_sync_report "refind" "INFO" "refind_linux.conf not readable; auto-discovery remains active" "$emit_row"
+                return 0
+            fi
+
+            if (( ${#missing[@]} > 0 )); then
+                local old_ifs="$IFS"
+                IFS=', '
+                missing_csv="${missing[*]}"
+                IFS="$old_ifs"
+                boot_sync_report "refind" "INFO" "static config misses: $missing_csv (rEFInd auto-discovery active)" "$emit_row"
+                return 0
+            fi
+            ;;
+
+        uki)
+            for kernel in "${kernels[@]}"; do
+                found=0
+                for file in "${uki_files[@]}"; do
+                    if boot_sync_filename_has_kernel "$(basename -- "$file")" "$kernel"; then
+                        found=1
+                        break
+                    fi
+                done
+                (( found )) || missing+=("$kernel")
+            done
+            ;;
+    esac
+
+    if (( ${#missing[@]} > 0 )); then
+        local old_ifs="$IFS"
+        IFS=', '
+        missing_csv="${missing[*]}"
+        IFS="$old_ifs"
+
+        ((WARNINGS++)) || :
+        local hint_cmd="run grub-mkconfig / update loader"
+        [[ "$engine" == "grub" ]] && hint_cmd="run sudo grub-mkconfig -o /boot/grub/grub.cfg"
+        [[ "$engine" == "systemd-boot" ]] && hint_cmd="run sudo reinstall-kernels or inspect /boot/loader/entries"
+
+        boot_sync_report "$engine" "WARN" "missing entries: $missing_csv ($hint_cmd)" "$emit_row"
+        return 1
+    fi
+
+    boot_sync_report "$engine" "PASS" "all installed kernels configured" "$emit_row"
+    return 0
+}
+
+check_bootloader_sync() {
+    _boot_sync_audit 1
 }
 
 check_gpu() {
@@ -3263,66 +3809,38 @@ check_mirrorlist_age() {
     local now
     now=$(date +%s)
     local -a mirror_files=()
-
-    # Discover all active mirrorlists dynamically (Arch, EndeavourOS, CachyOS, Chaotic, etc.)
-    while IFS= read -r f; do
-        [[ -f "$f" ]] && mirror_files+=("$f")
-    done < <(find /etc/pacman.d -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
+    mapfile -t mirror_files < <(discover_active_mirrorlists)
 
     if (( ${#mirror_files[@]} == 0 )); then
-        add_row "Mirrorlist status" "WARN ⚠ (no mirrorlist found in /etc/pacman.d)" "NET"
+        add_row "Mirrorlist status" "WARN ⚠ (no active mirrorlists configured)" "NET"
         ((WARNINGS++))
-        log "HEALTH mirrorlist_age=WARN missing_all details='no mirrorlist found in /etc/pacman.d'"
+        log "HEALTH mirrorlist_age=WARN missing_all details='no active mirrorlists configured'"
         return
     fi
 
-    # Ensure standard Arch mirrorlist is evaluated first if present
-    local -a sorted_files=()
-    if [[ -f "/etc/pacman.d/mirrorlist" ]]; then
-        sorted_files+=("/etc/pacman.d/mirrorlist")
-    fi
-    for mf in "${mirror_files[@]}"; do
-        [[ "$mf" == "/etc/pacman.d/mirrorlist" ]] && continue
-        sorted_files+=("$mf")
-    done
-
-    # Live Reachability & Latency Probe on Primary Arch Mirror
+    # Live Reachability & Latency Probe on Primary Repository Mirror
     local primary_info="" primary_dead=false primary_slow=false primary_ms=0
-    local arch_name
-    arch_name="$(uname -m)"
+    local probe_raw primary_url http_code rest target_repo
+    probe_raw="$(probe_primary_mirror)" || true
+    primary_url="${probe_raw%%|*}"
+    rest="${probe_raw#*|}"
+    http_code="${rest%%|*}"
+    rest="${rest#*|}"
+    primary_ms="${rest%%|*}"
+    target_repo="${rest#*|}"
 
-    if [[ -f "/etc/pacman.d/mirrorlist" ]] && command -v curl &>/dev/null; then
-        local first_srv
-        first_srv="$(grep -E '^[[:space:]]*Server[[:space:]]*=' /etc/pacman.d/mirrorlist 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
-        if [[ -n "$first_srv" ]]; then
-            first_srv="${first_srv//\$repo/core}"
-            first_srv="${first_srv//\$arch/$arch_name}"
-            local probe_res http_code time_conn
-            probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 2 "${first_srv%/}/core.db" 2>/dev/null || echo "000|0")"
-            http_code="${probe_res%%|*}"
-            time_conn="${probe_res##*|}"
-
-            if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
-                if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
-                    local s_sec="${BASH_REMATCH[1]}"
-                    local s_frac="${BASH_REMATCH[2]}"
-                    s_frac="${s_frac#"${s_frac%%[!0]*}"}"
-                    [[ -z "$s_frac" ]] && s_frac=0
-                    primary_ms=$(( s_sec * 1000 + s_frac ))
-                fi
-                if (( primary_ms > 400 )); then
-                    primary_slow=true
-                    primary_info="${primary_ms}ms high-latency"
-                else
-                    primary_info="${primary_ms}ms"
-                fi
-            else
-                # Check if network is globally alive before flagging primary mirror as dead
-                if curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
-                    primary_dead=true
-                    primary_info="primary DEAD"
-                fi
-            fi
+    if [[ -n "$primary_url" && "$http_code" =~ ^(200|301|302)$ ]]; then
+        if (( primary_ms > 400 )); then
+            primary_slow=true
+            primary_info="${primary_ms}ms high-latency"
+        else
+            primary_info="${primary_ms}ms"
+        fi
+    elif [[ -n "$primary_url" ]]; then
+        # Check if internet control plane is alive before flagging mirror as dead
+        if curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+            primary_dead=true
+            primary_info="primary DEAD"
         fi
     fi
 
@@ -3331,7 +3849,7 @@ check_mirrorlist_age() {
     local low_redundancy=false
     local -a labels=()
 
-    for mf in "${sorted_files[@]}"; do
+    for mf in "${mirror_files[@]}"; do
         local mtime fname days srv_cnt
         fname="$(basename "$mf")"
         fname="${fname%-mirrorlist}"
@@ -3358,8 +3876,10 @@ check_mirrorlist_age() {
 
             local detail_items=()
             detail_items+=("${days}d")
-            if [[ "$fname" == "Arch" && -n "$primary_info" ]]; then
+            # If this is the mirrorlist corresponding to the probed primary repository
+            if [[ -n "$primary_info" && ( "$fname" == "Arch" || "${#mirror_files[@]}" -eq 1 ) ]]; then
                 detail_items+=("$primary_info")
+                primary_info=""
             fi
             detail_items+=("${srv_cnt} srv")
 
@@ -3371,6 +3891,11 @@ check_mirrorlist_age() {
             labels+=("${fname}: ${item_str}")
         fi
     done
+
+    # If primary_info was not attached yet (e.g. non-Arch distro or custom name), attach to first label
+    if [[ -n "$primary_info" && ${#labels[@]} -gt 0 ]]; then
+        labels[0]="${labels[0]%%, *} ($primary_info), ${labels[0]#*, }"
+    fi
 
     local status_label=""
     for l in "${labels[@]}"; do
@@ -3958,6 +4483,12 @@ generate_summary_json() {
             local risk="LOW"
 
             case "$tag" in
+                bootloader_sync)
+                    code="BOOTLOADER_KERNEL_DESYNC"
+                    summary="Installed kernel(s) missing from bootloader menu configuration"
+                    fix="Regenerate bootloader configuration (e.g. sudo grub-mkconfig -o /boot/grub/grub.cfg)"
+                    risk="MEDIUM"
+                    ;;
                 reboot_pending)
                     code="SYS_REBOOT_REQUIRED"
                     summary="Running kernel modules were removed by pacman update"
@@ -4250,6 +4781,7 @@ run_health_check() {
 
     # --- 1. BOOT & CORE OS ---
     check_kernel
+    check_bootloader_sync
     check_initramfs "$(uname -r)"
     check_efi_mount
     check_reboot_pending
@@ -4431,6 +4963,18 @@ reconstruct_tables_from_log() {
                 else
                     AUDIT_TABLE_BOOT+="Reboot pending | WARN ⚠ (reboot required)\n"
                 fi
+                ;;
+            bootloader_sync)
+                local b_engine="" b_detail=""
+                if [[ "$details" =~ engine=([^ ]+) ]]; then
+                    b_engine="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$details" =~ detail=\'([^\']+)\' ]]; then
+                    b_detail="${BASH_REMATCH[1]}"
+                fi
+                local b_disp="all installed kernels configured"
+                [[ -n "$b_detail" ]] && b_disp="$b_detail"
+                AUDIT_TABLE_BOOT+="$(_format_audit_row "Bootloader sync" "$val" "${b_engine:+$b_engine: }$b_disp")\n"
                 ;;
             previous_boot)
                 AUDIT_TABLE_BOOT+="$(_format_audit_row "Previous session shutdown" "$val" "${details:-clean shutdown}")\n"
@@ -6061,111 +6605,15 @@ detect_esp_mountpoint() {
 
 verify_bootloader_post_flight() {
     local bl_type
-    bl_type="$(detect_active_bootloader)"
-    local esp_path
-    esp_path="$(detect_esp_mountpoint)"
-    [[ -z "$esp_path" ]] && esp_path="/efi"
+    bl_type="$(detect_active_bootloader 2>/dev/null || echo "bootloader")"
 
-    case "$bl_type" in
-        systemd-boot)
-            local has_entries=false
-
-            if command -v bootctl &>/dev/null; then
-                if sudo -n bootctl list --no-pager 2>/dev/null | grep -q "title:" || bootctl list --no-pager 2>/dev/null | grep -q "title:"; then
-                    has_entries=true
-                fi
-            fi
-
-            if ! $has_entries; then
-                local e_dir
-                for e_dir in "${esp_path}/loader/entries" /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
-                    if [[ -d "$e_dir" ]] && compgen -G "${e_dir}/*.conf" >/dev/null; then
-                        has_entries=true
-                        break
-                    fi
-                done
-            fi
-
-            if ! $has_entries; then
-                local uki_dir
-                for uki_dir in "${esp_path}/EFI/Linux" /efi/EFI/Linux /boot/EFI/Linux /boot/efi/EFI/Linux; do
-                    if [[ -d "$uki_dir" ]] && compgen -G "${uki_dir}/*.efi" >/dev/null; then
-                        has_entries=true
-                        break
-                    fi
-                done
-            fi
-
-            if $has_entries; then
-                ok "Bootloader ($bl_type) verified: Loader entries / UKIs intact."
-                return 0
-            else
-                fail "Bootloader ($bl_type) error: No boot entries (.conf) or UKIs (.efi) found in ESP!"
-                return 1
-            fi
-            ;;
-
-        grub)
-            local grub_cfg="/boot/grub/grub.cfg"
-            [[ ! -f "$grub_cfg" && -f "/boot/grub2/grub.cfg" ]] && grub_cfg="/boot/grub2/grub.cfg"
-            [[ ! -f "$grub_cfg" && -f "${esp_path}/grub/grub.cfg" ]] && grub_cfg="${esp_path}/grub/grub.cfg"
-
-            if [[ -f "$grub_cfg" && -s "$grub_cfg" ]]; then
-                local menu_ok=false
-                if sudo -n grep -qE '^[[:space:]]*(menuentry|submenu|linux)[[:space:]]' "$grub_cfg" 2>/dev/null; then
-                    menu_ok=true
-                elif grep -qE '^[[:space:]]*(menuentry|submenu|linux)[[:space:]]' "$grub_cfg" 2>/dev/null; then
-                    menu_ok=true
-                elif [[ ! -r "$grub_cfg" ]] && ! sudo -n true 2>/dev/null; then
-                    # Unprivileged user cannot read 0600 grub.cfg without active sudo password prompt
-                    menu_ok=true
-                fi
-
-                if $menu_ok; then
-                    ok "Bootloader ($bl_type) verified: $grub_cfg contains valid boot entries."
-                    return 0
-                else
-                    fail "Bootloader ($bl_type) error: $grub_cfg exists but contains ZERO menuentry definitions!"
-                    return 1
-                fi
-            else
-                fail "Bootloader ($bl_type) error: $grub_cfg missing or empty!"
-                return 1
-            fi
-            ;;
-
-        limine)
-            local l_conf=""
-            for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg "${esp_path}/limine/limine.conf" "${esp_path}/limine.conf" /efi/limine/limine.conf; do
-                if [[ -f "$f" && -s "$f" ]]; then
-                    l_conf="$f"
-                    break
-                fi
-            done
-            if [[ -n "$l_conf" ]]; then
-                ok "Bootloader ($bl_type) verified: $l_conf intact."
-                return 0
-            else
-                fail "Bootloader ($bl_type) error: Limine configuration file missing or empty!"
-                return 1
-            fi
-            ;;
-
-        refind)
-            ok "Bootloader ($bl_type) configuration detected."
-            return 0
-            ;;
-
-        uki)
-            ok "Bootloader (Unified Kernel Image - UKI) detected in ESP."
-            return 0
-            ;;
-
-        *)
-            warn "Bootloader: Unable to determine active bootloader. Manual verification recommended."
-            return 0
-            ;;
-    esac
+    if _boot_sync_audit 0; then
+        ok "Bootloader ($bl_type) verified: All installed kernels synchronized in boot configuration."
+        return 0
+    else
+        fail "Bootloader ($bl_type) desynchronization: Installed kernel(s) missing from boot configuration!"
+        return 1
+    fi
 }
 
 print_bootloader_repair_hint() {
@@ -6615,14 +7063,6 @@ run_guarded_upgrade() {
     # --------------------------------------------------------------------------
     # Gate 3: Network & Repository L7 Reachability & Mirrorlist Integrity
     # --------------------------------------------------------------------------
-    local arch_name
-    arch_name="$(uname -m)"
-    local arch_mfile="/etc/pacman.d/mirrorlist"
-    local eos_mfile="/etc/pacman.d/endeavouros-mirrorlist"
-    local primary_mirror="" mirror_reachable=false mirror_rtt_ms=0 http_code="" time_conn=""
-    local arch_srv_count=0 eos_srv_count=0
-
-    # 1. Verify Internet / DNS control plane reachability first
     local control_plane_reachable=false
     if curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
         control_plane_reachable=true
@@ -6632,62 +7072,64 @@ run_guarded_upgrade() {
         fail "Pre-Flight Gate 3: TLS/DNS reachability to repository infrastructure failed (network appears offline)."
         preflight_passed=false
     else
-        # 2. Extract primary mirror and count active servers
-        if [[ -f "$arch_mfile" ]]; then
-            arch_srv_count="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null || echo 0)"
-            primary_mirror="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
-            primary_mirror="${primary_mirror//\$repo/core}"
-            primary_mirror="${primary_mirror//\$arch/$arch_name}"
-        fi
-        if [[ -f "$eos_mfile" ]]; then
-            eos_srv_count="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$eos_mfile" 2>/dev/null || echo 0)"
-        fi
+        # 1. Dynamically probe primary repository mirror
+        local probe_raw primary_mirror rest http_code mirror_rtt_ms target_repo
+        probe_raw="$(probe_primary_mirror)" || true
+        primary_mirror="${probe_raw%%|*}"
+        rest="${probe_raw#*|}"
+        http_code="${rest%%|*}"
+        rest="${rest#*|}"
+        mirror_rtt_ms="${rest%%|*}"
+        target_repo="${rest#*|}"
 
-        # 3. Test primary mirror reachability & latency
-        if [[ -n "$primary_mirror" && "$arch_srv_count" -gt 0 ]]; then
-            local probe_out
-            probe_out="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_mirror%/}/core.db" 2>/dev/null || echo "000|0")"
-            http_code="${probe_out%%|*}"
-            time_conn="${probe_out##*|}"
-            if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
-                mirror_reachable=true
-                if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
-                    local s_sec="${BASH_REMATCH[1]}"
-                    local s_frac="${BASH_REMATCH[2]}"
-                    s_frac="${s_frac#"${s_frac%%[!0]*}"}"
-                    [[ -z "$s_frac" ]] && s_frac=0
-                    mirror_rtt_ms=$(( s_sec * 1000 + s_frac ))
+        local mirror_reachable=false
+        [[ "$http_code" =~ ^(200|301|302)$ ]] && mirror_reachable=true
+
+        # 2. Dynamically audit all active mirrorlists (Arch, Distro, CachyOS, Chaotic, etc.)
+        local -a mirror_files=()
+        mapfile -t mirror_files < <(discover_active_mirrorlists)
+
+        local max_age=0 empty_count=0 total_active_servers=0
+        local now_ts
+        now_ts="$(date +%s)"
+        local -a stale_advisories=()
+
+        for mf in "${mirror_files[@]}"; do
+            local mtime fname days srv_cnt
+            fname="$(basename "$mf")"
+            srv_cnt="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$mf" 2>/dev/null || echo 0)"
+            (( total_active_servers += srv_cnt ))
+            if (( srv_cnt == 0 )); then
+                ((empty_count++))
+                stale_advisories+=("${fname}: 0 servers")
+            fi
+
+            mtime="$(stat -c %Y "$mf" 2>/dev/null || echo 0)"
+            if (( mtime > 0 )); then
+                days=$(( (now_ts - mtime) / 86400 ))
+                (( days > max_age )) && max_age=$days
+                if (( days > 30 )); then
+                    stale_advisories+=("${fname}: ${days}d")
                 fi
             fi
-        fi
+        done
 
-        # 4. Check mirrorlist file age
-        local arch_age=0 eos_age=0 now_ts
-        now_ts="$(date +%s)"
-        if [[ -f "$arch_mfile" ]]; then
-            local m_mtime
-            m_mtime="$(stat -c %Y "$arch_mfile" 2>/dev/null || echo 0)"
-            (( m_mtime > 0 )) && arch_age=$(( (now_ts - m_mtime) / 86400 )) || arch_age=999
-        fi
-        if [[ -f "$eos_mfile" ]]; then
-            local e_mtime
-            e_mtime="$(stat -c %Y "$eos_mfile" 2>/dev/null || echo 0)"
-            (( e_mtime > 0 )) && eos_age=$(( (now_ts - e_mtime) / 86400 )) || eos_age=999
-        fi
-
-        # 5. Smart Health Trigger: Determine if mirrorlist needs refresh
+        # 3. Smart Health Trigger: Determine if mirrorlist needs refresh
         local needs_mirror_refresh=false
         local refresh_reason=""
 
-        if (( arch_srv_count == 0 )); then
+        if (( ${#mirror_files[@]} == 0 || total_active_servers == 0 )); then
             needs_mirror_refresh=true
-            refresh_reason="Arch Linux mirrorlist is empty (0 active servers)."
+            refresh_reason="No active repository mirrors found in pacman configuration."
         elif ! $mirror_reachable; then
             needs_mirror_refresh=true
-            refresh_reason="Primary mirror is unreachable (HTTP ${http_code:-000} - dead or connection refused)."
-        elif (( arch_age > 30 || eos_age > 30 )); then
+            refresh_reason="Primary mirror ($primary_mirror) is unreachable (HTTP ${http_code:-000} - dead or connection refused)."
+        elif (( empty_count > 0 )); then
             needs_mirror_refresh=true
-            refresh_reason="Local mirrorlists are older than 30 days (Arch: ${arch_age}d, EOS: ${eos_age}d)."
+            refresh_reason="Empty mirrorlist detected: ${stale_advisories[*]}."
+        elif (( max_age > 30 )); then
+            needs_mirror_refresh=true
+            refresh_reason="Local mirrorlists are older than 30 days (${stale_advisories[*]})."
         elif (( mirror_rtt_ms > 800 )); then
             needs_mirror_refresh=true
             refresh_reason="Primary mirror latency is critically high (${mirror_rtt_ms}ms - cross-continental or throttled)."
@@ -6699,31 +7141,20 @@ run_guarded_upgrade() {
                 if gum confirm "Refresh and rank fastest regional mirrors before upgrading?"; then
                     if refresh_and_rank_mirrors 1; then
                         # Re-probe primary mirror after refresh
-                        if [[ -f "$arch_mfile" ]]; then
-                            primary_mirror="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$arch_mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
-                            primary_mirror="${primary_mirror//\$repo/core}"
-                            primary_mirror="${primary_mirror//\$arch/$arch_name}"
-                            local re_probe re_code re_conn
-                            re_probe="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_mirror%/}/core.db" 2>/dev/null || echo "000|0")"
-                            re_code="${re_probe%%|*}"
-                            re_conn="${re_probe##*|}"
-                            if [[ "$re_code" =~ ^(200|301|302)$ ]]; then
-                                mirror_reachable=true
-                                if [[ "$re_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
-                                    local r_sec="${BASH_REMATCH[1]}"
-                                    local r_frac="${BASH_REMATCH[2]}"
-                                    r_frac="${r_frac#"${r_frac%%[!0]*}"}"
-                                    [[ -z "$r_frac" ]] && r_frac=0
-                                    mirror_rtt_ms=$(( r_sec * 1000 + r_frac ))
-                                fi
-                            fi
+                        local re_raw re_code re_ms
+                        re_raw="$(probe_primary_mirror)" || true
+                        re_code="$(cut -d'|' -f2 <<< "$re_raw")"
+                        re_ms="$(cut -d'|' -f3 <<< "$re_raw")"
+                        if [[ "$re_code" =~ ^(200|301|302)$ ]]; then
+                            mirror_reachable=true
+                            mirror_rtt_ms="$re_ms"
                         fi
                         ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified (${mirror_rtt_ms}ms)."
                     else
                         warn "Mirror refresh failed; proceeding with existing configuration."
                     fi
                 else
-                    if ! $mirror_reachable && (( arch_srv_count <= 1 )); then
+                    if ! $mirror_reachable && (( total_active_servers <= 1 )); then
                         fail "Pre-Flight Gate 3: Primary mirror is unreachable and no working fallback servers remain."
                         preflight_passed=false
                     else
