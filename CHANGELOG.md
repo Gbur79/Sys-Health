@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.24] - 2026-09-27
+
+### Fixed & Hardened (Luna SRE Architectural Audit 2.21/2.22 Remediation)
+- **Elimination of Arithmetic Expansion Syntax Trap in Orphan Audit (`check_orphan_packages`)**:
+  - Replaced defective `$(( ... | wc -l ))` construct with isolated standard command output parsing via `mktemp`.
+  - Disentangled genuine 0-orphan states (`exit 1` without stderr) from ALPM DB lock contention or query corruption (`WARN ⚠` upon non-empty stderr).
+  - Maintained 100% table reconstruction fidelity in `reconstruct_tables_from_log()`.
+- **Elimination of Double-Zero Arithmetic Failure Trap (`awk` Server Counting)**:
+  - Eliminated the `grep -c ... || echo 0` pattern across `refresh_and_rank_mirrors`, `check_mirrorlist_age`, and `run_guarded_upgrade` (Pre-Flight Gate 3 & Phase 1).
+  - When `grep -c` matched zero lines, it emitted `0` and returned code 1, causing `echo 0` to append a second zero (`0\n0`), which broke subsequent bash arithmetic evaluation `(( val >= 3 ))`.
+  - Migrated server and update counting to deterministic `awk` accumulators (`END { print count + 0 }`).
+- **Primary Mirror Probe & Zero-Curl False Positive Remediation (`probe_primary_mirror`)**:
+  - Eliminated artificial `HTTP 200` return code when `curl` was missing, ensuring systems without curl report `NA` probe status rather than falsely passing mirror health checks.
+  - Added clean timeout bounds (`--connect-timeout 3 --max-time 4`) and decoupled probe execution from subshell fallback corruption.
+- **Universal Mirrorlist Discovery Hardening (`discover_active_mirrorlists`)**:
+  - Added `PACMAN_CONF` environment variable override support with dynamic directory resolution.
+  - Hardened `Include` parsing with comment stripping and glob expansion.
+  - Implemented deduplication via associative arrays and eliminated empty newline generation on unconfigured systems (preventing phantom array elements in `mapfile`).
+- **Network Resolution & DNS Transport Integrity (`check_dns`)**:
+  - Added regex sanitization for `DNS_TEST_HOST` and `DNS_TEST_SERVER` to prevent argument injection.
+  - Added explicit `INFO ℹ` advisory when a custom server is requested but neither `dig` nor `drill` is installed, preventing misleading fallback claims.
+  - Added `resolvectl` integration for modern systemd-resolved setups.
+  - Updated `getent` fallback to explicitly state `(NSS resolution; DNS transport unverified)`, preventing false assumptions about upstream DNS transport health.
+- **Atomic Orphan Safety & Multi-Cache Purge (`triage_orphan_packages`)**:
+  - Enforced SRE cardinal safety standard: packages with missing or unparseable ALPM metadata are strictly classified as Tier 3 (Core & Toolchain Protected / Manual Review), eliminating accidental auto-purge risks.
+  - Dynamic discovery of all configured `CacheDir` locations from `pacman-conf` during Zero-Residue Cache Purge.
+  - Added privilege awareness (`EUID == 0` direct invocation vs `sudo` unprivileged).
+- **User Session Audit Race Condition & Bus Isolation (`check_failed_services`)**:
+  - Eliminated duplicate `systemctl --user` invocations between detection and logging, ensuring 100% telemetry consistency.
+  - Enforced `--no-pager` across all systemd queries.
+  - Verified D-Bus session bus existence prior to inspection and queried `id -un` instead of relying on mutable `$USER`.
+
 ## [2.23] - 2026-09-27
 
 ### Added & Hardened (Universal Bootloader & Kernel Synchronization Engine)
