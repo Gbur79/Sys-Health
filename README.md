@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.22](https://img.shields.io/badge/Version-2.22-orange.svg)](CHANGELOG.md)
+[![Version: 2.23](https://img.shields.io/badge/Version-2.23-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -26,6 +26,7 @@ Arch Linux and EndeavourOS deliver blistering speed, incredible flexibility, and
 A quick scan of community support forums reveals recurring pain points:
 * **The "Is My System OK?" dilemma:** After an update or an unexpected freeze, users wonder: *Is my system healthy? Did everything compile? Are my services running?* Instead of forcing you to hunt through dozens of terminal commands, `sys-health` runs an automated, read-only 10-second audit that answers that question with unequivocal, traffic-light clarity.
 * **Kernel & EFI mount desynchronization ("Kernel update leads to unbootable system / failure to mount /efi cleanly"):** If your ESP (EFI System Partition) is unmounted or mounted read-only during an update, new kernels get written to the root filesystem under the mountpoint. The bootloader never sees the new files, leaving you stranded at boot. `sys-health`'s **Guarded Upgrade** actively verifies ESP and `/boot` mount topology *before* transactions start, verifies multi-kernel DKMS builds for *all* installed kernels, and confirms bootloader entries before you reboot.
+* **The Silent Kernel-Bootloader Drift Trap ("I installed `linux-zen`, rebooted, but it is not in the boot menu"):** In Arch Linux, kernel packages trigger ALPM hooks that compile DKMS driver modules and generate initramfs images via dracut/mkinitcpio. However, Arch intentionally does *not* ship automated hooks to run `grub-mkconfig` (avoiding lengthy `os-prober` multi-drive scanning hangs during routine updates). The consequence: new kernels sit quietly on disk and DKMS builds cleanly, but the bootloader menu never receives them. `sys-health` detects this drift across the entire Arch bootloader ecosystem, warning you with actionable, distribution-accurate remediation commands before you reboot expecting a kernel that cannot be launched.
 * **Dependency breaks & partial upgrade traps (e.g., `libpcap` conflicts / broken `.so` libraries):** Updating AUR packages or isolated programs while core repository updates are pending leads to broken shared library links. `sys-health` protects package consistency: it detects database locks (`db.lck`) using `fuser`, enforces atomic upgrade ordering, and alerts you to pending Arch News manual interventions before touching a package.
 * **The "Blind Orphan Purge" Trap (`pacman -Qtdq` vs Reality):** Arch elitists often chant the dogma: *"Just blindly run `pacman -Rns $(pacman -Qtdq)`—if you don't know what you have installed, you shouldn't use Arch!"* In reality, unguided orphan deletion is an operational hazard:
   1. `pacman -Qtd` flags all unrequired dependencies—including critical **optional dependencies** (`Optional For:`) that provide features in everyday applications (e.g., Dolphin losing video thumbnails, GIMP losing RAW plugins).
@@ -66,7 +67,7 @@ sys-health AI Session:
 ## Core Features
 
 ### 1. Comprehensive Health Audit (Read-Only)
-* **Universal Multi-Bootloader Verification:** Automatically identifies active bootloader (`systemd-boot`, `GRUB`, `Limine`, `rEFInd`, or standalone `UKI`) and validates that boot configurations, loader entries, and EFI binaries exist and are populated.
+* **Universal Multi-Bootloader & Kernel Synchronization (`check_bootloader_sync`):** Dynamically cross-references active bootloader configurations against all installed kernel families (`/usr/lib/modules/*/pkgbase`). Supports **GRUB**, **systemd-boot**, **Limine**, **rEFInd** (with auto-discovery awareness), and standalone **UKI** (Unified Kernel Images). Features non-root privilege boundary safety (cleanly handles `0600` permissions via `sudo -n` with informative `INFO ℹ` guidance instead of false alarms), boundary-safe regex matching, and actionable remediation (`BOOTLOADER_KERNEL_DESYNC`).
 * **ESP & Mount Topology Integrity:** Inspects `/etc/fstab` and `findmnt` to ensure the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable, with sufficient free headroom (> 100 MB).
 * **Multi-Kernel & DKMS Synchronization:** Audits every installed kernel series (`linux`, `linux-lts`, `linux-zen`), ensuring matching kernel headers, module directories, and compiled DKMS modules exist for each.
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
@@ -104,7 +105,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
 * **Phase 3: Post-Flight Integrity Verification:**
   1. *Multi-Kernel DKMS Validation:* Confirms modules compiled cleanly for every installed kernel series.
   2. *Boot Image Sanity:* Verifies initramfs and kernel images exist, are parseable (`lsinitrd`/`lsinitcpio`), and have realistic sizes.
-  3. *Bootloader Integrity:* Validates that boot entries (GRUB menuentries, systemd-boot loader configs, UKI images) remain intact.
+  3. *Bootloader & Kernel Synchronization:* Validates that boot entries and configurations (GRUB menuentries, systemd-boot loader configs, UKI images) actively include all installed kernel versions, preventing post-upgrade bootloader drift.
   4. *Disaster Recovery Hints:* Emits immediate, context-aware recovery commands if boot inconsistencies are detected.
   5. *Post-Upgrade Housekeeping:* Refreshes systemd daemons, clears stale locks, and provides `.pacnew` merging prompts.
 
@@ -267,4 +268,3 @@ SKIP_INTEGRITY=0
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
