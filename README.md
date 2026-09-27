@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.20](https://img.shields.io/badge/Version-2.20-orange.svg)](CHANGELOG.md)
+[![Version: 2.21](https://img.shields.io/badge/Version-2.21-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -27,6 +27,11 @@ A quick scan of community support forums reveals recurring pain points:
 * **The "Is My System OK?" dilemma:** After an update or an unexpected freeze, users wonder: *Is my system healthy? Did everything compile? Are my services running?* Instead of forcing you to hunt through dozens of terminal commands, `sys-health` runs an automated, read-only 10-second audit that answers that question with unequivocal, traffic-light clarity.
 * **Kernel & EFI mount desynchronization ("Kernel update leads to unbootable system / failure to mount /efi cleanly"):** If your ESP (EFI System Partition) is unmounted or mounted read-only during an update, new kernels get written to the root filesystem under the mountpoint. The bootloader never sees the new files, leaving you stranded at boot. `sys-health`'s **Guarded Upgrade** actively verifies ESP and `/boot` mount topology *before* transactions start, verifies multi-kernel DKMS builds for *all* installed kernels, and confirms bootloader entries before you reboot.
 * **Dependency breaks & partial upgrade traps (e.g., `libpcap` conflicts / broken `.so` libraries):** Updating AUR packages or isolated programs while core repository updates are pending leads to broken shared library links. `sys-health` protects package consistency: it detects database locks (`db.lck`) using `fuser`, enforces atomic upgrade ordering, and alerts you to pending Arch News manual interventions before touching a package.
+* **The "Blind Orphan Purge" Trap (`pacman -Qtdq` vs Reality):** Arch elitists often chant the dogma: *"Just blindly run `pacman -Rns $(pacman -Qtdq)`—if you don't know what you have installed, you shouldn't use Arch!"* In reality, unguided orphan deletion is an operational hazard:
+  1. `pacman -Qtd` flags all unrequired dependencies—including critical **optional dependencies** (`Optional For:`) that provide features in everyday applications (e.g., Dolphin losing video thumbnails, GIMP losing RAW plugins).
+  2. It flags build toolchains (`rust`, `cargo`, `go`, `base-devel`, kernel headers) pulled during AUR compilations. Blindly removing them turns the next update into a 2-hour rebuild or breaks DKMS driver compilation.
+  3. Purists overlook that `pacman -Rns` **does not purge downloaded package archives from the cache** (`/var/cache/pacman/pkg`)! The uninstalled software leaves dead `.pkg.tar.zst` files rotting on disk indefinitely.
+  `sys-health` eliminates this guesswork with an offline 3-tier safety classifier, 1-click explicit dependency protection (`pacman -D --asexplicit`), and an atomic Zero-Residue Cache Purge.
 * **The dead laptop mid-upgrade disaster:** A kernel update interrupted by a dying battery is one of the quickest ways to corrupt an initramfs or filesystem. `sys-health` probes hardware ACPI power supplies and refuses heavy upgrades on battery power when charge is critically low (< 25%).
 
 ---
@@ -129,7 +134,17 @@ Bridges the gap for software installed outside distribution repositories:
   * **AUR Packages:** Filtered line-structure validation via `yay -Qua` or `paru -Qua`.
   * **Steam & Flatpak:** Differentiates self-managed game client runtimes and containerized apps.
 
-### 6. SRE Safe Maintenance & Deep Clean (`--maintenance`)
+### 6. Dynamic Orphan Triage & Zero-Residue Purge Engine (`--orphans`, `-o`)
+Designed to demystify package maintenance and eliminate the operational hazards of blind orphan cleaning:
+* **3-Tier ALPM Safety Classification:** Interrogates local package metadata (`LC_ALL=C pacman -Qi`) in a single offline batch query (< 50ms):
+  * 🟢 **Tier 1 (Safe Leaves):** Truly unrequired leaf packages (`Optional For: None`). Safe to purge immediately without downstream effects.
+  * 🟡 **Tier 2 (Optional Dependencies):** Packages actively utilized as optional dependencies by installed software. Surfaces exact reverse dependencies (e.g. `dolphin`, `vlc`, `gimp`) so you never lose desktop features unexpectedly.
+  * 🔴 **Tier 3 (Core & Toolchain Safety Guard):** Regex-protected blacklist safeguarding kernel headers, firmware, GPU drivers, audio servers, fonts, and build toolchains (`base-devel`, `rust`, `cargo`, `go`, `gcc`, `make`, `dkms`).
+* **Atomic Zero-Residue Purge (Arch Wiki Standard):** Deleting packages via `pacman -Rns` leaves cached installation tarballs in `/var/cache/pacman/pkg`. `sys-health` automatically executes `paccache -c "$CacheDir" --remove --uninstalled --keep 0` immediately following orphan removal, ensuring 100% clean disk reclaim while preserving rollback versions for installed software.
+* **1-Click Explicit Protection (`--asexplicit`):** Users frequently use orphaned tools directly (e.g., `git`, `htop`, `rust`). Rather than deleting and reinstalling, `sys-health` allows marking them as explicitly installed (`sudo pacman -D --asexplicit`), permanently resolving recurring orphan alerts.
+* **Pre-Flight Gate 2 Integration:** Non-intrusively notifies users during Guarded Upgrades if unrequired orphans are pending, preventing wasted download bandwidth and obsolete AUR rebuilds.
+
+### 7. SRE Safe Maintenance & Deep Clean (`--maintenance`, `--deep-clean`)
 * **Reclaimable Space Preview:** Accurately calculates estimated reclaimable space before deleting a single file.
 * **Active Browser Process Protection:** Inspects running Firefox or Chromium processes (`pgrep`). Skips browser cache cleaning during active sessions to prevent SQLite WAL corruption, lost tabs, or session restore loss.
 * **Strict Shader Cache Blacklist:** Hardcoded blacklist permanently safeguarding graphics shader caches (`~/.nv`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, Steam shader pre-caches, DXVK caches), eliminating post-cleanup in-game stutter.
@@ -215,6 +230,7 @@ All non-interactive flags output plain text or structured JSON, perfect for scri
 | `sys-health --snapshot` (or `-s`)| Output complete software and driver state snapshot. |
 | `sys-health --report` (or `-r`) | Output full plain-text audit report log. |
 | `sys-health --maintenance` (or `-m`)| Run safe maintenance non-interactively, then execute health audit. |
+| `sys-health --orphans` (or `-o`)| Run interactive 3-tier orphan package triage & zero-residue purger. |
 | `sys-health --deep-clean` (or `-d`)| Run safe deep cleaning non-interactively, then execute health audit. |
 
 ---
