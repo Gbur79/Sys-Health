@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.23
+# Arch System Health & Diagnostics v2.24
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.23"
+VERSION="2.24"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -1609,7 +1609,11 @@ triage_orphan_packages() {
     local p
     for p in "${raw_orphans[@]}"; do
         [[ -z "$p" ]] && continue
-        if [[ "$p" =~ $sys_pattern ]]; then
+        if [[ -z "${pkg_desc[$p]:-}" || ( "${pkg_desc[$p]}" == "No description available" && "${pkg_size[$p]:-Unknown}" == "Unknown" ) ]]; then
+            # SRE Cardinal Safety: Missing/failed metadata -> guard as Tier 3 manual review
+            pkg_desc["$p"]="${pkg_desc[$p]:-Metadata query failed; requires manual review}"
+            tier3_system+=("$p")
+        elif [[ "$p" =~ $sys_pattern ]]; then
             tier3_system+=("$p")
         elif [[ "${pkg_opt[$p]:-None}" != "None" && -n "${pkg_opt[$p]:-}" ]]; then
             tier2_optional+=("$p")
@@ -1750,8 +1754,10 @@ triage_orphan_packages() {
             fi
 
             if (( ${#to_protect[@]} > 0 )); then
-                info "Marking packages as explicitly installed (sudo pacman -D --asexplicit)..."
-                if sudo pacman -D --asexplicit "${to_protect[@]}"; then
+                info "Marking packages as explicitly installed (pacman -D --asexplicit)..."
+                local prot_cmd=(pacman -D --asexplicit "${to_protect[@]}")
+                (( EUID != 0 )) && prot_cmd=(sudo "${prot_cmd[@]}")
+                if "${prot_cmd[@]}"; then
                     ok "Successfully protected ${#to_protect[@]} package(s). They will no longer appear as orphans!"
                     log "MAINTENANCE orphans_protected count=${#to_protect[@]} pkgs=${to_protect[*]}"
                 else
@@ -1795,31 +1801,45 @@ triage_orphan_packages() {
         fi
 
         echo ""
-        info "[Step 1/2] Removing packages via: sudo pacman -Rns ${to_remove[*]}"
-        if ! sudo pacman -Rns "${to_remove[@]}"; then
+        info "[Step 1/2] Removing packages via: pacman -Rns ${to_remove[*]}"
+        local rem_cmd=(pacman -Rns "${to_remove[@]}")
+        (( EUID != 0 )) && rem_cmd=(sudo "${rem_cmd[@]}")
+        if ! "${rem_cmd[@]}"; then
             fail "Pacman package removal encountered an error!"
             return 1
         fi
         ok "Selected orphan packages and unneeded dependencies removed."
         log "MAINTENANCE orphans_removed count=${#to_remove[@]} pkgs=${to_remove[*]}"
 
-        # Step 2: Atomic Zero-Residue Cache Purge (Arch Wiki Standard)
+        # Step 2: Zero-Residue Cache Purge (Arch Wiki Standard)
         echo ""
         info "[Step 2/2] Initiating Zero-Residue Cache Purge (paccache -ruk0)..."
         info "  › Arch Wiki Standard: pacman -Rns does not delete downloaded .pkg.tar.zst files from cache."
         info "  › Purging uninstalled package archives while preserving installed packages rollback history."
 
-        local pacman_cache_dir
-        pacman_cache_dir="$(pacman-conf CacheDir 2>/dev/null | head -n 1 || echo "/var/cache/pacman/pkg")"
-        [[ -d "$pacman_cache_dir" ]] || pacman_cache_dir="/var/cache/pacman/pkg"
+        local -a cache_dirs=()
+        if command -v pacman-conf &>/dev/null; then
+            mapfile -t cache_dirs < <(pacman-conf CacheDir 2>/dev/null | sed '/^$/d' || true)
+        fi
+        if (( ${#cache_dirs[@]} == 0 )); then
+            cache_dirs=("/var/cache/pacman/pkg")
+        fi
 
         if command -v paccache &>/dev/null; then
-            if sudo paccache -c "$pacman_cache_dir" --remove --uninstalled --keep 0; then
-                ok "Zero-Residue Cache Purge complete. 0 dead package archives remain in $pacman_cache_dir."
-                log "MAINTENANCE uninstalled_cache_purged=PASS cache_dir=$pacman_cache_dir"
-            else
-                warn "paccache purge returned a non-zero exit code."
-            fi
+            local cdir cdir_purged=false
+            for cdir in "${cache_dirs[@]}"; do
+                [[ -d "$cdir" ]] || continue
+                local pc_cmd=(paccache -c "$cdir" --remove --uninstalled --keep 0)
+                (( EUID != 0 )) && pc_cmd=(sudo "${pc_cmd[@]}")
+                if "${pc_cmd[@]}"; then
+                    ok "Zero-Residue Cache Purge complete on $cdir."
+                    log "MAINTENANCE uninstalled_cache_purged=PASS cache_dir=$cdir"
+                    cdir_purged=true
+                else
+                    warn "paccache purge returned a non-zero exit code on $cdir."
+                fi
+            done
+            $cdir_purged || info "No valid pacman cache directories found to purge."
         else
             info "paccache command not found (pacman-contrib not installed). Skipping uninstalled cache purge."
         fi
@@ -1832,47 +1852,68 @@ triage_orphan_packages() {
 # ==============================================================================
 
 discover_active_mirrorlists() {
-    local -a files=()
-    local seen=" "
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local conf_dir="/etc"
+    [[ -f "$conf" ]] && conf_dir="$(dirname "$conf")"
 
-    # 1. Parse active Include directives from /etc/pacman.conf
-    if [[ -f /etc/pacman.conf ]]; then
-        local inc_f
-        while IFS= read -r inc_f; do
-            [[ -f "$inc_f" ]] || continue
-            if [[ "$seen" != *" $inc_f "* ]]; then
-                files+=("$inc_f")
-                seen+="$inc_f "
-            fi
-        done < <(grep -E '^[[:space:]]*Include[[:space:]]*=' /etc/pacman.conf 2>/dev/null | awk '{print $3}' || true)
+    local -a files=()
+    local -A seen=()
+
+    # 1. Parse active Include directives from pacman.conf
+    if [[ -f "$conf" ]]; then
+        local inc_pattern inc_f
+        while IFS= read -r inc_pattern; do
+            [[ -z "$inc_pattern" ]] && continue
+            [[ "$inc_pattern" != /* ]] && inc_pattern="${conf_dir}/${inc_pattern}"
+
+            for inc_f in $inc_pattern; do
+                [[ -f "$inc_f" ]] || continue
+                if [[ -z "${seen[$inc_f]:-}" ]]; then
+                    files+=("$inc_f")
+                    seen["$inc_f"]=1
+                fi
+            done
+        done < <(awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*Include[[:space:]]*=/ {
+                sub(/^[^=]*=[[:space:]]*/, "", $0)
+                sub(/[[:space:]]+#.*$/, "", $0)
+                if (length($0) > 0) print
+            }
+        ' "$conf" 2>/dev/null || true)
     fi
 
-    # 2. Discover any additional mirrorlists in /etc/pacman.d
-    if [[ -d /etc/pacman.d ]]; then
+    # 2. Discover any additional mirrorlists in pacman.d directory
+    local pacman_d="${conf_dir}/pacman.d"
+    [[ ! -d "$pacman_d" && -d /etc/pacman.d ]] && pacman_d="/etc/pacman.d"
+
+    if [[ -d "$pacman_d" ]]; then
         local d_f
         while IFS= read -r d_f; do
             [[ -f "$d_f" ]] || continue
-            if [[ "$seen" != *" $d_f "* ]]; then
+            if [[ -z "${seen[$d_f]:-}" ]]; then
                 files+=("$d_f")
-                seen+="$d_f "
+                seen["$d_f"]=1
             fi
-        done < <(find /etc/pacman.d -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
+        done < <(find "$pacman_d" -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
     fi
 
     # 3. Sort: prioritize standard Arch mirrorlist (/etc/pacman.d/mirrorlist) first if present
     local -a sorted=()
     for f in "${files[@]}"; do
-        if [[ "$f" == "/etc/pacman.d/mirrorlist" ]]; then
+        if [[ "$f" == "$pacman_d/mirrorlist" || "$f" == "/etc/pacman.d/mirrorlist" ]]; then
             sorted+=("$f")
             break
         fi
     done
     for f in "${files[@]}"; do
-        [[ "$f" == "/etc/pacman.d/mirrorlist" ]] && continue
+        [[ "$f" == "$pacman_d/mirrorlist" || "$f" == "/etc/pacman.d/mirrorlist" ]] && continue
         sorted+=("$f")
     done
 
-    printf '%s\n' "${sorted[@]}"
+    if (( ${#sorted[@]} > 0 )); then
+        printf '%s\n' "${sorted[@]}"
+    fi
 }
 
 probe_primary_mirror() {
@@ -1913,14 +1954,18 @@ probe_primary_mirror() {
     fi
 
     if ! command -v curl &>/dev/null; then
-        echo "$primary_url|200|0|$target_repo"
+        echo "$primary_url|NA|NA|$target_repo"
         return 0
     fi
 
-    local probe_res http_code time_conn time_ms=0
-    probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --max-time 3 "${primary_url%/}/${target_repo}.db" 2>/dev/null || echo "000|0")"
-    http_code="${probe_res%%|*}"
-    time_conn="${probe_res##*|}"
+    local probe_res="" http_code="000" time_conn="0" time_ms=0
+    if probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --connect-timeout 3 --max-time 4 "${primary_url%/}/${target_repo}.db" 2>/dev/null)"; then
+        http_code="${probe_res%%|*}"
+        time_conn="${probe_res##*|}"
+    else
+        http_code="000"
+        time_conn="0"
+    fi
 
     if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
         local s_sec="${BASH_REMATCH[1]}"
@@ -1946,7 +1991,12 @@ refresh_and_rank_mirrors() {
         section "REGIONAL REPOSITORY MIRROR RANKING"
     fi
 
-    # Step 1: Detect network reachability first
+    # Step 1: Detect network reachability & curl availability
+    if ! command -v curl &>/dev/null; then
+        warn "curl is not installed; cannot verify network reachability or benchmark mirrors."
+        return 1
+    fi
+
     if ! curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
         fail "Cannot reach Arch Linux network infrastructure (offline or DNS failure). Mirror ranking aborted."
         return 1
@@ -1956,11 +2006,12 @@ refresh_and_rank_mirrors() {
     local eos_mfile="/etc/pacman.d/endeavouros-mirrorlist"
     local arch_updated=false eos_updated=false
     local tmp_mfile
+    tmp_mfile="$(mktemp "${TMPDIR:-/tmp}/mirrorlist.XXXXXX")"
+    trap 'rm -f "$tmp_mfile"' RETURN
 
     # 1. Arch Linux Mirrors
     if [[ -f "$arch_mfile" ]]; then
         info "Evaluating available ranking engines for Arch Linux mirrors..."
-        tmp_mfile="$(mktemp /tmp/mirrorlist.XXXXXX)"
 
         local ranker=""
         if command -v rate-mirrors &>/dev/null; then
@@ -2014,7 +2065,7 @@ refresh_and_rank_mirrors() {
         # Atomic Staging Gate: Validate generated mirrorlist before touching /etc/pacman.d/mirrorlist
         local valid_servers=0
         if [[ -s "$tmp_mfile" ]]; then
-            valid_servers="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$tmp_mfile" 2>/dev/null || echo 0)"
+            valid_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$tmp_mfile" 2>/dev/null || echo 0)"
         fi
 
         if (( valid_servers >= 3 )); then
@@ -3324,47 +3375,58 @@ check_failed_services() {
     if [[ "$EUID" -eq 0 ]]; then
         # Running as root: inspect all active systemd user managers dynamically
         local active_user_units
-        active_user_units="$(systemctl list-units 'user@*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}' || true)"
+        active_user_units="$(systemctl list-units 'user@*.service' --state=active --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
 
         while read -r unit; do
             [[ -z "$unit" ]] && continue
             local uid="${unit#user@}"
             uid="${uid%.service}"
+            [[ "$uid" =~ ^[0-9]+$ ]] || continue
             local uname
             uname="$(id -nu "$uid" 2>/dev/null || echo "UID $uid")"
 
+            local raw_failed
+            if ! raw_failed="$(systemctl --user -M "${uid}@" list-units --failed --no-legend --plain --no-pager 2>/dev/null)"; then
+                continue
+            fi
+
             local failed_list
-            failed_list="$(systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vE '^app-.*\.(service|scope)$' | sed '/^$/d' || true)"
-            ((checked_users++))
+            failed_list="$(awk '$1 !~ /^app-.*\.(service|scope)$/ && NF {print $1}' <<< "$raw_failed")"
+            ((checked_users++)) || true
 
             if [[ -n "$failed_list" ]]; then
                 local u_cnt
-                u_cnt="$(printf '%s\n' "$failed_list" | wc -l)"
-                ((total_user_failed += u_cnt))
+                u_cnt="$(awk 'NF {n++} END {print n+0}' <<< "$failed_list")"
+                ((total_user_failed += u_cnt)) || true
                 user_failed_units+="${failed_list}"$'\n'
                 user_audit_details+=("User $uname ($uid): $u_cnt failed")
                 {
                     echo "### FAILED SYSTEMD UNITS (USER: $uname / $uid)"
-                    systemctl --user -M "${uid}@" list-units --failed --no-legend --plain 2>&1 | grep -vE '^app-.*\.(service|scope)$' || true
+                    printf '%s\n' "$failed_list"
                 } >> "$LOG_FILE"
             fi
         done <<< "$active_user_units"
     else
         # Unprivileged execution: check current user bus
-        if systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null; then
-            local failed_list
-            failed_list="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vE '^app-.*\.(service|scope)$' | sed '/^$/d' || true)"
-            ((checked_users++))
-            if [[ -n "$failed_list" ]]; then
-                local u_cnt
-                u_cnt="$(printf '%s\n' "$failed_list" | wc -l)"
-                ((total_user_failed += u_cnt))
-                user_failed_units+="${failed_list}"$'\n'
-                user_audit_details+=("${USER:-UID $EUID}: $u_cnt failed")
-                {
-                    echo "### FAILED SYSTEMD UNITS (USER: ${USER:-$EUID})"
-                    systemctl --user --failed --no-legend --plain 2>&1 | grep -vE '^app-.*\.(service|scope)$' || true
-                } >> "$LOG_FILE"
+        local runtime_bus="${XDG_RUNTIME_DIR:-}/bus"
+        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" || -S "$runtime_bus" ]] && (systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null); then
+            local raw_failed
+            if raw_failed="$(systemctl --user --failed --no-legend --plain --no-pager 2>/dev/null)"; then
+                local failed_list
+                failed_list="$(awk '$1 !~ /^app-.*\.(service|scope)$/ && NF {print $1}' <<< "$raw_failed")"
+                ((checked_users++)) || true
+                if [[ -n "$failed_list" ]]; then
+                    local u_cnt uname
+                    uname="$(id -un 2>/dev/null || echo "UID $EUID")"
+                    u_cnt="$(awk 'NF {n++} END {print n+0}' <<< "$failed_list")"
+                    ((total_user_failed += u_cnt)) || true
+                    user_failed_units+="${failed_list}"$'\n'
+                    user_audit_details+=("${uname}: $u_cnt failed")
+                    {
+                        echo "### FAILED SYSTEMD UNITS (USER: ${uname})"
+                        printf '%s\n' "$failed_list"
+                    } >> "$LOG_FILE"
+                fi
             fi
         fi
     fi
@@ -3516,18 +3578,53 @@ check_pacnew() {
 }
 
 check_orphan_packages() {
-    if ! command -v pacman &>/dev/null; then
-        return
+    local tmp err rc orphan_count=0 p
+    local -a orphans=()
+
+    if ! command -v pacman >/dev/null 2>&1; then
+        add_row "Orphan packages" "INFO ℹ (pacman unavailable)" "SYS"
+        ((INFO_COUNT++)) || true
+        log "HEALTH orphans=INFO pacman_missing"
+        return 0
     fi
-    local orphan_count=0
-    orphan_count="$((pacman -Qtdq 2>/dev/null || true) | wc -l)"
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/orphans.XXXXXX")" || {
+        add_row "Orphan packages" "INFO ℹ (temporary storage unavailable)" "SYS"
+        ((INFO_COUNT++)) || true
+        log "HEALTH orphans=INFO mktemp_failed"
+        return 0
+    }
+    err="${tmp}.err"
+
+    if pacman -Qtdq >"$tmp" 2>"$err"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    # Pacman exits with 1 when zero orphans are found; genuine ALPM errors write to stderr
+    if (( rc != 0 )) && [[ -s "$err" ]]; then
+        add_row "Orphan packages" "WARN ⚠ (pacman query failed)" "SYS"
+        ((WARNINGS++)) || true
+        log "HEALTH orphans=WARN query_failed"
+        rm -f -- "$tmp" "$err"
+        return 0
+    fi
+
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && orphans+=("$p")
+    done < "$tmp"
+
+    rm -f -- "$tmp" "$err"
+    orphan_count="${#orphans[@]}"
+
     if (( orphan_count == 0 )); then
         add_row "Orphan packages" "PASS ✔ (0 unrequired)" "SYS"
         log "HEALTH orphans=0"
     else
-        add_row "Orphan packages" "INFO ℹ ($orphan_count unrequired - triage recommended)" "SYS"
-        ((INFO_COUNT++))
-        log "HEALTH orphans=INFO count=$orphan_count"
+        add_row "Orphan packages" "INFO ℹ (${orphan_count} unrequired - triage recommended)" "SYS"
+        ((INFO_COUNT++)) || true
+        log "HEALTH orphans=INFO count=${orphan_count}"
     fi
 }
 
@@ -3706,9 +3803,23 @@ check_dns() {
     local test_host="${DNS_TEST_HOST:-archlinux.org}"
     local qtime_num="" server_note=""
 
+    # Sanitize test_host
+    if [[ ! "$test_host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+        add_row "System DNS" "INFO ℹ (invalid test host)" "NET"
+        ((INFO_COUNT++)) || true
+        log "HEALTH dns=INFO reason=invalid_test_host host=$test_host"
+        return 0
+    fi
+
     if command -v dig &>/dev/null; then
         local dig_cmd=(dig)
         if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+            if [[ ! "${DNS_TEST_SERVER}" =~ ^[A-Za-z0-9:._-]+$ ]]; then
+                add_row "System DNS" "INFO ℹ (invalid test server)" "NET"
+                ((INFO_COUNT++)) || true
+                log "HEALTH dns=INFO reason=invalid_test_server server=${DNS_TEST_SERVER}"
+                return 0
+            fi
             dig_cmd+=("@${DNS_TEST_SERVER}")
             server_note=" @${DNS_TEST_SERVER}"
         fi
@@ -3716,11 +3827,11 @@ check_dns() {
 
         local dig_out
         dig_out="$("${dig_cmd[@]}" 2>&1)"
-        printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
+        [[ -d "$RUN_RAW" && -w "$RUN_RAW" ]] && printf '%s\n' "$dig_out" > "$RUN_RAW/dig-test.txt"
 
         if ! printf '%s\n' "$dig_out" | grep -q 'status: NOERROR'; then
             add_row "System DNS" "WARN ⚠ (query failed or NOERROR not received)" "NET"
-            ((WARNINGS++))
+            ((WARNINGS++)) || true
             log "HEALTH dns=WARN resolution_failed host=$test_host"
             return
         fi
@@ -3732,6 +3843,12 @@ check_dns() {
     elif command -v drill &>/dev/null; then
         local drill_cmd=(drill)
         if [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+            if [[ ! "${DNS_TEST_SERVER}" =~ ^[A-Za-z0-9:._-]+$ ]]; then
+                add_row "System DNS" "INFO ℹ (invalid test server)" "NET"
+                ((INFO_COUNT++)) || true
+                log "HEALTH dns=INFO reason=invalid_test_server server=${DNS_TEST_SERVER}"
+                return 0
+            fi
             drill_cmd+=("@${DNS_TEST_SERVER}")
             server_note=" @${DNS_TEST_SERVER}"
         fi
@@ -3740,7 +3857,7 @@ check_dns() {
         drill_out="$("${drill_cmd[@]}" 2>&1)"
         if ! grep -q 'rcode: NOERROR' <<< "$drill_out"; then
             add_row "System DNS" "WARN ⚠ (drill query failed)" "NET"
-            ((WARNINGS++))
+            ((WARNINGS++)) || true
             log "HEALTH dns=WARN resolution_failed host=$test_host"
             return
         fi
@@ -3748,12 +3865,20 @@ check_dns() {
         qtime_num="${qtime_num:-?}"
         add_row "System DNS" "PASS ✔ (${qtime_num}ms${server_note})" "NET"
         log "HEALTH dns=PASS qtime=${qtime_num}ms host=$test_host"
+    elif [[ -n "${DNS_TEST_SERVER:-}" ]]; then
+        add_row "System DNS" "INFO ℹ (custom server cannot be tested; dig/drill unavailable)" "NET"
+        ((INFO_COUNT++)) || true
+        log "HEALTH dns=INFO requested_server_unverified server=${DNS_TEST_SERVER}"
+        return 0
+    elif command -v resolvectl &>/dev/null && resolvectl query "$test_host" &>/dev/null; then
+        add_row "System DNS" "PASS ✔ (resolved via systemd-resolved)" "NET"
+        log "HEALTH dns=PASS method=resolvectl host=$test_host"
     elif getent ahosts "$test_host" &>/dev/null; then
-        add_row "System DNS" "PASS ✔ (resolved via getent)" "NET"
+        add_row "System DNS" "PASS ✔ (NSS resolution; DNS transport unverified)" "NET"
         log "HEALTH dns=PASS method=getent host=$test_host"
     else
         add_row "System DNS" "WARN ⚠ (resolution failed for $test_host)" "NET"
-        ((WARNINGS++))
+        ((WARNINGS++)) || true
         log "HEALTH dns=WARN resolution_failed host=$test_host"
     fi
 }
@@ -3829,8 +3954,10 @@ check_mirrorlist_age() {
     primary_ms="${rest%%|*}"
     target_repo="${rest#*|}"
 
-    if [[ -n "$primary_url" && "$http_code" =~ ^(200|301|302)$ ]]; then
-        if (( primary_ms > 400 )); then
+    if [[ "$http_code" == "NA" ]]; then
+        primary_info="probe unavail"
+    elif [[ -n "$primary_url" && "$http_code" =~ ^(200|301|302)$ ]]; then
+        if [[ "$primary_ms" =~ ^[0-9]+$ ]] && (( primary_ms > 400 )); then
             primary_slow=true
             primary_info="${primary_ms}ms high-latency"
         else
@@ -3838,7 +3965,7 @@ check_mirrorlist_age() {
         fi
     elif [[ -n "$primary_url" ]]; then
         # Check if internet control plane is alive before flagging mirror as dead
-        if curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+        if command -v curl &>/dev/null && curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
             primary_dead=true
             primary_info="primary DEAD"
         fi
@@ -3862,7 +3989,7 @@ check_mirrorlist_age() {
             *)           fname="${fname^}" ;;
         esac
 
-        srv_cnt="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$mf" 2>/dev/null || echo 0)"
+        srv_cnt="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$mf" 2>/dev/null || echo 0)"
         if (( srv_cnt == 0 )); then
             empty_mirrorlist=true
         elif (( srv_cnt < 2 )); then
@@ -3906,13 +4033,20 @@ check_mirrorlist_age() {
         fi
     done
 
+    if [[ -z "$status_label" ]]; then
+        add_row "Mirrorlist status" "INFO ℹ (no readable server entries)" "NET"
+        ((INFO_COUNT++)) || true
+        log "HEALTH mirrorlist_age=INFO details='no readable server entries'"
+        return
+    fi
+
     if $empty_mirrorlist || $primary_dead || (( max_days > 90 )); then
         add_row "Mirrorlist status" "WARN ⚠ ($status_label)" "NET"
-        ((WARNINGS++))
+        ((WARNINGS++)) || true
         log "HEALTH mirrorlist_age=WARN max_days=$max_days details='$status_label'"
     elif $primary_slow || $low_redundancy || (( max_days > 45 )); then
         add_row "Mirrorlist status" "INFO ℹ ($status_label)" "NET"
-        ((INFO_COUNT++))
+        ((INFO_COUNT++)) || true
         log "HEALTH mirrorlist_age=INFO max_days=$max_days details='$status_label'"
     else
         add_row "Mirrorlist status" "PASS ✔ ($status_label)" "NET"
@@ -5104,6 +5238,12 @@ reconstruct_tables_from_log() {
             orphans)
                 if [[ "$val" == "0" || "$val" == "PASS" ]]; then
                     AUDIT_TABLE_SYS+="Orphan packages | PASS ✔ (0 unrequired)\n"
+                elif [[ "$val" == "WARN" ]]; then
+                    AUDIT_TABLE_SYS+="Orphan packages | WARN ⚠ (pacman query failed)\n"
+                elif [[ "$details" =~ pacman_missing ]]; then
+                    AUDIT_TABLE_SYS+="Orphan packages | INFO ℹ (pacman unavailable)\n"
+                elif [[ "$details" =~ mktemp_failed ]]; then
+                    AUDIT_TABLE_SYS+="Orphan packages | INFO ℹ (temporary storage unavailable)\n"
                 else
                     local ocount="${details#count=}"
                     AUDIT_TABLE_SYS+="Orphan packages | INFO ℹ (${ocount:-$val} unrequired - triage recommended)\n"
@@ -7097,7 +7237,7 @@ run_guarded_upgrade() {
         for mf in "${mirror_files[@]}"; do
             local mtime fname days srv_cnt
             fname="$(basename "$mf")"
-            srv_cnt="$(grep -c '^[[:space:]]*Server[[:space:]]*=' "$mf" 2>/dev/null || echo 0)"
+            srv_cnt="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$mf" 2>/dev/null || echo 0)"
             (( total_active_servers += srv_cnt ))
             if (( srv_cnt == 0 )); then
                 ((empty_count++))
@@ -7130,7 +7270,7 @@ run_guarded_upgrade() {
         elif (( max_age > 30 )); then
             needs_mirror_refresh=true
             refresh_reason="Local mirrorlists are older than 30 days (${stale_advisories[*]})."
-        elif (( mirror_rtt_ms > 800 )); then
+        elif [[ "$mirror_rtt_ms" =~ ^[0-9]+$ ]] && (( mirror_rtt_ms > 800 )); then
             needs_mirror_refresh=true
             refresh_reason="Primary mirror latency is critically high (${mirror_rtt_ms}ms - cross-continental or throttled)."
         fi
@@ -7166,7 +7306,7 @@ run_guarded_upgrade() {
             fi
         else
             local latency_note=""
-            (( mirror_rtt_ms > 0 )) && latency_note=" (${mirror_rtt_ms}ms)"
+            [[ "$mirror_rtt_ms" =~ ^[0-9]+$ ]] && (( mirror_rtt_ms > 0 )) && latency_note=" (${mirror_rtt_ms}ms)"
             ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified${latency_note}."
         fi
     fi
@@ -7363,8 +7503,8 @@ run_guarded_upgrade() {
     aur_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$tmp_aur" 2>/dev/null || true)"
     rm -f "$tmp_repo" "$tmp_aur"
 
-    [[ -n "$repo_raw" ]] && repo_count="$(grep -c '^[a-zA-Z0-9@._+-]' <<< "$repo_raw" || echo 0)"
-    [[ -n "$aur_raw" ]] && aur_count="$(grep -c '^[a-zA-Z0-9@._+-]' <<< "$aur_raw" || echo 0)"
+    [[ -n "$repo_raw" ]] && repo_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$repo_raw")"
+    [[ -n "$aur_raw" ]] && aur_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$aur_raw")"
 
     # Edge-case: System is fully up to date
     if (( repo_count == 0 && aur_count == 0 )); then
