@@ -7,16 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.28] - 2026-09-28
+
+### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Boot & Core OS Health Checks)
+- **Atomic Kernel & Initramfs Resolution (`_resolve_kernel_and_initramfs`)**:
+  - Eliminated dangerous cross-filesystem and cross-entry coupling where a kernel on one boot root (e.g., `/boot`) could be paired with an initramfs on another (e.g., `/efi`), creating phantom boot configurations no bootloader entry could load.
+  - Bound resolution into strictly indivisible records: BLS Type #1 entries require both kernel and initrd to resolve relative to the same entry root; traditional layouts require both artifacts to coexist under the identical boot directory; degraded fallback is restricted to a single candidate root.
+  - Eliminated global variable leakage by explicitly localizing all loop and candidate variables (`bdir`, `u_cand`, `entry`, `l_rel`, `i_rel`, `cand_k`, `cand_i`, `cand_f`, `bls_k`, `bls_i`, `deg_k`, `deg_i`).
+- **Fail-Closed Kernel Discovery & Modules Reconciliation (`check_kernel`)**:
+  - Eliminated silent false `PASS` when `/usr/lib/modules/*/pkgbase` glob returns empty.
+  - Added robust secondary directory scanning across `/usr/lib/modules/*` (reading `modules.dep` and package ownership via `pacman -Qqo`) and reconciliation against installed `linux*` packages from pacman.
+  - Enforced fail-closed behavior: flags `FAIL ✖` if modules directories are unpopulated or no bootable kernels can be resolved.
+- **Boot-Root Authority & Mountpoint Scope (`detect_boot_directories` & `check_efi_mount`)**:
+  - Replaced unconstrained VFAT mount scanning (which captured unrelated external USB sticks, recovery media, and SD cards) with authoritative `bootctl -p` (ESP) and `bootctl -x` (XBOOTLDR) discovery.
+  - Scoped filesystem and `fstab` discovery strictly to standard boot directories (`/boot`, `/efi`, `/boot/efi`, `/esp`).
+  - Added non-numeric / unreadable capacity handling for `df` output in `check_efi_mount`, reporting `INFO ℹ` instead of falling through to a spurious `PASS`.
+- **Initramfs Structural Integrity & Format Verification (`check_initramfs`)**:
+  - Replaced unsafe default fallback to `linux-lts` with deterministic resolution based on running kernel suffix and `pacman -Qqo`, failing closed with `FAIL ✖` if pkgbase cannot be determined.
+  - Added minimum payload validation (rejects truncated or 0-byte images < 1MB).
+  - Implemented unprivileged-safe deep content verification: checks PE magic headers (`MZ`) for UKIs, and leverages `lsinitrd --size`, `lsinitcpio -a`, or `booster ls` (with passwordless sudo awareness when files are mode 0600) to ensure images are not corrupt.
+- **Deterministic Previous-Boot Forensics (`check_previous_boot`)**:
+  - Replaced unreliable heuristic (searching for shutdown markers in last 50 journal entries) with boot verification via `journalctl --list-boots`.
+  - Added explicit kernel panic / OOPS detection (`journalctl -b -1 -k -p 0..2`), filesystem recovery alerts, and unclean journal markers.
+  - Replaced false crash warnings with nuanced triage: flags `WARN ⚠` on positive crash/recovery evidence, `PASS ✔` on verified shutdown targets, and `INFO ℹ (inconclusive)` when shutdown markers are unrecorded but no faults occurred.
+  - Enforced `LC_ALL=C` across all journal parsing to eliminate localization breakage.
+- **Pending Reboot Detection Hardening (`check_reboot_pending`)**:
+  - In addition to checking for the existence of `/usr/lib/modules/$running_k`, explicitly validates the integrity and presence of `modules.dep`, preventing false passes on partial or stale post-transaction directories.
+- **Accurate Critical-Path .pacnew Detection (`_find_pacnew_files`)**:
+  - Integrated official `pacdiff -o` for authoritative pacman database tracking, falling back to comprehensive scanning of `/etc` and all dynamically discovered boot roots.
+
+---
+
+## [2.27] - 2026-09-28
+
+### Fixed & Hardened (Terra EOS-SRE Architectural Audit - System State Snapshot & Telemetry Engine)
+- **Subshell Isolation, Timestamp Preservation & Injection Immunity (`refresh_state_snapshot` & `dump_software_state_snapshot`)**:
+  - Resolved missing timestamp flaw in spinner execution mode: extracted snapshot generation into a dedicated top-level function (`dump_software_state_snapshot`) and safely passed timestamp and output destination via positional arguments (`"$1"`, `"$2"`), preventing subshell variable loss and unquoted shell string injection.
+  - Eliminated global namespace pollution by removing nested function declarations inside callers.
+  - Resolved Dracut glob stdin hang risk: replaced raw `cat /etc/dracut.conf.d/*.conf` (which hangs awaiting stdin if `nullglob` expands to empty) with verified file existence loops and structured file-boundary tags (`[:/path/file.conf:]`).
+  - Implemented unambiguous diagnostic telemetry: replaced silent empty sections with explicit deterministic markers (`status=none`, `status=command_missing`, `status=permission_denied`, `status=unavailable`).
+- **Universal Multi-Vendor Hardware & Initramfs Expansion**:
+  - Expanded GPU package discovery across the Arch ecosystem to first-class Intel Xe, Arc, and Iris graphics stacks (`intel-media-driver`, `vpl-gpu-rt`, `libva-intel-driver`, `intel-compute-runtime`, `vulkan-intel`).
+  - Added native configuration discovery for the `booster` initramfs generator (`/etc/booster.yaml`) alongside Dracut and Mkinitcpio.
+  - Appended human-readable system uptime (`uptime -p`) to kernel telemetry for immediate reboot status verification.
+- **Universal Boot & Storage Topology Discovery**:
+  - Replaced restrictive `findmnt -t vfat` with flat list inspection (`findmnt --real -l`), capturing root filesystems (`/`), boot partitions (`/boot`), and ESPs regardless of filesystem type (`ext4`, `btrfs`, `xfs`, `vfat`).
+  - Dynamically detects ESP mountpoints across `/boot/efi`, `/efi`, and `/boot`, surfacing permission-denied states transparently when run unprivileged.
+- **Multi-User D-Bus Context Resolution**:
+  - Hardened user-space systemd unit query (`systemctl --user --failed`) to resolve active desktop user sessions (`SUDO_USER` / human UIDs >= 1000) when executed with root privileges, preventing failure or erroneous inspection of root's user manager.
+- **Documentation & Audit Terminology Reconciliation (`README.md`)**:
+  - Aligned README sections 6 and 7 with v2.26 SRE orphan triage architecture, eliminating outdated claims of immediate purge safety and reconciling package cache retention policies.
+
+## [2.26] - 2026-09-28
+
+### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Orphan Package Triage & Safety Engine)
+- **Dependency Classification & Optional-Only Reachability (`triage_orphan_packages`)**:
+  - Resolved critical architectural flaw where Tier 2 (Yellow) was unreachable: partitioned candidates into strict orphans (`pacman -Qdtq`) and optional-only reverse dependencies (`pacman -Qdttq` set difference).
+  - Replaced misleading "safe to purge", "protected", "pristine", and "zero-residue" claims with accurate SRE terminology ("strict unreferenced", "heuristically sensitive", "excluded from automatic selection"), recognizing pacman's inability to track external user scripts, compiled binaries, or manual workflows.
+  - Added heuristically sensitive caution tags (kernel, bootloaders, drivers, firmware, audio stack, compiler toolchains); tagged packages are safely excluded from auto-pruning while remaining selectable for informed manual review.
+- **Input Sanitization, Mutation Gates & Fail-Closed Safety**:
+  - Validated all manual operator selections against the scanned candidate set in both Gum and non-Gum interactive paths, preventing accidental removal of core packages through typos.
+  - Added pre-transaction read-only preview via `pacman -Rs --print` to display solver-calculated cascade removals before asking for final confirmation.
+  - Switched deletion engine from destructive `-Rns` to `-Rs`, preserving modified user configurations with `.pacsave` backups.
+  - Revalidated package candidate status and package manager lock/activity directly before mutating ALPM state, mitigating race conditions during interactive review.
+  - Fixed pacman query error handling: distinguishes between clean zero-orphan queries (exit 1 with empty stderr) and actual database/lock failures (exit code propagation and stderr reporting).
+  - Scoped all loop and user variables to `local` and pre-initialized associative array fields for `set -u` nounset resilience.
+- **Honest & Separately Confirmed Cache Maintenance**:
+  - Decoupled `paccache` uninstalled archive purging from package deletion: converted to an explicit, separately confirmed maintenance step with `paccache --dryrun --uninstalled --keep 0` preview.
+
 ## [2.25] - 2026-09-27
 
-### Fixed & Hardened (SRE Architectural Audit Priority 4 Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 4 Remediation)
 - **Universal Multi-Vendor Telemetry in Dynamic Flight Recorder (`run_dynamic_sample`)**:
   - Added native kernel sysfs fallback for AMD Radeon GPUs via `/sys/class/drm/card*/device/` (`gpu_busy_percent`, `mem_info_vram_used`, `mem_info_vram_total`, and GPU hwmon temperature), extending live sampling beyond NVIDIA rigs to AMD community users.
   - Implemented background ping process and temporary file lifecycle cleanup traps (`RETURN`, `INT`, `TERM`), preventing zombie ping processes and `/tmp` residues upon cancellation.
   - Hardened ping packet loss calculation (`awk -F'%' '{sub(/.*[ ,]/, "", $1); print $1+0}'`), resolving edge-case string misparsing that previously grabbed transmitted packet counts instead of actual loss.
   - Metric-aware gateway discovery with P2P VPN tunnel fallback (`1.1.1.1`) and multi-stage sysfs CPU temperature fallback (`coretemp`, `k10temp`, `zenpower`).
 
-### Fixed & Hardened (SRE Architectural Audit Priority 3 Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 3 Remediation)
 - **Multi-Route Metric Sorting & P2P Tunnel Tolerance (`check_network`)**:
   - Replaced crude single-line default route extraction with metric-aware evaluation (`awk ... | sort -n -k1,1`), accurately selecting the active primary route on multi-interface systems (e.g. wired Ethernet prioritized over Wi-Fi).
   - Added native support for point-to-point VPN and tunnel interfaces (`default dev wg0` / WireGuard, Tailscale, OpenVPN p2p) where no gateway IP exists, validating tunnel health via upstream DNS reachability instead of false route failures.
@@ -27,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added robust kernel version fallback (`uname -r >= 5.16`) for `futex_waitv` (fsync) when Python3 is unavailable or restricted.
   - Added fallback GPU name resolution from `vga_info` when `vulkaninfo` is not installed.
 
-### Fixed & Hardened (SRE Architectural Audit Priority 2B Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 2B Remediation)
 - **Universal Locale & Grammar Independence in Package Integrity (`check_package_integrity`)**:
   - Enforced `LC_ALL=C` across all `pacman -Qk` subshell queries, preventing localized output (e.g. Polish `brakujący plik`, German `fehlende Datei`) from blinding the audit engine on non-English desktop installations.
   - Corrected grammatical regex to match singular `1 missing file` as well as plural `N missing files` (`/[1-9][0-9]* missing file/`).
@@ -40,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Comprehensive Process Lock Detection (`check_pacman_lock`)**:
   - Expanded process detection regex to include `pikaur`, `makepkg`, and `eos-update`. Added `lsof` fallback when `fuser` (`psmisc`) is not installed.
 
-### Fixed & Hardened (SRE Architectural Audit Priority 2A Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 2A Remediation)
 - **Immediate Root Privilege Guardrail in Standalone Hub (`run_software_updates`)**:
   - Enforced an upfront non-root execution barrier (`EUID == 0`) at the very top of `run_software_updates()`, completely blocking discovery probes (`yay -Qua`, `uv self update`, `goose update`) from ever executing under `sudo` or as root.
   - Prevents root-owned cache contamination in `/root/.cache` and eliminates user home directory permission hijacking.
@@ -54,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Local DB Fallback for Partial Upgrade Risk (`check_partial_upgrade_risk`)**:
   - Added fallback evaluation using `pacman -Qu` when `checkupdates` (`pacman-contrib`) is unavailable, enabling immediate partial upgrade risk detection even without optional contrib utilities.
 
-### Fixed & Hardened (SRE Architectural Audit Priority 1 Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit Priority 1 Remediation)
 - **Universal Multi-Kernel & UKI Resolution Hardening (`_resolve_kernel_and_initramfs`)**:
   - Implemented boundary-safe regex matching (`^(.*[-_])?${pkgb}([-_.][0-9].*)?$`) for Unified Kernel Images (`.efi`), eliminating substring collisions where `arch-linux-lts.efi` or `linux-zen.efi` falsely matched plain `linux`.
   - Added multi-candidate path scanning across `/EFI/Linux`, `/EFI/BOOT`, and boot roots.
@@ -75,7 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Temporary File Lifecycle & Trap Cleanup (`run_guarded_upgrade`)**:
   - Registered `tmp_repo` and `tmp_aur` in the function's `RETURN` cleanup trap (`_cleanup_guarded_upgrade`), ensuring zero `/tmp` orphan residues even upon Ctrl+C interruption.
 
-### Fixed & Hardened (SRE Architectural Audit 2.20 Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit 2.20 Remediation)
 - **Elimination of Hybrid GPU Model-Driver Mismatch (`check_gpu` & `check_gpu_errors`)**:
   - Replaced crude single-line extraction with discrete PCI device block scanning (`lspci -k`).
   - Resolved fatal desynchronization on hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) where NVIDIA temperature was falsely assigned to an Intel GPU label.
@@ -98,7 +166,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.24] - 2026-09-27
 
-### Fixed & Hardened (SRE Architectural Audit 2.21/2.22 Remediation)
+### Fixed & Hardened (Luna SRE Architectural Audit 2.21/2.22 Remediation)
 - **Elimination of Arithmetic Expansion Syntax Trap in Orphan Audit (`check_orphan_packages`)**:
   - Replaced defective `$(( ... | wc -l ))` construct with isolated standard command output parsing via `mktemp`.
   - Disentangled genuine 0-orphan states (`exit 1` without stderr) from ALPM DB lock contention or query corruption (`WARN ⚠` upon non-empty stderr).
