@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.25](https://img.shields.io/badge/Version-2.25-orange.svg)](CHANGELOG.md)
+[![Version: 2.29](https://img.shields.io/badge/Version-2.29-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -32,7 +32,7 @@ A quick scan of community support forums reveals recurring pain points:
   1. `pacman -Qtd` flags all unrequired dependencies—including critical **optional dependencies** (`Optional For:`) that provide features in everyday applications (e.g., Dolphin losing video thumbnails, GIMP losing RAW plugins).
   2. It flags build toolchains (`rust`, `cargo`, `go`, `base-devel`, kernel headers) pulled during AUR compilations. Blindly removing them turns the next update into a 2-hour rebuild or breaks DKMS driver compilation.
   3. Purists overlook that `pacman -Rns` **does not purge downloaded package archives from the cache** (`/var/cache/pacman/pkg`)! The uninstalled software leaves dead `.pkg.tar.zst` files rotting on disk indefinitely.
-  `sys-health` eliminates this guesswork with an offline 3-tier safety classifier, 1-click explicit dependency protection (`pacman -D --asexplicit`), and an atomic Zero-Residue Cache Purge.
+  `sys-health` eliminates this guesswork with an offline 3-tier safety classifier, solver-calculated cascade previews, safe `.pacsave` preservation (`pacman -Rs`), 1-click explicit dependency protection (`pacman -D --asexplicit`), and separately confirmed cache maintenance.
 * **The dead laptop mid-upgrade disaster:** A kernel update interrupted by a dying battery is one of the quickest ways to corrupt an initramfs or filesystem. `sys-health` probes hardware ACPI power supplies and refuses heavy upgrades on battery power when charge is critically low (< 25%).
 
 ---
@@ -86,7 +86,7 @@ sys-health AI Session:
   * Pacman lockfile inspection with active process holder identification via `fuser`.
   * Ephemeral-filtered package integrity checking (`pacman -Qk`).
   * Unmerged configuration file detection (`.pacnew`).
-  * **Dynamic Mirrorlist Health & Latency Probe:** Interrogates all active `/etc/pacman.d/*mirrorlist*` topologies. Measures real-time TCP/TTFB latency to primary repositories (`curl`), detects dead or hanging primary mirrors (preventing package download socket timeouts), warns on cross-continental high latency (> 400ms), and audits mirrorlist redundancy and age.
+  * **Dynamic Mirrorlist Health & Latency Probe:** Interrogates active mirrorlist topologies resolved recursively from `pacman.conf` `Include =` directives (eliminating false readings from inactive files). Measures real-time TTFB latency to primary repositories (`curl`), natively accommodates local `file://` repositories, detects dead or hanging primary mirrors (preventing package download socket timeouts), warns on cross-continental high latency (> 400ms), and audits mirrorlist redundancy and age.
   * **Smart Arch News Correlator:** Proactively scrapes upstream Arch News with HTTP 429 rate-limiting resilience and local caching, correlating manual intervention advisories against locally installed packages (`pacman -Qq`) to eliminate false-positive alarm fatigue.
   * Official Arch Security Tracker (`arch-audit`) integration, separating actionable repository fixes from unclosed upstream backlog.
 
@@ -97,7 +97,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   2. *Laptop Battery Gate (Gate 0):* Detects ACPI battery power; refuses upgrades on discharging laptops below 25% battery.
   3. *Substrate & Mount Topology Gate (Gate 1):* Confirms ESP and `/boot` are mounted and writable; enforces safe disk margins (6 GB root, 4 GB pacman cache, 100 MB ESP).
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
-  5. *Network & Mirror Resilience Gate (Gate 3):* Verifies control-plane TLS/DNS connectivity, probes primary mirror reachability, and triggers smart self-healing ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) if the primary mirror is dead (preventing fatal 3102ms socket timeouts), if the mirrorlist is empty/corrupt, if cross-continental latency exceeds 800ms, or if lists are older than 30 days. Employs 100% dynamic universalism (zero hardcoded countries or regional bias) and atomic staging (`mktemp` + HTTP verification + `install`).
+  5. *Network & Mirror Resilience Gate (Gate 3):* Verifies control-plane TLS/DNS connectivity via a multi-endpoint high-availability fallback pool (`archlinux.org`, `1.1.1.1`, `cloudflare.com`), probes primary mirror reachability, and triggers smart self-healing ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) if the primary mirror is dead (preventing fatal socket timeouts), if the mirrorlist is empty/corrupt, if cross-continental latency exceeds 800ms, or if lists are older than 30 days. Employs 100% dynamic universalism across distribution ecosystems (Arch x86_64, EndeavourOS, CachyOS multi-file transactions, Manjaro, Artix, ALARM ARM-gate) with atomic staging and unique per-run backup rollback protection (`.sys-health-bak.$$.$RANDOM`).
   6. *Smart Arch News Correlator Gate (Gate 4):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
   7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants (e.g., legacy Maxwell GTX 970 vs modern drivers), kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
@@ -135,14 +135,15 @@ Bridges the gap for software installed outside distribution repositories:
   * **AUR Packages:** Filtered line-structure validation via `yay -Qua` or `paru -Qua`.
   * **Steam & Flatpak:** Differentiates self-managed game client runtimes and containerized apps.
 
-### 6. Dynamic Orphan Triage & Zero-Residue Purge Engine (`--orphans`, `-o`)
+### 6. Dynamic Orphan Triage & Package Safety Engine (`--orphans`, `-o`)
 Designed to demystify package maintenance and eliminate the operational hazards of blind orphan cleaning:
 * **3-Tier ALPM Safety Classification:** Interrogates local package metadata (`LC_ALL=C pacman -Qi`) in a single offline batch query (< 50ms):
-  * 🟢 **Tier 1 (Safe Leaves):** Truly unrequired leaf packages (`Optional For: None`). Safe to purge immediately without downstream effects.
-  * 🟡 **Tier 2 (Optional Dependencies):** Packages actively utilized as optional dependencies by installed software. Surfaces exact reverse dependencies (e.g. `dolphin`, `vlc`, `gimp`) so you never lose desktop features unexpectedly.
-  * 🔴 **Tier 3 (Core & Toolchain Safety Guard):** Regex-protected blacklist safeguarding kernel headers, firmware, GPU drivers, audio servers, fonts, and build toolchains (`base-devel`, `rust`, `cargo`, `go`, `gcc`, `make`, `dkms`).
-* **Atomic Zero-Residue Purge (Arch Wiki Standard):** Deleting packages via `pacman -Rns` leaves cached installation tarballs in `/var/cache/pacman/pkg`. `sys-health` automatically executes `paccache -c "$CacheDir" --remove --uninstalled --keep 0` immediately following orphan removal, ensuring 100% clean disk reclaim while preserving rollback versions for installed software.
-* **1-Click Explicit Protection (`--asexplicit`):** Users frequently use orphaned tools directly (e.g., `git`, `htop`, `rust`). Rather than deleting and reinstalling, `sys-health` allows marking them as explicitly installed (`sudo pacman -D --asexplicit`), permanently resolving recurring orphan alerts.
+  * 🟢 **Tier 1 (Strict Leaf Orphans):** Truly unreferenced packages (`pacman -Qdtq` set difference, `Optional For: None`). Selectable for removal.
+  * 🟡 **Tier 2 (Optional-Only Dependencies):** Packages actively utilized as optional dependencies by installed software (`pacman -Qdttq` set difference). Surfaces exact reverse dependencies (e.g. `dolphin`, `vlc`, `gimp`) so you never lose desktop features unexpectedly. Excluded from default batch removal.
+  * 🔴 **Tier 3 (Heuristically Sensitive Packages):** Flags critical system components (kernel headers, firmware, GPU drivers, audio servers, fonts, build toolchains). Excluded from automatic removal and tagged with cautionary warnings.
+* **Cascading Impact Preview & Safe Deletion (`pacman -Rs`):** Uses non-destructive `-Rs` (preserving user configs with `.pacsave`) and previews exact solver removal cascades (`pacman -Rs --print`) before prompting for confirmation.
+* **Separately Confirmed Cache Maintenance:** Cleanly decouples pacman package uninstallation from archive cache purging, offering an optional, explicitly previewed `paccache --uninstalled --keep 0` clean.
+* **1-Click Explicit Protection (`--asexplicit`):** Users frequently use unrequired tools directly (e.g., `git`, `htop`, `rust`). Rather than deleting and reinstalling, `sys-health` allows marking them as explicitly installed (`sudo pacman -D --asexplicit`), permanently resolving recurring orphan alerts.
 * **Pre-Flight Gate 2 Integration:** Non-intrusively notifies users during Guarded Upgrades if unrequired orphans are pending, preventing wasted download bandwidth and obsolete AUR rebuilds.
 
 ### 7. SRE Safe Maintenance & Deep Clean (`--maintenance`, `--deep-clean`)
@@ -151,7 +152,7 @@ Designed to demystify package maintenance and eliminate the operational hazards 
 * **Strict Shader Cache Blacklist:** Hardcoded blacklist permanently safeguarding graphics shader caches (`~/.nv`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, Steam shader pre-caches, DXVK caches), eliminating post-cleanup in-game stutter.
 * **Offline Rollback Lifeline:** Prunes package cache retaining the last 2 versions of installed packages, while retaining **at least 1 version of uninstalled packages** (`paccache -r -u -k 1`), preserving emergency offline rollback capabilities.
 * **FreeDesktop Trash & Journal Clean:** Native `gio trash --empty` and safe systemd journal vacuuming (> 30 days).
-* **On-Demand Regional Mirror Ranking:** Integrates 1-click regional mirror benchmarking and atomic ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) directly into the Safe Maintenance menu, allowing on-demand mirrorlist optimization without running a full upgrade.
+* **On-Demand Regional Mirror Ranking:** Integrates 1-click regional mirror benchmarking and atomic ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors` / `pacman-mirrors`) directly into the Safe Maintenance menu, with distribution-agnostic safety gates, multi-file CachyOS rollback coordination, and per-target transaction reporting (`UPDATED`, `FAILED`, `SKIPPED`).
 
 ---
 
@@ -261,7 +262,7 @@ SKIP_INTEGRITY=0
 ## Change Tracking & Roadmap
 
 * Detailed release history and version migration notes are maintained in [CHANGELOG.md](CHANGELOG.md).
-* Upcoming proposals, community backlog, and architectural discussions are tracked in [pending-patches.md](pending-patches.md).
+* Upcoming proposals, community backlog, and architectural discussions are tracked in [DEVELOPMENT_PROPOSALS.md](DEVELOPMENT_PROPOSALS.md) (also available as [pending-patches.md](pending-patches.md)).
 
 ---
 
