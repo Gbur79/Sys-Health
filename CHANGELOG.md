@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.28] - 2026-09-28
 
-### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Boot & Core OS Health Checks)
+### Fixed & Hardened (SRE Architectural Audit - Boot & Core OS Health Checks)
 - **Atomic Kernel & Initramfs Resolution (`_resolve_kernel_and_initramfs`)**:
   - Eliminated dangerous cross-filesystem and cross-entry coupling where a kernel on one boot root (e.g., `/boot`) could be paired with an initramfs on another (e.g., `/efi`), creating phantom boot configurations no bootloader entry could load.
   - Bound resolution into strictly indivisible records: BLS Type #1 entries require both kernel and initrd to resolve relative to the same entry root; traditional layouts require both artifacts to coexist under the identical boot directory; degraded fallback is restricted to a single candidate root.
@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.27] - 2026-09-28
 
-### Fixed & Hardened (Terra EOS-SRE Architectural Audit - System State Snapshot & Telemetry Engine)
+### Fixed & Hardened (SRE Architectural Audit - System State Snapshot & Telemetry Engine)
 - **Subshell Isolation, Timestamp Preservation & Injection Immunity (`refresh_state_snapshot` & `dump_software_state_snapshot`)**:
   - Resolved missing timestamp flaw in spinner execution mode: extracted snapshot generation into a dedicated top-level function (`dump_software_state_snapshot`) and safely passed timestamp and output destination via positional arguments (`"$1"`, `"$2"`), preventing subshell variable loss and unquoted shell string injection.
   - Eliminated global namespace pollution by removing nested function declarations inside callers.
@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.26] - 2026-09-28
 
-### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Orphan Package Triage & Safety Engine)
+### Fixed & Hardened (SRE Architectural Audit - Orphan Package Triage & Safety Engine)
 - **Dependency Classification & Optional-Only Reachability (`triage_orphan_packages`)**:
   - Resolved critical architectural flaw where Tier 2 (Yellow) was unreachable: partitioned candidates into strict orphans (`pacman -Qdtq`) and optional-only reverse dependencies (`pacman -Qdttq` set difference).
   - Replaced misleading "safe to purge", "protected", "pristine", and "zero-residue" claims with accurate SRE terminology ("strict unreferenced", "heuristically sensitive", "excluded from automatic selection"), recognizing pacman's inability to track external user scripts, compiled binaries, or manual workflows.
@@ -77,14 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.25] - 2026-09-27
 
-### Fixed & Hardened (Luna SRE Architectural Audit Priority 4 Remediation)
+### Fixed & Hardened (Architectural Audit Priority 4 Remediation)
 - **Universal Multi-Vendor Telemetry in Dynamic Flight Recorder (`run_dynamic_sample`)**:
   - Added native kernel sysfs fallback for AMD Radeon GPUs via `/sys/class/drm/card*/device/` (`gpu_busy_percent`, `mem_info_vram_used`, `mem_info_vram_total`, and GPU hwmon temperature), extending live sampling beyond NVIDIA rigs to AMD community users.
   - Implemented background ping process and temporary file lifecycle cleanup traps (`RETURN`, `INT`, `TERM`), preventing zombie ping processes and `/tmp` residues upon cancellation.
   - Hardened ping packet loss calculation (`awk -F'%' '{sub(/.*[ ,]/, "", $1); print $1+0}'`), resolving edge-case string misparsing that previously grabbed transmitted packet counts instead of actual loss.
   - Metric-aware gateway discovery with P2P VPN tunnel fallback (`1.1.1.1`) and multi-stage sysfs CPU temperature fallback (`coretemp`, `k10temp`, `zenpower`).
 
-### Fixed & Hardened (Luna SRE Architectural Audit Priority 3 Remediation)
+### Fixed & Hardened (SRE Architectural Audit Priority 3 Remediation)
 - **Multi-Route Metric Sorting & P2P Tunnel Tolerance (`check_network`)**:
   - Replaced crude single-line default route extraction with metric-aware evaluation (`awk ... | sort -n -k1,1`), accurately selecting the active primary route on multi-interface systems (e.g. wired Ethernet prioritized over Wi-Fi).
   - Added native support for point-to-point VPN and tunnel interfaces (`default dev wg0` / WireGuard, Tailscale, OpenVPN p2p) where no gateway IP exists, validating tunnel health via upstream DNS reachability instead of false route failures.
@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added robust kernel version fallback (`uname -r >= 5.16`) for `futex_waitv` (fsync) when Python3 is unavailable or restricted.
   - Added fallback GPU name resolution from `vga_info` when `vulkaninfo` is not installed.
 
-### Fixed & Hardened (Luna SRE Architectural Audit Priority 2B Remediation)
+### Fixed & Hardened (SRE Architectural Audit Priority 2B Remediation)
 - **Universal Locale & Grammar Independence in Package Integrity (`check_package_integrity`)**:
   - Enforced `LC_ALL=C` across all `pacman -Qk` subshell queries, preventing localized output (e.g. Polish `brakujący plik`, German `fehlende Datei`) from blinding the audit engine on non-English desktop installations.
   - Corrected grammatical regex to match singular `1 missing file` as well as plural `N missing files` (`/[1-9][0-9]* missing file/`).
@@ -108,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Comprehensive Process Lock Detection (`check_pacman_lock`)**:
   - Expanded process detection regex to include `pikaur`, `makepkg`, and `eos-update`. Added `lsof` fallback when `fuser` (`psmisc`) is not installed.
 
-### Fixed & Hardened (Luna SRE Architectural Audit Priority 2A Remediation)
+### Fixed & Hardened (SRE Architectural Audit Priority 2A Remediation)
 - **Immediate Root Privilege Guardrail in Standalone Hub (`run_software_updates`)**:
   - Enforced an upfront non-root execution barrier (`EUID == 0`) at the very top of `run_software_updates()`, completely blocking discovery probes (`yay -Qua`, `uv self update`, `goose update`) from ever executing under `sudo` or as root.
   - Prevents root-owned cache contamination in `/root/.cache` and eliminates user home directory permission hijacking.
@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Local DB Fallback for Partial Upgrade Risk (`check_partial_upgrade_risk`)**:
   - Added fallback evaluation using `pacman -Qu` when `checkupdates` (`pacman-contrib`) is unavailable, enabling immediate partial upgrade risk detection even without optional contrib utilities.
 
-### Fixed & Hardened (Luna SRE Architectural Audit Priority 1 Remediation)
+### Fixed & Hardened (SRE Architectural Audit Priority 1 Remediation)
 - **Universal Multi-Kernel & UKI Resolution Hardening (`_resolve_kernel_and_initramfs`)**:
   - Implemented boundary-safe regex matching (`^(.*[-_])?${pkgb}([-_.][0-9].*)?$`) for Unified Kernel Images (`.efi`), eliminating substring collisions where `arch-linux-lts.efi` or `linux-zen.efi` falsely matched plain `linux`.
   - Added multi-candidate path scanning across `/EFI/Linux`, `/EFI/BOOT`, and boot roots.
@@ -143,7 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Temporary File Lifecycle & Trap Cleanup (`run_guarded_upgrade`)**:
   - Registered `tmp_repo` and `tmp_aur` in the function's `RETURN` cleanup trap (`_cleanup_guarded_upgrade`), ensuring zero `/tmp` orphan residues even upon Ctrl+C interruption.
 
-### Fixed & Hardened (Luna SRE Architectural Audit 2.20 Remediation)
+### Fixed & Hardened (SRE Architectural Audit 2.20 Remediation)
 - **Elimination of Hybrid GPU Model-Driver Mismatch (`check_gpu` & `check_gpu_errors`)**:
   - Replaced crude single-line extraction with discrete PCI device block scanning (`lspci -k`).
   - Resolved fatal desynchronization on hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) where NVIDIA temperature was falsely assigned to an Intel GPU label.
@@ -166,7 +166,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.24] - 2026-09-27
 
-### Fixed & Hardened (Luna SRE Architectural Audit 2.21/2.22 Remediation)
+### Fixed & Hardened (SRE Architectural Audit 2.21/2.22 Remediation)
 - **Elimination of Arithmetic Expansion Syntax Trap in Orphan Audit (`check_orphan_packages`)**:
   - Replaced defective `$(( ... | wc -l ))` construct with isolated standard command output parsing via `mktemp`.
   - Disentangled genuine 0-orphan states (`exit 1` without stderr) from ALPM DB lock contention or query corruption (`WARN ⚠` upon non-empty stderr).
