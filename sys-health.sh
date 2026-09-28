@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.28"
+VERSION="2.29"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2259,8 +2259,20 @@ triage_orphan_packages() {
 
 # ==============================================================================
 # Dynamic Mirror Topology Discovery & Primary Probe Engine
-# 100% Portable & Agnostic across all Arch-based distributions
+# 100% Universal & Distribution-Agnostic across all Arch-based ecosystems
 # ==============================================================================
+
+_probe_network_control_plane() {
+    # Returns 0 if external network reachability is verified, 1 if offline/DNS failure
+    command -v curl &>/dev/null || return 1
+    local endpoint
+    for endpoint in "https://archlinux.org" "https://1.1.1.1" "https://cloudflare.com"; do
+        if curl -fsSIL --connect-timeout 2 --max-time 3 "$endpoint" &>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 discover_active_mirrorlists() {
     local conf="${PACMAN_CONF:-/etc/pacman.conf}"
@@ -2269,56 +2281,74 @@ discover_active_mirrorlists() {
 
     local -a files=()
     local -A seen=()
+    local -A seen_configs=()
 
-    # 1. Parse active Include directives from pacman.conf
-    if [[ -f "$conf" ]]; then
-        local inc_pattern inc_f
-        while IFS= read -r inc_pattern; do
-            [[ -z "$inc_pattern" ]] && continue
-            [[ "$inc_pattern" != /* ]] && inc_pattern="${conf_dir}/${inc_pattern}"
+    # Recursive parser for active Include directives in pacman configuration
+    _parse_pacman_includes() {
+        local cur_conf="$1"
+        [[ -f "$cur_conf" ]] || return 0
+        local real_c
+        real_c="$(realpath "$cur_conf" 2>/dev/null || echo "$cur_conf")"
+        [[ -n "${seen_configs[$real_c]:-}" ]] && return 0
+        seen_configs["$real_c"]=1
 
-            for inc_f in $inc_pattern; do
-                [[ -f "$inc_f" ]] || continue
-                if [[ -z "${seen[$inc_f]:-}" ]]; then
-                    files+=("$inc_f")
-                    seen["$inc_f"]=1
+        local cur_dir
+        cur_dir="$(dirname "$real_c")"
+
+        local inc_line
+        while IFS= read -r inc_line; do
+            [[ -z "$inc_line" ]] && continue
+            [[ "$inc_line" != /* ]] && inc_line="${cur_dir}/${inc_line}"
+
+            local -a matched=()
+            local prev_nullglob
+            prev_nullglob="$(shopt -p nullglob || true)"
+            shopt -s nullglob
+            # shellcheck disable=SC2206
+            matched=( $inc_line )
+            eval "$prev_nullglob"
+
+            local target
+            for target in "${matched[@]}"; do
+                [[ -f "$target" ]] || continue
+                local real_target
+                real_target="$(realpath "$target" 2>/dev/null || echo "$target")"
+
+                # If target contains Server = directives, it is an active mirrorlist
+                if grep -qE '^[[:space:]]*Server[[:space:]]*=' "$target" 2>/dev/null; then
+                    if [[ -z "${seen[$real_target]:-}" ]]; then
+                        files+=("$target")
+                        seen["$real_target"]=1
+                    fi
+                fi
+
+                # If target contains nested Include directives, recurse
+                if grep -qE '^[[:space:]]*Include[[:space:]]*=' "$target" 2>/dev/null; then
+                    _parse_pacman_includes "$target"
                 fi
             done
         done < <(awk '
             /^[[:space:]]*#/ { next }
             /^[[:space:]]*Include[[:space:]]*=/ {
                 sub(/^[^=]*=[[:space:]]*/, "", $0)
-                sub(/[[:space:]]+#.*$/, "", $0)
+                sub(/[[:space:]]+$/, "", $0)
                 if (length($0) > 0) print
             }
-        ' "$conf" 2>/dev/null || true)
-    fi
+        ' "$cur_conf" 2>/dev/null || true)
+    }
 
-    # 2. Discover any additional mirrorlists in pacman.d directory
-    local pacman_d="${conf_dir}/pacman.d"
-    [[ ! -d "$pacman_d" && -d /etc/pacman.d ]] && pacman_d="/etc/pacman.d"
+    _parse_pacman_includes "$conf"
 
-    if [[ -d "$pacman_d" ]]; then
-        local d_f
-        while IFS= read -r d_f; do
-            [[ -f "$d_f" ]] || continue
-            if [[ -z "${seen[$d_f]:-}" ]]; then
-                files+=("$d_f")
-                seen["$d_f"]=1
-            fi
-        done < <(find "$pacman_d" -maxdepth 1 -type f -name '*mirrorlist*' ! -name '*.bak*' ! -name '*.pacnew*' ! -name '*.pacsave*' ! -name '*.old*' 2>/dev/null | sort || true)
-    fi
-
-    # 3. Sort: prioritize standard Arch mirrorlist (/etc/pacman.d/mirrorlist) first if present
+    # Prioritize base mirrorlist (/etc/pacman.d/mirrorlist or */mirrorlist) first if present
     local -a sorted=()
+    local f
     for f in "${files[@]}"; do
-        if [[ "$f" == "$pacman_d/mirrorlist" || "$f" == "/etc/pacman.d/mirrorlist" ]]; then
+        if [[ "$f" == */mirrorlist ]]; then
             sorted+=("$f")
-            break
         fi
     done
     for f in "${files[@]}"; do
-        [[ "$f" == "$pacman_d/mirrorlist" || "$f" == "/etc/pacman.d/mirrorlist" ]] && continue
+        [[ "$f" == */mirrorlist ]] && continue
         sorted+=("$f")
     done
 
@@ -2329,21 +2359,25 @@ discover_active_mirrorlists() {
 
 probe_primary_mirror() {
     # Returns: "PRIMARY_URL|HTTP_CODE|TIME_MS|REPO_NAME"
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local conf_opt=()
+    [[ -f "$conf" ]] && conf_opt=(-c "$conf")
+
     local target_repo="core"
     local primary_url=""
 
     if command -v pacman-conf &>/dev/null; then
         local -a repos=()
-        mapfile -t repos < <(pacman-conf --repo-list 2>/dev/null || true)
+        mapfile -t repos < <(pacman-conf "${conf_opt[@]}" --repo-list 2>/dev/null || true)
         if [[ " ${repos[*]} " =~ [[:space:]]core[[:space:]] ]]; then
             target_repo="core"
         elif (( ${#repos[@]} > 0 )); then
             target_repo="${repos[0]}"
         fi
-        primary_url="$(pacman-conf -r "$target_repo" Server 2>/dev/null | head -n 1 || true)"
+        primary_url="$(pacman-conf "${conf_opt[@]}" -r "$target_repo" Server 2>/dev/null | head -n 1 || true)"
     fi
 
-    # Fallback to scanning discovered mirrorlists if pacman-conf returned nothing
+    # Fallback to discovered mirrorlists if pacman-conf returned nothing
     if [[ -z "$primary_url" ]]; then
         local mfile=""
         while IFS= read -r mfile; do
@@ -2352,6 +2386,11 @@ probe_primary_mirror() {
                 primary_url="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$mfile" 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
                 local arch_name
                 arch_name="$(uname -m)"
+                local base_m
+                base_m="$(basename "$mfile")"
+                base_m="${base_m%-mirrorlist}"
+                base_m="${base_m#mirrorlist}"
+                [[ -n "$base_m" && "$base_m" != "arch" ]] && target_repo="$base_m"
                 primary_url="${primary_url//\$repo/$target_repo}"
                 primary_url="${primary_url//\$arch/$arch_name}"
                 break
@@ -2364,21 +2403,34 @@ probe_primary_mirror() {
         return 1
     fi
 
+    # Handle local file:// repositories
+    if [[ "$primary_url" == file://* ]]; then
+        local local_path="${primary_url#file://}"
+        if [[ -f "${local_path%/}/${target_repo}.db" || -d "$local_path" ]]; then
+            echo "$primary_url|200|1|$target_repo"
+            return 0
+        else
+            echo "$primary_url|404|1|$target_repo"
+            return 1
+        fi
+    fi
+
     if ! command -v curl &>/dev/null; then
         echo "$primary_url|NA|NA|$target_repo"
-        return 0
+        return 1
     fi
 
-    local probe_res="" http_code="000" time_conn="0" time_ms=0
-    if probe_res="$(curl -s -o /dev/null -w "%{http_code}|%{time_connect}" --connect-timeout 3 --max-time 4 "${primary_url%/}/${target_repo}.db" 2>/dev/null)"; then
+    local probe_res="" http_code="000" time_transfer="0" time_ms=0
+    # Probe target repository database with redirect following (-L) and measure TTFB (time_starttransfer)
+    if probe_res="$(curl -s -L -o /dev/null -w "%{http_code}|%{time_starttransfer}" --connect-timeout 3 --max-time 5 "${primary_url%/}/${target_repo}.db" 2>/dev/null)"; then
         http_code="${probe_res%%|*}"
-        time_conn="${probe_res##*|}"
+        time_transfer="${probe_res##*|}"
     else
         http_code="000"
-        time_conn="0"
+        time_transfer="0"
     fi
 
-    if [[ "$time_conn" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+    if [[ "$time_transfer" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
         local s_sec="${BASH_REMATCH[1]}"
         local s_frac="${BASH_REMATCH[2]}"
         s_frac="${s_frac#"${s_frac%%[!0]*}"}"
@@ -2387,16 +2439,148 @@ probe_primary_mirror() {
     fi
 
     echo "$primary_url|$http_code|$time_ms|$target_repo"
+
+    if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
-# ==============================================================================
-# Dynamic Regional Mirror Benchmark & Staged Ranking Engine
-# Universal, Agnostic & Atomic (Reflector / Rate-Mirrors / EOS-Rankmirrors)
-# ==============================================================================
+_validate_mirrorlist_content() {
+    local staged_file="$1"
+    local target_repo="$2"
+    local arch_name="${3:-$(uname -m)}"
+    local min_servers="${4:-1}"
+
+    [[ -s "$staged_file" ]] || return 1
+
+    local valid_servers
+    valid_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$staged_file" 2>/dev/null || echo 0)"
+    if (( valid_servers < min_servers )); then
+        return 2
+    fi
+
+    # Reachability gate: Probe top candidate servers
+    if ! command -v curl &>/dev/null; then
+        return 0
+    fi
+
+    local -a candidates=()
+    mapfile -t candidates < <(grep -E '^[[:space:]]*Server[[:space:]]*=' "$staged_file" 2>/dev/null | head -n 3 | awk '{print $3}' || true)
+
+    local cand_url tested_ok=false
+    for cand_url in "${candidates[@]}"; do
+        [[ -z "$cand_url" ]] && continue
+        cand_url="${cand_url//\$repo/$target_repo}"
+        cand_url="${cand_url//\$arch/$arch_name}"
+
+        if [[ "$cand_url" == file://* ]]; then
+            local lpath="${cand_url#file://}"
+            if [[ -f "${lpath%/}/${target_repo}.db" || -d "$lpath" ]]; then
+                tested_ok=true
+                break
+            fi
+            continue
+        fi
+
+        if curl -fsSIL --connect-timeout 3 --max-time 5 "${cand_url%/}/${target_repo}.db" &>/dev/null; then
+            tested_ok=true
+            break
+        elif curl -fsSIL --connect-timeout 3 --max-time 5 "$cand_url" &>/dev/null; then
+            tested_ok=true
+            break
+        fi
+    done
+
+    if $tested_ok; then
+        return 0
+    else
+        return 3
+    fi
+}
+
+_apply_staged_mirrorlist() {
+    local staged_file="$1"
+    local target_file="$2"
+    local target_name="${3:-$(basename "$target_file")}"
+
+    if [[ ! -s "$staged_file" ]]; then
+        fail "Internal error: Staged mirrorlist for $target_name is missing or empty."
+        return 1
+    fi
+
+    # 1. Concurrency Gate: Check for active pacman transaction lock
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local db_path="/var/lib/pacman"
+    if command -v pacman-conf &>/dev/null; then
+        db_path="$(pacman-conf ${conf:+-c "$conf"} DBPath 2>/dev/null || echo /var/lib/pacman)"
+    fi
+    if [[ -f "${db_path%/}/db.lck" ]]; then
+        fail "Cannot update $target_name: pacman database is locked (${db_path%/}/db.lck)."
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=pacman_locked"
+        return 1
+    fi
+
+    # 2. Privilege Gate: Verify sudo authorization
+    if (( EUID != 0 )); then
+        if ! sudo -v 2>/dev/null; then
+            fail "Sudo authentication required to update $target_file."
+            log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=sudo_auth_failed"
+            return 1
+        fi
+    fi
+
+    # 3. Unique Safety Backup: Record per-run backup with guaranteed rollback
+    local backup_file="${target_file}.sys-health-bak.$$.${RANDOM}"
+    local backup_created=false
+    if [[ -f "$target_file" ]]; then
+        if sudo cp -a "$target_file" "$backup_file" 2>/dev/null; then
+            backup_created=true
+        else
+            fail "Failed to create atomic safety backup for $target_name ($backup_file). Mutation aborted."
+            log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=backup_failed"
+            return 1
+        fi
+    fi
+
+    # 4. Atomic Installation
+    if ! sudo install -m 644 "$staged_file" "$target_file" 2>/dev/null; then
+        fail "Failed to install staged mirrorlist into $target_file."
+        if $backup_created; then
+            sudo cp -a "$backup_file" "$target_file" 2>/dev/null || true
+            sudo rm -f "$backup_file" 2>/dev/null || true
+        fi
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=install_failed"
+        return 1
+    fi
+
+    # 5. Post-Installation Verification Gate
+    local target_servers=0
+    target_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$target_file" 2>/dev/null || echo 0)"
+    if (( target_servers == 0 )); then
+        fail "Post-install verification failed for $target_name (0 valid servers found). Rolling back..."
+        if $backup_created; then
+            sudo cp -a "$backup_file" "$target_file" 2>/dev/null || true
+            sudo rm -f "$backup_file" 2>/dev/null || true
+        fi
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=post_verify_empty"
+        return 1
+    fi
+
+    # 6. Transaction Success: Safely clean up unique backup
+    if $backup_created; then
+        sudo rm -f "$backup_file" 2>/dev/null || true
+    fi
+
+    ok "$target_name mirrorlist staged, verified ($target_servers servers), and updated."
+    log "MAINTENANCE mirrorlist_update=success target=$target_name servers=$target_servers"
+    return 0
+}
 
 refresh_and_rank_mirrors() {
     local interactive="${1:-1}"
-    if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
+    if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
         ui_screen "Regional Mirror Benchmark & Ranking"
     else
         section "REGIONAL REPOSITORY MIRROR RANKING"
@@ -2404,175 +2588,335 @@ refresh_and_rank_mirrors() {
 
     # Step 1: Detect network reachability & curl availability
     if ! command -v curl &>/dev/null; then
-        warn "curl is not installed; cannot verify network reachability or benchmark mirrors."
+        fail "curl is not installed; cannot verify network reachability or benchmark mirrors."
         return 1
     fi
 
-    if ! curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
-        fail "Cannot reach Arch Linux network infrastructure (offline or DNS failure). Mirror ranking aborted."
+    # Dynamic Network Gate: Probes primary repository first, falls back to resilient HA endpoints
+    local net_ok=false
+    if probe_primary_mirror &>/dev/null; then
+        net_ok=true
+    elif _probe_network_control_plane; then
+        net_ok=true
+    fi
+
+    if ! $net_ok; then
+        fail "Cannot reach repository network infrastructure (offline or DNS failure). Mirror ranking aborted."
+        log "MAINTENANCE mirrorlist_refresh=aborted reason=network_unreachable"
         return 1
     fi
 
+    # Step 2: Distribution, Architecture & Repository Profile Detection
+    local arch_cpu os_id="" os_like=""
+    arch_cpu="$(uname -m)"
+    if [[ -f /etc/os-release ]]; then
+        os_id="$(grep -E '^ID=' /etc/os-release 2>/dev/null | head -n 1 | cut -d'=' -f2 | tr -d '"'"'" || true)"
+        os_like="$(grep -E '^ID_LIKE=' /etc/os-release 2>/dev/null | head -n 1 | cut -d'=' -f2 | tr -d '"'"'" || true)"
+    fi
+
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local -a configured_repos=()
+    if command -v pacman-conf &>/dev/null; then
+        mapfile -t configured_repos < <(pacman-conf ${conf:+-c "$conf"} -l 2>/dev/null || true)
+    fi
+
+    # Preflight sudo authorization once if needed
+    if (( EUID != 0 )); then
+        if ! sudo -v; then
+            fail "Sudo authentication cancelled or failed. Mirror ranking aborted."
+            return 1
+        fi
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sys-health-mirrors.XXXXXX")"
+    _cleanup_mirrors() { rm -rf "$tmp_dir"; }
+    local prev_trap
+    prev_trap="$(trap -p RETURN || true)"
+    trap '_cleanup_mirrors' RETURN
+
+    local -A target_status=()
     local arch_mfile="/etc/pacman.d/mirrorlist"
     local eos_mfile="/etc/pacman.d/endeavouros-mirrorlist"
-    local arch_updated=false eos_updated=false
-    local tmp_mfile
-    tmp_mfile="$(mktemp "${TMPDIR:-/tmp}/mirrorlist.XXXXXX")"
-    trap 'rm -f "$tmp_mfile"' RETURN
-
-    # 1. Arch Linux Mirrors
-    if [[ -f "$arch_mfile" ]]; then
-        info "Evaluating available ranking engines for Arch Linux mirrors..."
-
-        local ranker=""
-        if command -v rate-mirrors &>/dev/null; then
-            ranker="rate-mirrors"
-        elif command -v reflector &>/dev/null; then
-            ranker="reflector"
-        fi
-
-        if [[ -z "$ranker" ]]; then
-            warn "Neither 'rate-mirrors' nor 'reflector' was found on your system."
-            warn "Install 'reflector' (sudo pacman -S reflector) to benchmark and rank mirrors."
-        elif [[ "$ranker" == "rate-mirrors" ]]; then
-            if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
-                gum spin --title "Benchmarking & ranking fastest worldwide mirrors with rate-mirrors..." -- \
-                    bash -c "rate-mirrors --protocol https arch > '$tmp_mfile'" || true
-            else
-                info "Benchmarking & ranking fastest mirrors with rate-mirrors..."
-                rate-mirrors --protocol https arch > "$tmp_mfile" 2>/dev/null || true
-            fi
-        elif [[ "$ranker" == "reflector" ]]; then
-            local ref_conf="/etc/xdg/reflector/reflector.conf"
-            local ref_ran=false
-
-            # Check if user has an active reflector.conf (using standard @ syntax for python-argparse)
-            if [[ -f "$ref_conf" ]]; then
-                if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
-                    if gum spin --title "Ranking Arch Linux mirrors using /etc/xdg/reflector/reflector.conf..." -- \
-                        reflector @"$ref_conf" --save "$tmp_mfile"; then
-                        ref_ran=true
-                    fi
-                else
-                    if reflector @"$ref_conf" --save "$tmp_mfile" 2>/dev/null; then
-                        ref_ran=true
-                    fi
-                fi
-            fi
-
-            # Dynamic Universalism: Test the latest 20 synchronized HTTPS mirrors worldwide,
-            # benchmark connection/download speeds, select the fastest 10. NO HARDCODED COUNTRIES!
-            if ! $ref_ran; then
-                if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
-                    gum spin --title "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide..." -- \
-                        reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_mfile" || true
-                else
-                    info "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide with reflector..."
-                    reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_mfile" 2>/dev/null || true
-                fi
-            fi
-        fi
-
-        # Atomic Staging Gate: Validate generated mirrorlist before touching /etc/pacman.d/mirrorlist
-        local valid_servers=0
-        if [[ -s "$tmp_mfile" ]]; then
-            valid_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$tmp_mfile" 2>/dev/null || echo 0)"
-        fi
-
-        if (( valid_servers >= 3 )); then
-            # Test that the top mirror in the generated file is actually reachable
-            local first_srv arch_name
-            arch_name="$(uname -m)"
-            first_srv="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$tmp_mfile" | head -n 1 | awk '{print $3}' || true)"
-            first_srv="${first_srv//\$repo/core}"
-            first_srv="${first_srv//\$arch/$arch_name}"
-
-            if curl -Ism 4 "${first_srv%/}/core.db" 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
-                sudo cp -a "$arch_mfile" "${arch_mfile}.bak" 2>/dev/null || true
-                sudo install -m 644 "$tmp_mfile" "$arch_mfile"
-                ok "Arch Linux mirrorlist staged, verified ($valid_servers servers), and updated."
-                log "MAINTENANCE mirrorlist_refresh=success target=arch servers=$valid_servers"
-                arch_updated=true
-            else
-                warn "Validation probe failed on ranked primary mirror ($first_srv); keeping existing mirrorlist."
-                log "MAINTENANCE mirrorlist_refresh=failed reason=primary_unreachable"
-            fi
-        else
-            warn "Ranking did not produce sufficient valid servers ($valid_servers found); existing mirrorlist kept."
-            log "MAINTENANCE mirrorlist_refresh=failed reason=insufficient_servers count=$valid_servers"
-        fi
-        rm -f "$tmp_mfile"
-    fi
-
-    # 2. EndeavourOS Mirrors (if present on system)
-    if [[ -f "$eos_mfile" ]]; then
-        if command -v eos-rankmirrors &>/dev/null; then
-            sudo cp -a "$eos_mfile" "${eos_mfile}.bak" 2>/dev/null || true
-            if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
-                if gum spin --title "Ranking EndeavourOS mirrors with eos-rankmirrors..." -- sudo eos-rankmirrors --timeout 4; then
-                    ok "EndeavourOS mirrorlist refreshed."
-                    log "MAINTENANCE mirrorlist_refresh=success target=endeavouros"
-                    eos_updated=true
-                else
-                    sudo cp -a "${eos_mfile}.bak" "$eos_mfile" 2>/dev/null || true
-                    warn "eos-rankmirrors failed; restored previous EndeavourOS mirrorlist."
-                    log "MAINTENANCE mirrorlist_refresh=failed target=endeavouros"
-                fi
-            else
-                if sudo eos-rankmirrors --timeout 4 2>/dev/null; then
-                    ok "EndeavourOS mirrorlist refreshed."
-                    log "MAINTENANCE mirrorlist_refresh=success target=endeavouros"
-                    eos_updated=true
-                else
-                    sudo cp -a "${eos_mfile}.bak" "$eos_mfile" 2>/dev/null || true
-                    warn "eos-rankmirrors failed; restored previous EndeavourOS mirrorlist."
-                    log "MAINTENANCE mirrorlist_refresh=failed target=endeavouros"
-                fi
-            fi
-        fi
-    fi
-
-    # 3. CachyOS Mirrors (if present on system)
     local cachy_mfile="/etc/pacman.d/cachyos-mirrorlist"
-    local cachy_updated=false
-    if [[ -f "$cachy_mfile" ]] && command -v cachyos-rate-mirrors &>/dev/null; then
-        sudo cp -a "$cachy_mfile" "${cachy_mfile}.bak" 2>/dev/null || true
-        if (( interactive == 1 )) && [[ -t 1 ]] && command -v gum &>/dev/null; then
-            if gum spin --title "Ranking CachyOS mirrors with cachyos-rate-mirrors..." -- sudo cachyos-rate-mirrors; then
-                ok "CachyOS mirrorlist refreshed."
-                log "MAINTENANCE mirrorlist_refresh=success target=cachyos"
-                cachy_updated=true
+
+    # --------------------------------------------------------------------------
+    # Adapter 1: CachyOS (Multi-File Coordinated Transaction)
+    # Note: cachyos-rate-mirrors natively updates both cachyos and arch mirrorlists.
+    # --------------------------------------------------------------------------
+    local cachy_handled=false
+    if [[ -f "$cachy_mfile" || " ${configured_repos[*]} " =~ [[:space:]]cachyos ]]; then
+        if command -v cachyos-rate-mirrors &>/dev/null; then
+            info "CachyOS environment detected. Executing coordinated cachyos-rate-mirrors..."
+            local c_bak="${cachy_mfile}.sys-health-bak.$$.${RANDOM}"
+            local a_bak="${arch_mfile}.sys-health-bak.$$.${RANDOM}"
+            local c_bak_ok=false a_bak_ok=false
+
+            [[ -f "$cachy_mfile" ]] && sudo cp -a "$cachy_mfile" "$c_bak" 2>/dev/null && c_bak_ok=true
+            [[ -f "$arch_mfile" ]] && sudo cp -a "$arch_mfile" "$a_bak" 2>/dev/null && a_bak_ok=true
+
+            local c_ran=false
+            if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                if gum spin --title "Benchmarking & ranking mirrors with cachyos-rate-mirrors..." -- sudo cachyos-rate-mirrors; then
+                    c_ran=true
+                fi
             else
-                sudo cp -a "${cachy_mfile}.bak" "$cachy_mfile" 2>/dev/null || true
-                warn "cachyos-rate-mirrors failed; restored previous CachyOS mirrorlist."
-                log "MAINTENANCE mirrorlist_refresh=failed target=cachyos"
+                if sudo cachyos-rate-mirrors 2>"$tmp_dir/cachy.err"; then
+                    c_ran=true
+                fi
             fi
-        else
-            if sudo cachyos-rate-mirrors 2>/dev/null; then
-                ok "CachyOS mirrorlist refreshed."
-                log "MAINTENANCE mirrorlist_refresh=success target=cachyos"
-                cachy_updated=true
+
+            if $c_ran; then
+                $c_bak_ok && sudo rm -f "$c_bak" 2>/dev/null || true
+                $a_bak_ok && sudo rm -f "$a_bak" 2>/dev/null || true
+                ok "CachyOS & Arch Linux mirrorlists refreshed via cachyos-rate-mirrors."
+                target_status["CachyOS"]="UPDATED"
+                target_status["Arch Linux"]="UPDATED"
+                cachy_handled=true
             else
-                sudo cp -a "${cachy_mfile}.bak" "$cachy_mfile" 2>/dev/null || true
-                warn "cachyos-rate-mirrors failed; restored previous CachyOS mirrorlist."
-                log "MAINTENANCE mirrorlist_refresh=failed target=cachyos"
+                $c_bak_ok && sudo cp -a "$c_bak" "$cachy_mfile" 2>/dev/null && sudo rm -f "$c_bak" 2>/dev/null || true
+                $a_bak_ok && sudo cp -a "$a_bak" "$arch_mfile" 2>/dev/null && sudo rm -f "$a_bak" 2>/dev/null || true
+                warn "cachyos-rate-mirrors failed; restored previous configuration."
+                target_status["CachyOS"]="FAILED"
+                cachy_handled=true
             fi
+        elif [[ -f "$cachy_mfile" ]]; then
+            target_status["CachyOS"]="SKIPPED (cachyos-rate-mirrors not installed)"
         fi
     fi
 
-    if $arch_updated || $eos_updated || $cachy_updated; then
-        echo ""
+    # --------------------------------------------------------------------------
+    # Adapter 2: EndeavourOS Mirrorlist
+    # --------------------------------------------------------------------------
+    if [[ -f "$eos_mfile" || " ${configured_repos[*]} " =~ [[:space:]]endeavouros[[:space:]] ]]; then
+        info "Evaluating ranking engines for EndeavourOS mirrors..."
+        local tmp_eos="$tmp_dir/endeavouros-mirrorlist"
+        local eos_gen_ok=false
+
+        if command -v eos-rankmirrors &>/dev/null; then
+            if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                gum spin --title "Benchmarking & ranking EndeavourOS mirrors..." -- \
+                    bash -c "eos-rankmirrors -n --timeout 4 > '$tmp_eos' 2> '$tmp_dir/eos.err'" || true
+            else
+                info "Benchmarking EndeavourOS mirrors with eos-rankmirrors..."
+                eos-rankmirrors -n --timeout 4 > "$tmp_eos" 2> "$tmp_dir/eos.err" || true
+            fi
+            [[ -s "$tmp_eos" ]] && eos_gen_ok=true
+        elif command -v rate-mirrors &>/dev/null; then
+            if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                gum spin --title "Benchmarking EndeavourOS mirrors with rate-mirrors..." -- \
+                    rate-mirrors --protocol https --save="$tmp_eos" endeavouros || true
+            else
+                rate-mirrors --protocol https --save="$tmp_eos" endeavouros 2>"$tmp_dir/eos.err" || true
+            fi
+            [[ -s "$tmp_eos" ]] && eos_gen_ok=true
+        else
+            target_status["EndeavourOS"]="SKIPPED (neither eos-rankmirrors nor rate-mirrors installed)"
+            warn "EndeavourOS mirrorlist present, but no ranking tool found."
+        fi
+
+        if $eos_gen_ok; then
+            local v_rc=0
+            _validate_mirrorlist_content "$tmp_eos" "endeavouros" "$arch_cpu" 1 || v_rc=$?
+            if (( v_rc == 0 )); then
+                if _apply_staged_mirrorlist "$tmp_eos" "$eos_mfile" "EndeavourOS"; then
+                    target_status["EndeavourOS"]="UPDATED"
+                else
+                    target_status["EndeavourOS"]="FAILED"
+                fi
+            elif (( v_rc == 2 )); then
+                warn "EndeavourOS ranking produced insufficient valid servers; keeping existing mirrorlist."
+                target_status["EndeavourOS"]="FAILED (insufficient servers)"
+            else
+                warn "EndeavourOS validation probe failed on generated mirrors; keeping existing mirrorlist."
+                target_status["EndeavourOS"]="FAILED (validation failed)"
+            fi
+        elif [[ -z "${target_status["EndeavourOS"]:-}" ]]; then
+            warn "EndeavourOS mirror ranking process produced no valid output."
+            target_status["EndeavourOS"]="FAILED"
+        fi
+    fi
+
+    # --------------------------------------------------------------------------
+    # Adapter 3: Arch Linux / Distribution Base Mirrorlist
+    # Guard against applying Arch rankers to ARM, Manjaro, Artix, or when handled by CachyOS
+    # --------------------------------------------------------------------------
+    if [[ -f "$arch_mfile" ]] && ! $cachy_handled; then
+        local tmp_arch="$tmp_dir/arch-mirrorlist"
+        local arch_gen_ok=false
+
+        if [[ "$os_id" =~ (manjaro) || "$os_like" =~ (manjaro) ]]; then
+            # Manjaro Distribution Gate
+            info "Manjaro distribution detected for $arch_mfile..."
+            if command -v pacman-mirrors &>/dev/null; then
+                local m_bak="${arch_mfile}.sys-health-bak.$$.${RANDOM}"
+                local m_bak_ok=false
+                sudo cp -a "$arch_mfile" "$m_bak" 2>/dev/null && m_bak_ok=true
+                local m_ran=false
+                if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                    if gum spin --title "Ranking Manjaro mirrors with pacman-mirrors..." -- sudo pacman-mirrors -f 5; then
+                        m_ran=true
+                    fi
+                else
+                    if sudo pacman-mirrors -f 5 2>"$tmp_dir/manjaro.err"; then
+                        m_ran=true
+                    fi
+                fi
+                if $m_ran; then
+                    $m_bak_ok && sudo rm -f "$m_bak" 2>/dev/null || true
+                    ok "Manjaro mirrorlist ranked successfully."
+                    target_status["Manjaro"]="UPDATED"
+                else
+                    $m_bak_ok && sudo cp -a "$m_bak" "$arch_mfile" 2>/dev/null && sudo rm -f "$m_bak" 2>/dev/null || true
+                    warn "pacman-mirrors failed; restored previous mirrorlist."
+                    target_status["Manjaro"]="FAILED"
+                fi
+            elif command -v rate-mirrors &>/dev/null; then
+                rate-mirrors --protocol https --save="$tmp_arch" manjaro 2>"$tmp_dir/arch.err" || true
+                [[ -s "$tmp_arch" ]] && arch_gen_ok=true
+            else
+                target_status["Manjaro"]="SKIPPED (pacman-mirrors missing)"
+            fi
+        elif [[ "$os_id" =~ (artix) || "$os_like" =~ (artix) ]]; then
+            # Artix Distribution Gate
+            info "Artix distribution detected for $arch_mfile..."
+            if command -v rate-mirrors &>/dev/null; then
+                rate-mirrors --protocol https --save="$tmp_arch" artix 2>"$tmp_dir/arch.err" || true
+                [[ -s "$tmp_arch" ]] && arch_gen_ok=true
+            else
+                target_status["Artix"]="SKIPPED (rate-mirrors missing)"
+            fi
+        elif [[ "$arch_cpu" != "x86_64" ]]; then
+            # Non-x86 Architecture Gate (ALARM / RISC-V)
+            info "Non-x86 architecture detected ($arch_cpu). Reflector does not support this architecture."
+            if [[ "$arch_cpu" =~ ^(aarch64|armv7h|armv6h)$ ]] && command -v rate-mirrors &>/dev/null; then
+                rate-mirrors --protocol https --save="$tmp_arch" archarm 2>"$tmp_dir/arch.err" || true
+                [[ -s "$tmp_arch" ]] && arch_gen_ok=true
+            else
+                target_status["Arch ARM"]="SKIPPED (requires rate-mirrors for ARM)"
+            fi
+        else
+            # Standard Arch Linux x86_64 Ecosystem (Arch Linux, EndeavourOS)
+            info "Evaluating available ranking engines for Arch Linux mirrors..."
+            local ranker=""
+            if command -v rate-mirrors &>/dev/null; then
+                ranker="rate-mirrors"
+            elif command -v reflector &>/dev/null; then
+                ranker="reflector"
+            fi
+
+            if [[ -z "$ranker" ]]; then
+                warn "Neither 'rate-mirrors' nor 'reflector' was found on your system."
+                warn "Install 'reflector' (sudo pacman -S reflector) to benchmark and rank mirrors."
+                target_status["Arch Linux"]="SKIPPED (no ranker installed)"
+            elif [[ "$ranker" == "rate-mirrors" ]]; then
+                if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                    gum spin --title "Benchmarking & ranking fastest worldwide mirrors with rate-mirrors..." -- \
+                        rate-mirrors --protocol https --save="$tmp_arch" arch || true
+                else
+                    info "Benchmarking & ranking fastest mirrors with rate-mirrors..."
+                    rate-mirrors --protocol https --save="$tmp_arch" arch 2>"$tmp_dir/arch.err" || true
+                fi
+                [[ -s "$tmp_arch" ]] && arch_gen_ok=true
+            elif [[ "$ranker" == "reflector" ]]; then
+                local ref_conf="/etc/xdg/reflector/reflector.conf"
+                local ref_ran=false
+
+                if [[ -f "$ref_conf" ]]; then
+                    if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                        if gum spin --title "Ranking Arch Linux mirrors using /etc/xdg/reflector/reflector.conf..." -- \
+                            reflector @"$ref_conf" --save "$tmp_arch"; then
+                            ref_ran=true
+                        fi
+                    else
+                        if reflector @"$ref_conf" --save "$tmp_arch" 2>"$tmp_dir/arch.err"; then
+                            ref_ran=true
+                        fi
+                    fi
+                fi
+
+                if ! $ref_ran; then
+                    if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
+                        gum spin --title "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide..." -- \
+                            reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_arch" || true
+                    else
+                        info "Benchmarking & ranking fastest 10 HTTPS mirrors worldwide with reflector..."
+                        reflector --latest 20 --protocol https --sort rate --fastest 10 --connection-timeout 3 --download-timeout 5 --save "$tmp_arch" 2>"$tmp_dir/arch.err" || true
+                    fi
+                fi
+                [[ -s "$tmp_arch" ]] && arch_gen_ok=true
+            fi
+        fi
+
+        if $arch_gen_ok; then
+            local v_rc=0
+            _validate_mirrorlist_content "$tmp_arch" "core" "$arch_cpu" 2 || v_rc=$?
+            if (( v_rc == 0 )); then
+                local t_label="Arch Linux"
+                [[ "$os_id" =~ (manjaro) ]] && t_label="Manjaro"
+                [[ "$os_id" =~ (artix) ]] && t_label="Artix"
+                if _apply_staged_mirrorlist "$tmp_arch" "$arch_mfile" "$t_label"; then
+                    target_status["$t_label"]="UPDATED"
+                else
+                    target_status["$t_label"]="FAILED"
+                fi
+            elif (( v_rc == 2 )); then
+                warn "Ranking did not produce sufficient valid servers; keeping existing mirrorlist."
+                target_status["Arch Linux"]="FAILED (insufficient servers)"
+            else
+                warn "Validation probe failed on ranked primary mirror; keeping existing mirrorlist."
+                target_status["Arch Linux"]="FAILED (validation failed)"
+            fi
+        elif [[ -z "${target_status["Arch Linux"]:-}" && -z "${target_status["Manjaro"]:-}" && -z "${target_status["Artix"]:-}" && -z "${target_status["Arch ARM"]:-}" ]]; then
+            target_status["Arch Linux"]="FAILED"
+        fi
+    fi
+
+    # Cleanup temporary directory and restore previous traps
+    _cleanup_mirrors
+    eval "$prev_trap"
+
+    # Step 3: Synthesis & Transaction Summary
+    local total_updated=0 total_failed=0 total_skipped=0
+    local tgt st
+    echo ""
+    info "Mirror Benchmark & Ranking Results:"
+    for tgt in "${!target_status[@]}"; do
+        st="${target_status[$tgt]}"
+        case "$st" in
+            UPDATED*)
+                ((total_updated++))
+                ok "  › $tgt: $st"
+                ;;
+            FAILED*)
+                ((total_failed++))
+                fail "  › $tgt: $st"
+                ;;
+            SKIPPED*)
+                ((total_skipped++))
+                info "  › $tgt: $st"
+                ;;
+            *)
+                info "  › $tgt: $st"
+                ;;
+        esac
+    done
+    echo ""
+
+    if (( total_failed == 0 && total_updated > 0 )); then
         ok "Mirrorlist ranking & optimization completed successfully."
-        echo ""
         return 0
-    else
-        echo ""
-        warn "Mirrorlist ranking did not update any active mirrorlists."
-        echo ""
+    elif (( total_updated > 0 && total_failed > 0 )); then
+        warn "Mirrorlist ranking partially succeeded ($total_updated updated, $total_failed failed)."
+        return 2
+    elif (( total_failed > 0 )); then
+        fail "Mirrorlist ranking failed for all attempted targets."
         return 1
+    else
+        info "Mirrorlist ranking unchanged (no targets updated or ranking skipped)."
+        return 0
     fi
 }
-
 
 
 # ------------------------------------------------------------------------------
@@ -4801,7 +5145,7 @@ check_mirrorlist_age() {
         fi
     elif [[ -n "$primary_url" ]]; then
         # Check if internet control plane is alive before flagging mirror as dead
-        if command -v curl &>/dev/null && curl -Ism 2 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+        if _probe_network_control_plane; then
             primary_dead=true
             primary_info="primary DEAD"
         fi
@@ -8265,7 +8609,7 @@ run_guarded_upgrade() {
     # Gate 3: Network & Repository L7 Reachability & Mirrorlist Integrity
     # --------------------------------------------------------------------------
     local control_plane_reachable=false
-    if curl -Ism 4 https://archlinux.org 2>/dev/null | grep -qE "HTTP/.* (200|301|302)"; then
+    if probe_primary_mirror &>/dev/null || _probe_network_control_plane; then
         control_plane_reachable=true
     fi
 
@@ -8340,7 +8684,9 @@ run_guarded_upgrade() {
             warn "Pre-Flight Gate 3: $refresh_reason"
             if [[ -t 0 ]] && command -v gum &>/dev/null; then
                 if gum confirm "Refresh and rank fastest regional mirrors before upgrading?"; then
-                    if refresh_and_rank_mirrors 1; then
+                    local rank_rc=0
+                    refresh_and_rank_mirrors 1 || rank_rc=$?
+                    if (( rank_rc == 0 || rank_rc == 2 )); then
                         # Re-probe primary mirror after refresh
                         local re_raw re_code re_ms
                         re_raw="$(probe_primary_mirror)" || true
