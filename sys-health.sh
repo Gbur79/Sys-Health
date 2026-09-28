@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.25
+# Arch System Health & Diagnostics v2.28
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.25"
+VERSION="2.28"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -819,6 +819,9 @@ collect_system_snapshot() {
     log "User: $USER"
     log "Kernel: $(uname -r)"
     log "Architecture: $(uname -m)"
+    if [[ -r /proc/uptime ]]; then
+        log "Uptime: $(uptime -p 2>/dev/null || true)"
+    fi
 
     if [[ -f /etc/os-release ]]; then
         log "OS: $(. /etc/os-release; echo "${PRETTY_NAME:-unknown}")"
@@ -841,74 +844,235 @@ collect_system_snapshot() {
     fi
 }
 
+dump_software_state_snapshot() {
+    local ts="${1:-$(date --iso-8601=seconds)}"
+    echo '=== SYSTEM SOFTWARE STATE SNAPSHOT ==='
+    echo "Generated on: ${ts}"
+    echo ''
+    echo '--- 1. Kernel Information ---'
+    uname -a
+    if [[ -r /proc/uptime ]]; then
+        printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || true)"
+    fi
+    echo ''
+    echo '--- 2. Installed Linux Kernels & Headers ---'
+    local kernels
+    kernels="$(pacman -Q 2>/dev/null | grep -E '^linux' || true)"
+    if [[ -n "$kernels" ]]; then
+        printf '%s\n' "$kernels"
+    else
+        echo 'status=none (no packages matching ^linux found)'
+    fi
+    echo ''
+    echo '--- 3. GPU Packages (AMD/Intel/NVIDIA) ---'
+    local gpu_pkgs
+    gpu_pkgs="$(pacman -Q 2>/dev/null | grep -iE 'nvidia|amdgpu|radeon|vulkan|mesa|xf86-video|intel-media|vpl-gpu|libva-intel|intel-compute' || true)"
+    if [[ -n "$gpu_pkgs" ]]; then
+        printf '%s\n' "$gpu_pkgs"
+    else
+        echo 'status=none'
+    fi
+    echo ''
+    echo '--- 4. DKMS Status ---'
+    if command -v dkms &>/dev/null; then
+        local dkms_out
+        dkms_out="$(dkms status 2>/dev/null || true)"
+        if [[ -n "$dkms_out" ]]; then
+            printf '%s\n' "$dkms_out"
+        else
+            echo 'status=none (no DKMS modules registered)'
+        fi
+    else
+        echo 'status=command_missing (dkms not installed)'
+    fi
+    echo ''
+    echo '--- 5. Loaded GPU Kernel Modules ---'
+    local mods
+    mods="$(lsmod 2>/dev/null | grep -E '^nvidia|^nouveau|^amdgpu|^radeon|^i915|^xe|^drm' || true)"
+    if [[ -n "$mods" ]]; then
+        printf '%s\n' "$mods"
+    else
+        echo 'status=none (no common GPU modules loaded)'
+    fi
+    echo ''
+    echo '--- 6. GPU Hardware & Kernel Driver in Use ---'
+    if command -v lspci &>/dev/null; then
+        local lspci_out
+        lspci_out="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
+        if [[ -n "$lspci_out" ]]; then
+            printf '%s\n' "$lspci_out"
+        else
+            echo 'status=none'
+        fi
+    else
+        echo 'status=command_missing (lspci not installed)'
+    fi
+    echo ''
+    echo '--- 7. Initramfs Configuration Files (Dracut / Mkinitcpio / Booster) ---'
+    local init_found=0
+    if [[ -f /etc/dracut.conf || -d /etc/dracut.conf.d ]]; then
+        init_found=1
+        echo 'Dracut configs:'
+        if [[ -f /etc/dracut.conf ]]; then
+            echo '[:/etc/dracut.conf:]'
+            grep -vE '^[[:space:]]*(#|$)' /etc/dracut.conf 2>/dev/null || true
+        fi
+        if [[ -d /etc/dracut.conf.d ]]; then
+            local f
+            for f in /etc/dracut.conf.d/*.conf; do
+                [[ -f "$f" ]] || continue
+                echo "[:$f:]"
+                grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null || true
+            done
+        fi
+    fi
+    if [[ -f /etc/mkinitcpio.conf || -d /etc/mkinitcpio.conf.d ]]; then
+        init_found=1
+        echo 'Mkinitcpio configs:'
+        if [[ -f /etc/mkinitcpio.conf ]]; then
+            echo '[:/etc/mkinitcpio.conf:]'
+            grep -vE '^[[:space:]]*(#|$)' /etc/mkinitcpio.conf 2>/dev/null || true
+        fi
+        if [[ -d /etc/mkinitcpio.conf.d ]]; then
+            local f
+            for f in /etc/mkinitcpio.conf.d/*.conf; do
+                [[ -f "$f" ]] || continue
+                echo "[:$f:]"
+                grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null || true
+            done
+        fi
+    fi
+    if [[ -f /etc/booster.yaml ]]; then
+        init_found=1
+        echo 'Booster config ([:/etc/booster.yaml:]):'
+        grep -vE '^[[:space:]]*(#|$)' /etc/booster.yaml 2>/dev/null || true
+    fi
+    if (( init_found == 0 )); then
+        echo 'status=none (no standard initramfs configs found in /etc)'
+    fi
+    echo ''
+    echo '--- 8. Boot & Filesystem Mounts ---'
+    if command -v findmnt &>/dev/null; then
+        local mnts
+        mnts="$(findmnt --real -l -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | grep -E '^/( |boot|efi)' || true)"
+        if [[ -n "$mnts" ]]; then
+            printf '%s\n' "$mnts"
+        else
+            findmnt --real -l -o TARGET,SOURCE,FSTYPE,OPTIONS -t vfat,btrfs,ext4,xfs,zfs 2>/dev/null || echo 'status=none'
+        fi
+    else
+        echo 'status=command_missing (findmnt not available)'
+    fi
+    echo ''
+    echo '--- 9. Boot Directory Content (/boot) ---'
+    if [[ -d /boot ]]; then
+        ls -lah /boot/ 2>/dev/null || echo 'status=permission_denied'
+    else
+        echo 'status=not_found'
+    fi
+    local esp_target
+    esp_target="$(findmnt -n -r -t vfat -o TARGET 2>/dev/null | grep -E '^/(efi|boot/efi)$' | head -n 1 || true)"
+    if [[ -n "$esp_target" && "$esp_target" != "/boot" && -d "$esp_target" ]]; then
+        echo ''
+        echo "--- 9b. EFI System Partition Content ($esp_target) ---"
+        ls -lah "$esp_target" 2>/dev/null || echo 'status=permission_denied (run with sudo to view EFI contents)'
+    elif [[ -d /efi && "$esp_target" != "/efi" ]]; then
+        echo ''
+        echo '--- 9b. EFI Directory Content (/efi) ---'
+        ls -lah /efi/ 2>/dev/null || echo 'status=permission_denied (run with sudo to view EFI contents)'
+    fi
+    echo ''
+    echo '--- 10. Failed Systemd Services (System) ---'
+    if command -v systemctl &>/dev/null; then
+        local sys_failed
+        sys_failed="$(systemctl --failed --no-legend --plain 2>/dev/null || true)"
+        if [[ -n "$sys_failed" ]]; then
+            printf '%s\n' "$sys_failed"
+        else
+            echo 'status=none (all system services healthy)'
+        fi
+    else
+        echo 'status=command_missing (systemctl not available)'
+    fi
+    echo ''
+    echo '--- 11. Failed Systemd Services (User) ---'
+    if command -v systemctl &>/dev/null; then
+        if (( EUID == 0 )); then
+            local target_uid=""
+            if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+                target_uid="$(id -u "$SUDO_USER" 2>/dev/null || true)"
+            fi
+            if [[ -z "$target_uid" ]]; then
+                target_uid="$(systemctl list-units --type=service --state=active --no-legend 'user@*.service' 2>/dev/null | sed -n 's/.*user@\([0-9]\+\)\.service.*/\1/p' | awk '$1 >= 1000 {print $1; exit}')"
+            fi
+            if [[ -n "$target_uid" ]]; then
+                local u_failed
+                if u_failed="$(systemctl --user -M "${target_uid}@" list-units --failed --no-legend --plain --no-pager 2>/dev/null)"; then
+                    local filtered_failed
+                    filtered_failed="$(awk '$1 !~ /^app-.*\.(service|scope)$/ && NF {print $0}' <<< "$u_failed")"
+                    if [[ -n "$filtered_failed" ]]; then
+                        printf '%s\n' "$filtered_failed"
+                    else
+                        echo "status=none (user UID $target_uid services healthy)"
+                    fi
+                else
+                    echo "status=unavailable (could not query user manager for UID $target_uid)"
+                fi
+            else
+                echo 'status=none (no active user session detected)'
+            fi
+        else
+            local runtime_bus="${XDG_RUNTIME_DIR:-}/bus"
+            if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" || -S "$runtime_bus" ]] && systemctl --user list-units &>/dev/null; then
+                local u_failed
+                u_failed="$(systemctl --user --failed --no-legend --plain --no-pager 2>/dev/null || true)"
+                local filtered_failed
+                filtered_failed="$(awk '$1 !~ /^app-.*\.(service|scope)$/ && NF {print $0}' <<< "$u_failed")"
+                if [[ -n "$filtered_failed" ]]; then
+                    printf '%s\n' "$filtered_failed"
+                else
+                    echo 'status=none (all user services healthy)'
+                fi
+            else
+                echo 'status=unavailable (no active user session bus)'
+            fi
+        fi
+    else
+        echo 'status=command_missing (systemctl not available)'
+    fi
+    echo ''
+    echo '--- 12. Desktop & Session Environment ---'
+    local session_env
+    session_env="$(printenv XDG_SESSION_TYPE DESKTOP_SESSION XDG_CURRENT_DESKTOP 2>/dev/null || true)"
+    if [[ -n "$session_env" ]]; then
+        printf '%s\n' "$session_env"
+    elif command -v loginctl &>/dev/null; then
+        local active_session
+        active_session="$(loginctl list-sessions --no-legend 2>/dev/null | awk '$3 !~ /^lightdm|gdm|sddm/ {print $1; exit}')"
+        if [[ -n "$active_session" ]]; then
+            loginctl show-session "$active_session" -p Type -p Desktop 2>/dev/null || echo 'status=unknown'
+        else
+            echo 'status=unknown'
+        fi
+    else
+        echo 'status=unknown'
+    fi
+}
+
 refresh_state_snapshot() {
     local quiet="${1:-0}"
     local ts
     ts="$(date --iso-8601=seconds)"
 
-    dump_snapshot_content() {
-        echo '=== SYSTEM SOFTWARE STATE SNAPSHOT ==='
-        echo "Generated on: ${ts}"
-        echo ''
-        echo '--- 1. Kernel Information ---'
-        uname -a
-        echo ''
-        echo '--- 2. Installed Linux Kernels & Headers ---'
-        pacman -Q 2>/dev/null | grep -E '^linux'
-        echo ''
-        echo '--- 3. GPU Packages (AMD/Intel/NVIDIA) ---'
-        pacman -Q 2>/dev/null | grep -iE 'nvidia|amdgpu|radeon|vulkan|mesa|xf86-video'
-        echo ''
-        echo '--- 4. DKMS Status ---'
-        dkms status 2>/dev/null || echo '(dkms not available)'
-        echo ''
-        echo '--- 5. Loaded GPU Kernel Modules ---'
-        lsmod 2>/dev/null | grep -E '^nvidia|^nouveau|^amdgpu|^radeon|^i915|^xe|^drm'
-        echo ''
-        echo '--- 6. GPU Hardware & Kernel Driver in Use ---'
-        lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display'
-        echo ''
-        echo '--- 7. Initramfs Configuration Files (Dracut / Mkinitcpio) ---'
-        if [[ -f /etc/dracut.conf || -d /etc/dracut.conf.d ]]; then
-            echo 'Dracut configs:'
-            [[ -f /etc/dracut.conf ]] && grep -v '^#' /etc/dracut.conf 2>/dev/null | sed '/^$/d'
-            ls -la /etc/dracut.conf.d/ 2>/dev/null
-            cat /etc/dracut.conf.d/*.conf 2>/dev/null
-        fi
-        if [[ -f /etc/mkinitcpio.conf ]]; then
-            echo 'Mkinitcpio config:'
-            cat /etc/mkinitcpio.conf 2>/dev/null | grep -v '^#' | sed '/^$/d'
-            ls -la /etc/mkinitcpio.d/ 2>/dev/null
-        fi
-        echo ''
-        echo '--- 8. Boot & Filesystem Mounts ---'
-        findmnt --real -o TARGET,SOURCE,FSTYPE,OPTIONS -t vfat 2>/dev/null
-        echo ''
-        echo '--- 9. Boot Directory Content ---'
-        ls -lah /boot/ 2>/dev/null
-        if [[ -d /efi ]]; then
-            echo ''
-            echo '--- 9b. EFI Directory Content (/efi) ---'
-            ls -lah /efi/ 2>/dev/null
-        fi
-        echo ''
-        echo '--- 10. Failed Systemd Services (System) ---'
-        systemctl --failed --no-legend --plain 2>/dev/null
-        echo ''
-        echo '--- 11. Failed Systemd Services (User) ---'
-        systemctl --user --failed --no-legend --plain 2>/dev/null
-        echo ''
-        echo '--- 12. Desktop & Session Environment ---'
-        printenv XDG_SESSION_TYPE DESKTOP_SESSION XDG_CURRENT_DESKTOP 2>/dev/null || true
-    }
-
     if (( quiet == 1 )); then
-        dump_snapshot_content > "$STATE_SNAPSHOT" 2>&1
+        dump_software_state_snapshot "$ts" > "$STATE_SNAPSHOT" 2>&1
     else
-        spinner "Refreshing system state snapshot..." bash -c "$(declare -f dump_snapshot_content); dump_snapshot_content > "$STATE_SNAPSHOT" 2>&1"
+        export -f dump_software_state_snapshot
+        spinner "Refreshing system state snapshot..." \
+            bash -c 'dump_software_state_snapshot "$1" > "$2" 2>&1' _ "$ts" "$STATE_SNAPSHOT"
     fi
 
-    if [[ -s "$STATE_SNAPSHOT" ]]; then
+    if [[ -s "$STATE_SNAPSHOT" ]] && grep -q '=== SYSTEM SOFTWARE STATE SNAPSHOT ===' "$STATE_SNAPSHOT" 2>/dev/null; then
         if (( quiet != 1 )); then
             ok "State snapshot refreshed: $STATE_SNAPSHOT"
         fi
@@ -1551,16 +1715,35 @@ run_maintenance() {
 }
 
 # ==============================================================================
-# Dynamic Orphan Package Triage & Zero-Residue Purge Engine
-# Hardened according to Luna EOS-SRE-Auditor Architectural Blueprint
+# Dynamic Orphan Package Triage & Safety Pruning Engine
+# Hardened according to Terra EOS-SRE-Auditor Architectural Blueprint
 # ==============================================================================
 
 triage_orphan_packages() {
-    ui_screen "Orphan Package Triage & Safety Pruning"
+    ui_screen "Orphan Package Triage & Safety Review"
 
-    if ! command -v pacman &>/dev/null; then
+    local interactive=0
+    local workdir errfile metafile
+    local strict_output="" extended_output="" current_output="" current_strict_output=""
+    local cache_output="" choice="" selected="" manual_input="" response=""
+    local current_pkg="" line="" target="" qrc=0
+    local action="" auto_selection=0
+    local -a strict_orphans=() candidate_orphans=() current_orphans=()
+    local -a current_strict_orphans=() tier1_strict=() tier2_optional=()
+    local -a tier3_sensitive=() to_remove=() to_protect=() normalized=()
+    local -a cache_dirs=() cache_args=() rem_cmd=() protect_cmd=()
+    local -A strict_set=() candidates=() current_set=() current_strict_set=()
+    local -A pkg_desc=() pkg_opt=() pkg_size=() pkg_tag=() seen=()
+
+    if ! command -v pacman >/dev/null 2>&1; then
         fail "Pacman package manager not detected."
         return 1
+    fi
+
+    if [[ -t 0 && -t 1 ]]; then
+        interactive=1
+    else
+        info "Non-interactive terminal detected; orphan triage will report only and make no changes."
     fi
 
     if package_manager_busy; then
@@ -1568,284 +1751,510 @@ triage_orphan_packages() {
         return 1
     fi
 
-    local -a raw_orphans=()
-    mapfile -t raw_orphans < <(pacman -Qtdq 2>/dev/null || true)
+    workdir="$(mktemp -d "${TMPDIR:-/tmp}/sys-health-orphans.XXXXXX")" || {
+        fail "Unable to create temporary workspace for orphan triage."
+        return 1
+    }
+    errfile="$workdir/pacman.stderr"
+    metafile="$workdir/pacman-metadata"
 
-    if (( ${#raw_orphans[@]} == 0 )); then
+    # Strict: dependency-installed packages with neither required nor optional reverse dependencies.
+    qrc=0
+    strict_output="$(LC_ALL=C pacman -Qdtq 2>"$errfile")" || qrc=$?
+    if (( qrc != 0 )); then
+        if [[ -s "$errfile" ]]; then
+            fail "Unable to query strict unreferenced dependency packages (pacman exit $qrc)."
+            sed 's/^/  /' "$errfile" >&2
+            rm -rf -- "$workdir"
+            return "$qrc"
+        fi
+        strict_output=""
+    fi
+
+    # Extended: includes packages referenced only through optional dependencies (-Qdttq).
+    qrc=0
+    extended_output="$(LC_ALL=C pacman -Qdttq 2>"$errfile")" || qrc=$?
+    if (( qrc != 0 )); then
+        if [[ -s "$errfile" ]]; then
+            fail "Unable to query candidate dependency packages (pacman exit $qrc)."
+            sed 's/^/  /' "$errfile" >&2
+            rm -rf -- "$workdir"
+            return "$qrc"
+        fi
+        extended_output=""
+    fi
+
+    [[ -n "$strict_output" ]] && mapfile -t strict_orphans < <(printf '%s
+' "$strict_output")
+    [[ -n "$extended_output" ]] && mapfile -t candidate_orphans < <(printf '%s
+' "$extended_output")
+
+    if (( ${#candidate_orphans[@]} == 0 )); then
         echo ""
-        ok "Your system dependency tree is pristine! Zero orphan packages found."
+        ok "Pacman reports no unreferenced dependency packages found on your system."
         echo ""
+        rm -rf -- "$workdir"
         return 0
     fi
 
-    info "Analyzing ${#raw_orphans[@]} orphan package(s) against local ALPM database..."
+    info "Analyzing ${#candidate_orphans[@]} candidate dependency package(s) against local ALPM database..."
     echo ""
 
-    local -a tier1_safe=()       # Truly unrequired leaves (Optional For: None)
-    local -a tier2_optional=()   # Optional dependency for other installed apps
-    local -a tier3_system=()     # System/Kernel/Firmware/Drivers/Dev Toolchain
-
-    # Regex patterns for Tier 3 System/Build safety guardrails
-    local sys_pattern="^(linux.*|.*-headers|.*-firmware|.*-ucode|.*-dkms|base-devel|rust|cargo|go|gcc.*|clang.*|llvm.*|make|cmake|patch|git|fakeroot|binutils|pipewire.*|wireplumber.*|alsa-.*|mesa.*|vulkan.*|nvidia.*|xf86-video.*|noto-fonts.*|ttf-.*|otf-.*|fontconfig.*|grub.*|systemd.*|dracut.*|mkinitcpio.*|booster.*|limine.*|refind.*|efibootmgr.*)$"
-
-    local current_pkg=""
-    local -A pkg_desc pkg_opt pkg_size
-
-    # Single-pass batch query (blazing fast, <50ms)
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Name[[:space:]]*:[[:space:]]*(.+) ]]; then
-            current_pkg="${BASH_REMATCH[1]}"
-            pkg_desc["$current_pkg"]="No description available"
-            pkg_opt["$current_pkg"]="None"
-            pkg_size["$current_pkg"]="Unknown"
-        elif [[ "$line" =~ ^Description[[:space:]]*:[[:space:]]*(.+) ]]; then
-            pkg_desc["$current_pkg"]="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Installed[[:space:]]Size[[:space:]]*:[[:space:]]*(.+) ]]; then
-            pkg_size["$current_pkg"]="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Optional[[:space:]]For[[:space:]]*:[[:space:]]*(.+) ]]; then
-            pkg_opt["$current_pkg"]="${BASH_REMATCH[1]}"
-        fi
-    done < <(LC_ALL=C pacman -Qi "${raw_orphans[@]}" 2>/dev/null || true)
-
-    # Classify packages into 3 tiers
-    local p
-    for p in "${raw_orphans[@]}"; do
-        [[ -z "$p" ]] && continue
-        if [[ -z "${pkg_desc[$p]:-}" || ( "${pkg_desc[$p]}" == "No description available" && "${pkg_size[$p]:-Unknown}" == "Unknown" ) ]]; then
-            # SRE Cardinal Safety: Missing/failed metadata -> guard as Tier 3 manual review
-            pkg_desc["$p"]="${pkg_desc[$p]:-Metadata query failed; requires manual review}"
-            tier3_system+=("$p")
-        elif [[ "$p" =~ $sys_pattern ]]; then
-            tier3_system+=("$p")
-        elif [[ "${pkg_opt[$p]:-None}" != "None" && -n "${pkg_opt[$p]:-}" ]]; then
-            tier2_optional+=("$p")
-        else
-            tier1_safe+=("$p")
-        fi
+    for target in "${strict_orphans[@]}"; do
+        [[ -n "$target" ]] && strict_set["$target"]=1
     done
 
-    # Presentation breakdown
-    echo "Summary of Detected Orphan Packages (${#raw_orphans[@]} total):"
-    if command -v gum &>/dev/null; then
-        gum style --foreground 82  "  ● 🟢 Tier 1 (Safe Leaves):       ${#tier1_safe[@]} package(s) - Safe to purge (no reverse dependencies)"
-        gum style --foreground 214 "  ● 🟡 Tier 2 (Optional for Apps): ${#tier2_optional[@]} package(s) - Features in existing apps might stop working"
-        gum style --foreground 196 "  ● 🔴 Tier 3 (Core & Toolchain):  ${#tier3_system[@]} package(s) - System drivers, firmware, audio or build toolchain"
+    # Pre-initialize metadata fields for nounset safety and missing metadata resilience
+    for target in "${candidate_orphans[@]}"; do
+        [[ -z "$target" ]] && continue
+        candidates["$target"]=1
+        pkg_desc["$target"]="No description available"
+        pkg_opt["$target"]="None"
+        pkg_size["$target"]="Unknown"
+        pkg_tag["$target"]=""
+    done
+
+    # Batch query ALPM metadata
+    if LC_ALL=C pacman -Qi -- "${candidate_orphans[@]}" >"$metafile" 2>"$errfile"; then
+        :
     else
-        echo "  ● [GREEN]  Tier 1 (Safe Leaves):       ${#tier1_safe[@]} package(s) - Safe to purge"
-        echo "  ● [YELLOW] Tier 2 (Optional for Apps): ${#tier2_optional[@]} package(s) - Reverse optional dependencies"
-        echo "  ● [RED]    Tier 3 (Core & Toolchain):  ${#tier3_system[@]} package(s) - System drivers, firmware, audio or toolchains"
+        qrc=$?
+        fail "Unable to read package metadata for triage (pacman exit $qrc); no changes made."
+        [[ -s "$errfile" ]] && sed 's/^/  /' "$errfile" >&2
+        rm -rf -- "$workdir"
+        return "$qrc"
     fi
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Name[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+            current_pkg="${BASH_REMATCH[1]}"
+        elif [[ -n "$current_pkg" && "$line" =~ ^Description[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+            pkg_desc["$current_pkg"]="${BASH_REMATCH[1]}"
+        elif [[ -n "$current_pkg" && "$line" =~ ^Installed[[:space:]]Size[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+            pkg_size["$current_pkg"]="${BASH_REMATCH[1]}"
+        elif [[ -n "$current_pkg" && "$line" =~ ^Optional[[:space:]]For[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+            pkg_opt["$current_pkg"]="${BASH_REMATCH[1]}"
+        fi
+    done <"$metafile"
+
+    # Classify candidate packages into 3 tiers
+    for target in "${candidate_orphans[@]}"; do
+        case "$target" in
+            linux*|*-headers|grub*|systemd*|dracut*|mkinitcpio*|booster*|limine*|refind*|efibootmgr*)
+                pkg_tag["$target"]="kernel / bootloader"
+                tier3_sensitive+=("$target")
+                ;;
+            *firmware*|*-ucode|*-dkms|nvidia*|mesa*|vulkan*|xf86-video*)
+                pkg_tag["$target"]="driver / firmware / graphics"
+                tier3_sensitive+=("$target")
+                ;;
+            pipewire*|wireplumber*|alsa-*)
+                pkg_tag["$target"]="audio subsystem"
+                tier3_sensitive+=("$target")
+                ;;
+            base-devel|rust|cargo|go|gcc*|clang*|llvm*|make|cmake|patch|git|fakeroot|binutils)
+                pkg_tag["$target"]="development toolchain"
+                tier3_sensitive+=("$target")
+                ;;
+            *)
+                if [[ -n "${strict_set[$target]+present}" ]]; then
+                    tier1_strict+=("$target")
+                else
+                    tier2_optional+=("$target")
+                fi
+                ;;
+        esac
+    done
+
+    # Presentation breakdown with Gum styling
+    echo "Summary of Detected Dependency Candidates (${#candidate_orphans[@]} total):"
+    if command -v gum >/dev/null 2>&1; then
+        gum style --foreground 82  "  ● 🟢 Tier 1 (Strict Unreferenced):  ${#tier1_strict[@]} package(s) - Neither required nor optionally used by installed apps"
+        gum style --foreground 214 "  ● 🟡 Tier 2 (Optional for Apps):    ${#tier2_optional[@]} package(s) - Referenced ONLY as optional dependencies of existing apps"
+        gum style --foreground 196 "  ● 🔴 Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio or dev toolchains"
+    else
+        echo "  ● [GREEN]  Tier 1 (Strict Unreferenced):  ${#tier1_strict[@]} package(s) - No installed reverse dependencies"
+        echo "  ● [YELLOW] Tier 2 (Optional for Apps):    ${#tier2_optional[@]} package(s) - Reverse optional dependencies"
+        echo "  ● [RED]    Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio, dev tools"
+    fi
+    info "Note: Pacman models package dependencies only; it cannot detect external scripts, binaries, or manual builds."
     echo ""
 
-    if (( ${#tier1_safe[@]} > 0 )); then
-        echo "🟢 Tier 1: Safe Leaves to Purge:"
-        for p in "${tier1_safe[@]}"; do
-            echo "   • $p (${pkg_size[$p]}) - ${pkg_desc[$p]}"
+    if (( ${#tier1_strict[@]} > 0 )); then
+        echo "🟢 Tier 1: Strict Unreferenced Packages:"
+        for target in "${tier1_strict[@]}"; do
+            echo "   • $target (${pkg_size[$target]}) - ${pkg_desc[$target]}"
         done
         echo ""
     fi
 
     if (( ${#tier2_optional[@]} > 0 )); then
-        echo "🟡 Tier 2: Optional Dependencies (Review carefully):"
-        for p in "${tier2_optional[@]}"; do
-            echo "   • $p (${pkg_size[$p]})"
-            echo "     └─ Optional For: ${pkg_opt[$p]}"
-            echo "     └─ Info: ${pkg_desc[$p]}"
+        echo "🟡 Tier 2: Optional Dependencies of Installed Apps (Review carefully):"
+        for target in "${tier2_optional[@]}"; do
+            echo "   • $target (${pkg_size[$target]})"
+            echo "     └─ Optional For: ${pkg_opt[$target]}"
+            echo "     └─ Info: ${pkg_desc[$target]}"
         done
         echo ""
     fi
 
-    if (( ${#tier3_system[@]} > 0 )); then
-        echo "🔴 Tier 3: Core / Drivers / Build Toolchains (Protected):"
-        for p in "${tier3_system[@]}"; do
-            echo "   • $p (${pkg_size[$p]}) - ${pkg_desc[$p]}"
-            echo "     └─ SRE Notice: Likely needed for DKMS, hardware, sound, or AUR builds."
+    if (( ${#tier3_sensitive[@]} > 0 )); then
+        echo "🔴 Tier 3: Heuristically Sensitive Packages (Excluded from automatic selection):"
+        for target in "${tier3_sensitive[@]}"; do
+            echo "   • $target (${pkg_size[$target]}) - ${pkg_desc[$target]}"
+            echo "     └─ SRE Notice: Flagged as ${pkg_tag[$target]}. Excluded from auto-prune."
         done
         echo ""
     fi
 
-    # Interactive Action Choice
-    local choice=""
-    if [[ -t 0 ]] && command -v gum &>/dev/null; then
-        choice="$(
+    if (( ! interactive )); then
+        rm -rf -- "$workdir"
+        return 0
+    fi
+
+    # Interactive Action Selection
+    if command -v gum >/dev/null 2>&1; then
+        if ! choice="$(
             gum choose \
                 --header="Select an Action:" \
                 --cursor="› " \
                 --cursor.foreground="81" \
-                "1. Auto-Purge Safe Leaves Only (Remove ${#tier1_safe[@]} Green packages + Zero-Residue Cache Purge)" \
-                "2. Interactive Selection (Pick packages to remove individually)" \
-                "3. Protect Useful Packages (Mark selected as Explicitly Installed: pacman -D --asexplicit)" \
+                "1. Remove Strict Candidates Only (${#tier1_strict[@]} Green packages)" \
+                "2. Interactive Selection (Pick candidate packages manually)" \
+                "3. Protect Useful Packages (Mark as Explicitly Installed: pacman -D --asexplicit)" \
                 "4. Cancel & Return"
-        )"
-    elif [[ -t 0 ]]; then
-        echo "1. Auto-Purge Safe Leaves Only (${#tier1_safe[@]} Green packages + Cache Purge)"
-        echo "2. Interactive Selection (Pick packages to remove)"
+        )"; then
+            info "Orphan triage cancelled."
+            rm -rf -- "$workdir"
+            return 0
+        fi
+    else
+        echo "1. Remove Strict Candidates Only (${#tier1_strict[@]} Green packages)"
+        echo "2. Interactive Selection (Pick candidate packages manually)"
         echo "3. Protect Useful Packages (Mark as Explicitly Installed)"
         echo "4. Cancel & Return"
-        read -r -p "Select action [1-4]: " choice
-    else
-        info "Non-interactive shell detected; orphan triage interactive actions skipped."
-        return 0
+        if ! IFS= read -r -p "Select action [1-4]: " choice; then
+            info "Input closed; orphan triage cancelled."
+            rm -rf -- "$workdir"
+            return 0
+        fi
     fi
 
-    local -a to_remove=()
-    local -a to_protect=()
-
     case "$choice" in
-        "1. Auto-Purge Safe Leaves Only"*|"1")
-            if (( ${#tier1_safe[@]} == 0 )); then
-                warn "No Green Tier 1 safe leaf packages found to purge."
+        "1. Remove Strict Candidates Only"*|"1")
+            if (( ${#tier1_strict[@]} == 0 )); then
+                warn "No Green Tier 1 strict unreferenced packages found to remove."
+                rm -rf -- "$workdir"
                 return 0
             fi
-            to_remove=("${tier1_safe[@]}")
+            action="remove"
+            auto_selection=1
+            to_remove=("${tier1_strict[@]}")
             ;;
         "2. Interactive Selection"*|"2")
-            if [[ -t 0 ]] && command -v gum &>/dev/null; then
+            action="remove"
+            if command -v gum >/dev/null 2>&1; then
                 local -a options=()
-                for p in "${tier1_safe[@]}"; do
-                    options+=("[GREEN] $p (${pkg_size[$p]})")
+                for target in "${tier1_strict[@]}"; do
+                    options+=("$target [GREEN] (${pkg_size[$target]}) - ${pkg_desc[$target]}")
                 done
-                for p in "${tier2_optional[@]}"; do
-                    options+=("[YELLOW] $p (${pkg_size[$p]} - opt for: ${pkg_opt[$p]})")
+                for target in "${tier2_optional[@]}"; do
+                    options+=("$target [YELLOW] (${pkg_size[$target]} - opt for: ${pkg_opt[$target]})")
                 done
-                for p in "${tier3_system[@]}"; do
-                    options+=("[RED] $p (${pkg_size[$p]} - CRITICAL)")
+                for target in "${tier3_sensitive[@]}"; do
+                    options+=("$target [RED] (${pkg_size[$target]} - SENSITIVE: ${pkg_tag[$target]})")
                 done
 
-                local selected
-                selected="$(
+                if ! selected="$(
                     printf '%s\n' "${options[@]}" | gum choose --no-limit \
+                        --cursor="› " \
+                        --cursor.foreground="81" \
                         --header="Select packages to REMOVE (Space to toggle, Enter to confirm):"
-                )"
-                [[ -z "$selected" ]] && { info "No packages selected. Aborted."; return 0; }
+                )"; then
+                    info "Package selection cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
+                fi
+                [[ -z "$selected" ]] && { info "No packages selected. Aborted."; rm -rf -- "$workdir"; return 0; }
 
                 while IFS= read -r item; do
                     [[ -z "$item" ]] && continue
-                    local p_name
-                    p_name="$(echo "$item" | awk '{print $2}')"
+                    local p_name="${item%% *}"
                     [[ -n "$p_name" ]] && to_remove+=("$p_name")
                 done <<< "$selected"
             else
-                read -r -p "Enter space-separated package names to remove: " user_pkgs
-                read -r -a to_remove <<< "$user_pkgs"
+                if ! IFS= read -r -p "Enter space-separated package names to remove: " manual_input; then
+                    info "Input closed; orphan triage cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
+                fi
+                read -r -a to_remove <<< "$manual_input"
             fi
             ;;
         "3. Protect Useful Packages"*|"3")
-            if [[ -t 0 ]] && command -v gum &>/dev/null; then
+            action="protect"
+            if command -v gum >/dev/null 2>&1; then
                 local -a protect_options=()
-                for p in "${raw_orphans[@]}"; do
-                    protect_options+=("$p (${pkg_size[$p]}) - ${pkg_desc[$p]}")
+                for target in "${candidate_orphans[@]}"; do
+                    protect_options+=("$target (${pkg_size[$target]}) - ${pkg_desc[$target]}")
                 done
 
-                local sel_protect
-                sel_protect="$(
+                if ! selected="$(
                     printf '%s\n' "${protect_options[@]}" | gum choose --no-limit \
+                        --cursor="› " \
+                        --cursor.foreground="81" \
                         --header="Select packages to PROTECT as explicitly installed (Space to toggle, Enter):"
-                )"
-                [[ -z "$sel_protect" ]] && { info "No packages chosen for protection."; return 0; }
+                )"; then
+                    info "Protection selection cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
+                fi
+                [[ -z "$selected" ]] && { info "No packages chosen for protection."; rm -rf -- "$workdir"; return 0; }
 
                 while IFS= read -r item; do
                     [[ -z "$item" ]] && continue
-                    local p_prot
-                    p_prot="$(echo "$item" | awk '{print $1}')"
+                    local p_prot="${item%% *}"
                     [[ -n "$p_prot" ]] && to_protect+=("$p_prot")
-                done <<< "$sel_protect"
+                done <<< "$selected"
             else
-                read -r -p "Enter space-separated package names to protect: " user_prots
-                read -r -a to_protect <<< "$user_prots"
-            fi
-
-            if (( ${#to_protect[@]} > 0 )); then
-                info "Marking packages as explicitly installed (pacman -D --asexplicit)..."
-                local prot_cmd=(pacman -D --asexplicit "${to_protect[@]}")
-                (( EUID != 0 )) && prot_cmd=(sudo "${prot_cmd[@]}")
-                if "${prot_cmd[@]}"; then
-                    ok "Successfully protected ${#to_protect[@]} package(s). They will no longer appear as orphans!"
-                    log "MAINTENANCE orphans_protected count=${#to_protect[@]} pkgs=${to_protect[*]}"
-                else
-                    fail "Failed to update package install reason."
+                if ! IFS= read -r -p "Enter space-separated package names to protect: " manual_input; then
+                    info "Input closed; orphan triage cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
                 fi
+                read -r -a to_protect <<< "$manual_input"
             fi
-            return 0
             ;;
         *)
             info "Orphan triage cancelled. No changes made."
+            rm -rf -- "$workdir"
             return 0
             ;;
     esac
 
-    # Execute removal if packages were selected
-    if (( ${#to_remove[@]} > 0 )); then
-        echo ""
-        if command -v gum &>/dev/null; then
-            gum style --foreground 214 "The following package(s) will be completely removed along with unneeded dependencies:"
-        else
-            echo "The following package(s) will be completely removed along with unneeded dependencies:"
-        fi
-        printf '  • %s\n' "${to_remove[@]}"
-        echo ""
-
-        local confirm_removal=false
-        if [[ -t 0 ]] && command -v gum &>/dev/null; then
-            if gum confirm "Are you sure you want to remove these packages and purge their cached archives?"; then
-                confirm_removal=true
+    # Validate and de-duplicate input against scanned candidate set
+    seen=()
+    normalized=()
+    if [[ "$action" == "remove" ]]; then
+        for target in "${to_remove[@]}"; do
+            [[ -z "$target" ]] && continue
+            if [[ -z "${candidates[$target]+present}" ]]; then
+                warn "'$target' was not in the scanned candidate list; refusing to remove it."
+                rm -rf -- "$workdir"
+                return 1
             fi
-        elif [[ -t 0 ]]; then
-            read -r -p "Are you sure you want to remove these packages and purge their cached archives? [y/N] " resp
-            [[ "$resp" =~ ^[Yy]$ ]] && confirm_removal=true
-        else
-            confirm_removal=true
-        fi
-
-        if ! $confirm_removal; then
-            info "Package removal aborted by user."
+            [[ -n "${seen[$target]+present}" ]] && continue
+            seen["$target"]=1
+            normalized+=("$target")
+        done
+        to_remove=("${normalized[@]}")
+        if (( ${#to_remove[@]} == 0 )); then
+            info "No valid candidate packages selected."
+            rm -rf -- "$workdir"
             return 0
         fi
 
         echo ""
-        info "[Step 1/2] Removing packages via: pacman -Rns ${to_remove[*]}"
-        local rem_cmd=(pacman -Rns "${to_remove[@]}")
-        (( EUID != 0 )) && rem_cmd=(sudo "${rem_cmd[@]}")
-        if ! "${rem_cmd[@]}"; then
-            fail "Pacman package removal encountered an error!"
+        info "Proposed packages for removal (${#to_remove[@]} package(s)):"
+        printf '  • %s\n' "${to_remove[@]}"
+        echo ""
+
+        # Pre-transaction read-only preview via pacman -Rs --print
+        info "Calculating dependency transaction preview (pacman -Rs --print)..."
+        if ! pacman -Rs --print -- "${to_remove[@]}"; then
+            fail "Pacman could not prepare the removal preview (dependency conflict detected)."
+            rm -rf -- "$workdir"
             return 1
         fi
-        ok "Selected orphan packages and unneeded dependencies removed."
-        log "MAINTENANCE orphans_removed count=${#to_remove[@]} pkgs=${to_remove[*]}"
-
-        # Step 2: Zero-Residue Cache Purge (Arch Wiki Standard)
         echo ""
-        info "[Step 2/2] Initiating Zero-Residue Cache Purge (paccache -ruk0)..."
-        info "  › Arch Wiki Standard: pacman -Rns does not delete downloaded .pkg.tar.zst files from cache."
-        info "  › Purging uninstalled package archives while preserving installed packages rollback history."
+        info "Note: pacman -Rs removes target packages and dependencies that become unneeded."
+        info "Modified configuration files will be preserved with .pacsave extension."
+        echo ""
 
-        local -a cache_dirs=()
-        if command -v pacman-conf &>/dev/null; then
-            mapfile -t cache_dirs < <(pacman-conf CacheDir 2>/dev/null | sed '/^$/d' || true)
-        fi
-        if (( ${#cache_dirs[@]} == 0 )); then
-            cache_dirs=("/var/cache/pacman/pkg")
-        fi
-
-        if command -v paccache &>/dev/null; then
-            local cdir cdir_purged=false
-            for cdir in "${cache_dirs[@]}"; do
-                [[ -d "$cdir" ]] || continue
-                local pc_cmd=(paccache -c "$cdir" --remove --uninstalled --keep 0)
-                (( EUID != 0 )) && pc_cmd=(sudo "${pc_cmd[@]}")
-                if "${pc_cmd[@]}"; then
-                    ok "Zero-Residue Cache Purge complete on $cdir."
-                    log "MAINTENANCE uninstalled_cache_purged=PASS cache_dir=$cdir"
-                    cdir_purged=true
-                else
-                    warn "paccache purge returned a non-zero exit code on $cdir."
-                fi
-            done
-            $cdir_purged || info "No valid pacman cache directories found to purge."
+        local confirm_removal=false
+        if command -v gum >/dev/null 2>&1; then
+            if gum confirm "Are you sure you want to remove these packages?"; then
+                confirm_removal=true
+            fi
         else
-            info "paccache command not found (pacman-contrib not installed). Skipping uninstalled cache purge."
+            if IFS= read -r -p "Are you sure you want to remove these packages? [y/N] " response &&
+                [[ "$response" =~ ^[Yy]$ ]]; then
+                confirm_removal=true
+            fi
+        fi
+
+        if ! $confirm_removal; then
+            info "Package removal aborted by user."
+            rm -rf -- "$workdir"
+            return 0
+        fi
+    elif [[ "$action" == "protect" ]]; then
+        for target in "${to_protect[@]}"; do
+            [[ -z "$target" ]] && continue
+            if [[ -z "${candidates[$target]+present}" ]]; then
+                warn "'$target' was not in the scanned candidate list; refusing to alter install reason."
+                rm -rf -- "$workdir"
+                return 1
+            fi
+            [[ -n "${seen[$target]+present}" ]] && continue
+            seen["$target"]=1
+            normalized+=("$target")
+        done
+        to_protect=("${normalized[@]}")
+        if (( ${#to_protect[@]} == 0 )); then
+            info "No valid candidate packages selected."
+            rm -rf -- "$workdir"
+            return 0
         fi
     fi
+
+    # Fresh candidate scan & concurrency check immediately before ALPM mutation
+    if package_manager_busy; then
+        warn "Package manager or AUR build activity started during review; ALPM mutation aborted."
+        rm -rf -- "$workdir"
+        return 1
+    fi
+
+    qrc=0
+    current_output="$(LC_ALL=C pacman -Qdttq 2>"$errfile")" || qrc=$?
+    if (( qrc != 0 && -s "$errfile" )); then
+        fail "Unable to revalidate current candidates before execution (pacman exit $qrc)."
+        sed 's/^/  /' "$errfile" >&2
+        rm -rf -- "$workdir"
+        return "$qrc"
+    fi
+    [[ -n "$current_output" ]] && mapfile -t current_orphans < <(printf '%s\n' "$current_output")
+    for target in "${current_orphans[@]}"; do
+        [[ -n "$target" ]] && current_set["$target"]=1
+    done
+
+    if [[ "$action" == "remove" ]]; then
+        for target in "${to_remove[@]}"; do
+            if [[ -z "${current_set[$target]+present}" ]]; then
+                warn "Package '$target' is no longer a candidate orphan; transaction aborted."
+                rm -rf -- "$workdir"
+                return 1
+            fi
+        done
+
+        if (( auto_selection )); then
+            qrc=0
+            current_strict_output="$(LC_ALL=C pacman -Qdtq 2>"$errfile")" || qrc=$?
+            if (( qrc != 0 && -s "$errfile" )); then
+                fail "Unable to revalidate strict candidates before execution (pacman exit $qrc)."
+                sed 's/^/  /' "$errfile" >&2
+                rm -rf -- "$workdir"
+                return "$qrc"
+            fi
+            [[ -n "$current_strict_output" ]] &&
+                mapfile -t current_strict_orphans < <(printf '%s\n' "$current_strict_output")
+            for target in "${current_strict_orphans[@]}"; do
+                [[ -n "$target" ]] && current_strict_set["$target"]=1
+            done
+            for target in "${to_remove[@]}"; do
+                if [[ -z "${current_strict_set[$target]+present}" ]]; then
+                    warn "Package '$target' is no longer a strict candidate; auto-removal aborted."
+                    rm -rf -- "$workdir"
+                    return 1
+                fi
+            done
+        fi
+    elif [[ "$action" == "protect" ]]; then
+        for target in "${to_protect[@]}"; do
+            if [[ -z "${current_set[$target]+present}" ]]; then
+                warn "Package '$target' is no longer a candidate orphan; transaction aborted."
+                rm -rf -- "$workdir"
+                return 1
+            fi
+        done
+    fi
+
+    # Execute Action
+    if [[ "$action" == "protect" ]]; then
+        info "Marking packages as explicitly installed (pacman -D --asexplicit)..."
+        protect_cmd=(pacman -D --asexplicit "${to_protect[@]}")
+        (( EUID != 0 )) && protect_cmd=(sudo "${protect_cmd[@]}")
+        if ! "${protect_cmd[@]}"; then
+            fail "Failed to update package install reason."
+            rm -rf -- "$workdir"
+            return 1
+        fi
+        ok "Successfully marked ${#to_protect[@]} package(s) as explicitly installed."
+        log "MAINTENANCE orphans_protected count=${#to_protect[@]} pkgs=${to_protect[*]}"
+        rm -rf -- "$workdir"
+        return 0
+    fi
+
+    # Execute removal
+    echo ""
+    info "Executing package removal: pacman -Rs ${to_remove[*]}"
+    rem_cmd=(pacman -Rs "${to_remove[@]}")
+    (( EUID != 0 )) && rem_cmd=(sudo "${rem_cmd[@]}")
+    if ! "${rem_cmd[@]}"; then
+        fail "Pacman package removal failed!"
+        rm -rf -- "$workdir"
+        return 1
+    fi
+    ok "Selected candidate packages and unneeded dependencies successfully removed."
+    log "MAINTENANCE orphans_removed count=${#to_remove[@]} pkgs=${to_remove[*]}"
+
+    # Optional Separately Confirmed Uninstalled Cache Purge
+    if command -v paccache >/dev/null 2>&1; then
+        if command -v pacman-conf >/dev/null 2>&1 &&
+            cache_output="$(LC_ALL=C pacman-conf CacheDir 2>/dev/null)"; then
+            while IFS= read -r target; do
+                [[ -n "$target" ]] && cache_args+=(-c "$target")
+            done <<< "$cache_output"
+        fi
+        if (( ${#cache_args[@]} == 0 )); then
+            cache_args=(-c "/var/cache/pacman/pkg")
+        fi
+
+        echo ""
+        info "Optional Cache Maintenance (paccache --uninstalled --keep 0):"
+        info "  › Notice: This inspects cached archives of ALL uninstalled packages on the system."
+        info "  › Running dry-run check..."
+        echo ""
+
+        if paccache "${cache_args[@]}" --dryrun --uninstalled --keep 0; then
+            echo ""
+            local confirm_cache=false
+            if command -v gum >/dev/null 2>&1; then
+                if gum confirm "Prune all cached archives for uninstalled packages?"; then
+                    confirm_cache=true
+                fi
+            else
+                if IFS= read -r -p "Prune all cached archives for uninstalled packages? [y/N] " response &&
+                    [[ "$response" =~ ^[Yy]$ ]]; then
+                    confirm_cache=true
+                fi
+            fi
+
+            if $confirm_cache; then
+                if package_manager_busy; then
+                    warn "Package manager activity detected; cache cleanup aborted."
+                else
+                    local pc_cmd=(paccache "${cache_args[@]}" --remove --uninstalled --keep 0)
+                    (( EUID != 0 )) && pc_cmd=(sudo "${pc_cmd[@]}")
+                    if "${pc_cmd[@]}"; then
+                        ok "Uninstalled packages cache cleanup complete."
+                        log "MAINTENANCE uninstalled_cache_purged=PASS"
+                    else
+                        warn "paccache returned a non-zero exit status."
+                    fi
+                fi
+            else
+                info "Cache cleanup skipped."
+            fi
+        else
+            warn "Unable to execute paccache dry-run; cache cleanup skipped."
+        fi
+    else
+        info "paccache utility not found (pacman-contrib not installed). Skipping cache check."
+    fi
+
+    rm -rf -- "$workdir"
+    return 0
 }
 
 # ==============================================================================
@@ -2173,43 +2582,66 @@ refresh_and_rank_mirrors() {
 detect_boot_directories() {
     local -a dirs=()
     local seen=" "
+    local bctl_esp bctl_xboot mnt fstab_mnt
 
-    # 1. Active vfat ESP mountpoints from findmnt
-    local esp_mnt
-    while IFS= read -r esp_mnt; do
-        [[ -n "$esp_mnt" && -d "$esp_mnt" ]] || continue
-        if [[ "$seen" != *" $esp_mnt "* ]]; then
-            dirs+=("$esp_mnt")
-            seen+="$esp_mnt "
+    # 1. Authoritative ESP and XBOOTLDR paths from bootctl (if available)
+    if command -v bootctl &>/dev/null; then
+        bctl_esp="$(bootctl -p 2>/dev/null || true)"
+        if [[ -n "$bctl_esp" && -d "$bctl_esp" && "$seen" != *" $bctl_esp "* ]]; then
+            dirs+=("$bctl_esp")
+            seen+="$bctl_esp "
         fi
-    done < <(findmnt -n -r -t vfat -o TARGET 2>/dev/null || true)
+        bctl_xboot="$(bootctl -x 2>/dev/null || true)"
+        if [[ -n "$bctl_xboot" && -d "$bctl_xboot" && "$seen" != *" $bctl_xboot "* ]]; then
+            dirs+=("$bctl_xboot")
+            seen+="$bctl_xboot "
+        fi
+    fi
 
-    # 2. Inspect /etc/fstab for active (uncommented) vfat or boot mounts
-    local fstab_mnt
+    # 2. Active boot mountpoints from findmnt (restricted to standard boot/EFI targets)
+    while IFS= read -r mnt; do
+        [[ -n "$mnt" && -d "$mnt" ]] || continue
+        if [[ "$seen" != *" $mnt "* ]]; then
+            dirs+=("$mnt")
+            seen+="$mnt "
+        fi
+    done < <(findmnt -n -r -o TARGET 2>/dev/null | grep -E '^/(boot|efi|boot/efi|esp)$' || true)
+
+    # 3. Active /etc/fstab entries for boot/EFI targets
     while IFS= read -r fstab_mnt; do
         [[ -n "$fstab_mnt" && -d "$fstab_mnt" ]] || continue
         if [[ "$seen" != *" $fstab_mnt "* ]]; then
             dirs+=("$fstab_mnt")
             seen+="$fstab_mnt "
         fi
-    done < <(awk '!/^[[:space:]]*#/ && ($3 == "vfat" || $2 ~ /^\/(boot|efi|boot\/efi)$/) {print $2}' /etc/fstab 2>/dev/null || true)
+    done < <(awk '!/^[[:space:]]*#/ && ($2 ~ /^\/(boot|efi|boot\/efi|esp)$/) {print $2}' /etc/fstab 2>/dev/null || true)
 
-    # 3. Dedicated /boot, /efi, or /boot/efi directories if present
-    for cand in /boot /efi /boot/efi; do
-        if [[ -d "$cand" ]]; then
-            if [[ "$seen" != *" $cand "* ]]; then
-                dirs+=("$cand")
-                seen+="$cand "
-            fi
-        fi
-    done
+    # 4. Standard /boot on root filesystem (if not a separate mount but containing kernel/initrd/grub)
+    if [[ -d "/boot" && "$seen" != *" /boot "* ]]; then
+        dirs+=("/boot")
+        seen+="/boot "
+    fi
 
     printf "%s\n" "${dirs[@]}"
 }
 
 _find_pacnew_files() {
+    # 1. Official pacdiff discovery (inspects full pacman DB tracked configs)
+    if command -v pacdiff &>/dev/null; then
+        local pacdiff_out
+        pacdiff_out="$(pacdiff -o 2>/dev/null | grep -E '\.pacnew$' || true)"
+        if [[ -n "$pacdiff_out" ]]; then
+            printf "%s\n" "$pacdiff_out" | sort -u
+            return 0
+        else
+            return 0
+        fi
+    fi
+
+    # 2. Filesystem fallback: scan /etc and all active boot roots
     local -a scan_dirs=("/etc")
     local -a boot_dirs=()
+    local b
     mapfile -t boot_dirs < <(detect_boot_directories)
     for b in "${boot_dirs[@]}"; do
         [[ -d "$b" ]] && scan_dirs+=("$b")
@@ -2229,10 +2661,12 @@ _resolve_kernel_and_initramfs() {
     k_mode=""
     k_sz=0
 
+    local bdir u_cand entry l_rel i_rel cand_k cand_i cand_f bls_k bls_i
     local uki_pat="^(.*[-_])?${pkgb}([-_.][0-9].*)?$"
 
-    # 1. UKI Check (Unified Kernel Image - Type #2 BLS with strict boundary matching)
+    # 1. UKI Check (Unified Kernel Image - Type #2 BLS)
     for bdir in "${boot_dirs[@]}"; do
+        [[ -d "$bdir" ]] || continue
         for u_cand in "${bdir}/EFI/Linux"/*.efi "${bdir}/EFI/BOOT"/*.efi "${bdir}"/*.efi; do
             [[ -f "$u_cand" ]] || continue
             local bname="${u_cand%.efi}"
@@ -2248,11 +2682,12 @@ _resolve_kernel_and_initramfs() {
     done
 
     # 2. Type #1 BLS (systemd-boot entries / kernel-install layout)
+    # Strictly atomic: kernel and initramfs must both reside under the SAME root owning the entry
     for bdir in "${boot_dirs[@]}"; do
+        [[ -d "$bdir" ]] || continue
         if [[ -d "${bdir}/loader/entries" ]]; then
             for entry in "${bdir}"/loader/entries/*.conf; do
                 [[ -f "$entry" ]] || continue
-                local l_rel i_rel
                 l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' "$entry" | head -n1 || true)"
                 i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' "$entry" | tail -n1 || true)"
 
@@ -2268,142 +2703,225 @@ _resolve_kernel_and_initramfs() {
                 fi
 
                 if $entry_matches; then
-                    for cand_dir in "${boot_dirs[@]}"; do
-                        if [[ -n "$l_rel" && -f "${cand_dir}/${l_rel#/}" && -z "$k_vmlinuz" ]]; then
-                            k_vmlinuz="${cand_dir}/${l_rel#/}"
-                        fi
-                        if [[ -n "$i_rel" && -f "${cand_dir}/${i_rel#/}" && -z "$k_initrd" ]]; then
-                            k_initrd="${cand_dir}/${i_rel#/}"
-                            k_mode="bls"
-                            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
-                        fi
-                    done
-                    if [[ -n "$k_vmlinuz" && -n "$k_initrd" ]]; then
-                        break 2
+                    local entry_k="" entry_i=""
+                    # Resolve relative to the root hosting this entry
+                    if [[ -n "$l_rel" && -f "${bdir}/${l_rel#/}" ]]; then
+                        entry_k="${bdir}/${l_rel#/}"
+                    fi
+                    if [[ -n "$i_rel" && -f "${bdir}/${i_rel#/}" ]]; then
+                        entry_i="${bdir}/${i_rel#/}"
+                    fi
+                    if [[ -n "$entry_k" && -n "$entry_i" ]]; then
+                        k_vmlinuz="$entry_k"
+                        k_initrd="$entry_i"
+                        k_mode="bls"
+                        k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                        return 0
                     fi
                 fi
             done
         fi
-        if [[ -z "$k_vmlinuz" || -z "$k_initrd" ]]; then
-            local bls_k bls_i
-            bls_k="$(compgen -G "${bdir}/*/${kver}/linux" 2>/dev/null | head -n1 || true)"
-            [[ -z "$bls_k" ]] && bls_k="$(compgen -G "${bdir}/*/${kver}/vmlinuz" 2>/dev/null | head -n1 || true)"
-            bls_i="$(compgen -G "${bdir}/*/${kver}/initrd*" 2>/dev/null | head -n1 || true)"
-            [[ -z "$bls_i" ]] && bls_i="$(compgen -G "${bdir}/*/${kver}/initramfs*" 2>/dev/null | head -n1 || true)"
-            if [[ -n "$bls_k" && -f "$bls_k" ]]; then
-                k_vmlinuz="$bls_k"
-            fi
-            if [[ -n "$bls_i" && -f "$bls_i" ]]; then
-                k_initrd="$bls_i"
-                k_mode="bls"
-                k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
-            fi
-            if [[ -n "$k_vmlinuz" && -n "$k_initrd" ]]; then
-                break
-            fi
+
+        # Machine-ID token directory layout within bdir
+        bls_k="$(compgen -G "${bdir}/*/${kver}/linux" 2>/dev/null | head -n1 || true)"
+        [[ -z "$bls_k" ]] && bls_k="$(compgen -G "${bdir}/*/${kver}/vmlinuz" 2>/dev/null | head -n1 || true)"
+        bls_i="$(compgen -G "${bdir}/*/${kver}/initrd*" 2>/dev/null | head -n1 || true)"
+        [[ -z "$bls_i" ]] && bls_i="$(compgen -G "${bdir}/*/${kver}/initramfs*" 2>/dev/null | head -n1 || true)"
+        if [[ -n "$bls_k" && -f "$bls_k" && -n "$bls_i" && -f "$bls_i" ]]; then
+            k_vmlinuz="$bls_k"
+            k_initrd="$bls_i"
+            k_mode="bls"
+            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+            return 0
         fi
     done
 
-    # 3. Traditional Flat Layout (GRUB / Limine / rEFInd / flat systemd-boot)
+    # 3. Traditional Flat Layout (Atomic per boot root: both kernel & initrd must coexist in same bdir)
     for bdir in "${boot_dirs[@]}"; do
-        if [[ -z "$k_vmlinuz" ]]; then
-            for kcand in \
-                "${bdir}/vmlinuz-${pkgb}" \
-                "${bdir}/vmlinuz-${kver}" \
-                "${bdir}/${pkgb}/vmlinuz" \
-                "${bdir}/${pkgb}/linux"; do
-                if [[ -f "$kcand" ]]; then
-                    k_vmlinuz="$kcand"
-                    break
-                fi
-            done
-        fi
+        [[ -d "$bdir" ]] || continue
+        local cur_k="" cur_i="" cur_f="" cur_mode="normal"
 
-        if [[ -z "$k_initrd" ]]; then
-            for icand in \
-                "${bdir}/initramfs-${pkgb}.img" \
-                "${bdir}/initramfs-${kver}.img" \
-                "${bdir}/initramfs-${pkgb}" \
-                "${bdir}/initrd-${pkgb}.img" \
-                "${bdir}/initrd-${pkgb}" \
-                "${bdir}/initrd-${kver}" \
-                "${bdir}/${pkgb}/initramfs.img" \
-                "${bdir}/${pkgb}/initrd"; do
-                if [[ -f "$icand" ]]; then
-                    k_initrd="$icand"
-                    k_mode="normal"
-                    k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
-                    break
-                fi
-            done
-        fi
+        for cand_k in \
+            "${bdir}/vmlinuz-${pkgb}" \
+            "${bdir}/vmlinuz-${kver}" \
+            "${bdir}/${pkgb}/vmlinuz" \
+            "${bdir}/${pkgb}/linux"; do
+            if [[ -f "$cand_k" ]]; then
+                cur_k="$cand_k"
+                break
+            fi
+        done
 
-        if [[ -z "$k_initrd" ]]; then
-            for bcand in \
+        for cand_i in \
+            "${bdir}/initramfs-${pkgb}.img" \
+            "${bdir}/initramfs-${kver}.img" \
+            "${bdir}/initramfs-${pkgb}" \
+            "${bdir}/initrd-${pkgb}.img" \
+            "${bdir}/initrd-${pkgb}" \
+            "${bdir}/initrd-${kver}" \
+            "${bdir}/${pkgb}/initramfs.img" \
+            "${bdir}/${pkgb}/initrd"; do
+            if [[ -f "$cand_i" ]]; then
+                cur_i="$cand_i"
+                cur_mode="normal"
+                break
+            fi
+        done
+
+        if [[ -z "$cur_i" ]]; then
+            for cand_i in \
                 "${bdir}/booster-${pkgb}.img" \
                 "${bdir}/booster-${kver}.img"; do
-                if [[ -f "$bcand" ]]; then
-                    k_initrd="$bcand"
-                    k_mode="booster"
-                    k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                if [[ -f "$cand_i" ]]; then
+                    cur_i="$cand_i"
+                    cur_mode="booster"
                     break
                 fi
             done
         fi
 
-        if [[ -z "$k_fallback" ]]; then
-            for fcand in \
+        # If both kernel and initrd exist under this same root, we found an indivisible match!
+        if [[ -n "$cur_k" && -n "$cur_i" ]]; then
+            k_vmlinuz="$cur_k"
+            k_initrd="$cur_i"
+            k_mode="$cur_mode"
+            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+
+            for cand_f in \
                 "${bdir}/initramfs-${pkgb}-fallback.img" \
                 "${bdir}/initramfs-${pkgb}_fallback.img" \
                 "${bdir}/initramfs-${kver}-fallback.img" \
                 "${bdir}/initrd-${pkgb}-fallback.img"; do
-                if [[ -f "$fcand" ]]; then
-                    k_fallback="$fcand"
+                if [[ -f "$cand_f" ]]; then
+                    k_fallback="$cand_f"
                     break
                 fi
             done
+            return 0
         fi
     done
 
-    # 4. Fallback for strictly single-kernel systems (avoids masking missing multi-kernel images)
+    # 4. Strictly single-kernel minimal fallback (e.g. custom kernel installed as /boot/vmlinuz)
+    local -a mod_pkgbases=(/usr/lib/modules/*/pkgbase)
     local k_count=0
-    k_count="$(find /usr/lib/modules -maxdepth 2 -name pkgbase 2>/dev/null | wc -l || echo 0)"
+    [[ -f "${mod_pkgbases[0]}" ]] && k_count="${#mod_pkgbases[@]}"
+
     if (( k_count <= 1 )); then
-        if [[ -z "$k_vmlinuz" && -f "/boot/vmlinuz" ]]; then
-            k_vmlinuz="/boot/vmlinuz"
-        fi
-        if [[ -z "$k_vmlinuz" && -f "/efi/vmlinuz" ]]; then
-            k_vmlinuz="/efi/vmlinuz"
-        fi
+        for bdir in "${boot_dirs[@]}"; do
+            if [[ -f "${bdir}/vmlinuz" && -f "${bdir}/initramfs.img" ]]; then
+                k_vmlinuz="${bdir}/vmlinuz"
+                k_initrd="${bdir}/initramfs.img"
+                k_mode="normal"
+                k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                return 0
+            fi
+        done
     fi
+
+    # 5. Degraded / Partial discovery fallback (strictly single root, never mix roots across filesystems)
+    for bdir in "${boot_dirs[@]}"; do
+        [[ -d "$bdir" ]] || continue
+        local deg_k="" deg_i=""
+        for cand_k in "${bdir}/vmlinuz-${pkgb}" "${bdir}/vmlinuz-${kver}"; do
+            if [[ -f "$cand_k" ]]; then
+                deg_k="$cand_k"
+                break
+            fi
+        done
+        for cand_i in "${bdir}/initramfs-${pkgb}.img" "${bdir}/initramfs-${kver}.img" "${bdir}/booster-${pkgb}.img"; do
+            if [[ -f "$cand_i" ]]; then
+                deg_i="$cand_i"
+                break
+            fi
+        done
+        if [[ -n "$deg_k" || -n "$deg_i" ]]; then
+            k_vmlinuz="$deg_k"
+            k_initrd="$deg_i"
+            k_mode="normal"
+            [[ -n "$deg_i" ]] && k_sz="$(stat -c %s "$deg_i" 2>/dev/null || echo 0)"
+            return 0
+        fi
+    done
 }
 
 check_kernel() {
     local running_k
     running_k="$(uname -r)"
-    local installed_kernels=()
-    local missing_components=()
+    local -a installed_kernels=()
+    local -a missing_components=()
+    local -a pkgbase_files=(/usr/lib/modules/*/pkgbase)
+    local pkgbase_file kdir kver pkgb
 
     # Multi-kernel validation: inspect all installed kernel module directories
-    for pkgbase_file in /usr/lib/modules/*/pkgbase; do
-        [[ -f "$pkgbase_file" ]] || continue
-        local kdir="${pkgbase_file%/pkgbase}"
-        local kver="${kdir##*/}"
-        local pkgb="$(< "$pkgbase_file")"
-        [[ -z "$pkgb" ]] && pkgb="linux"
-        installed_kernels+=("$pkgb")
+    if [[ -f "${pkgbase_files[0]}" ]]; then
+        for pkgbase_file in "${pkgbase_files[@]}"; do
+            [[ -f "$pkgbase_file" ]] || continue
+            kdir="${pkgbase_file%/pkgbase}"
+            kver="${kdir##*/}"
+            pkgb="$(< "$pkgbase_file")"
+            pkgb="${pkgb//[[:space:]]/}"
+            [[ -z "$pkgb" ]] && pkgb="linux"
+            installed_kernels+=("$pkgb")
 
-        local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
-        _resolve_kernel_and_initramfs "$pkgb" "$kver"
+            local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+            _resolve_kernel_and_initramfs "$pkgb" "$kver"
 
-        [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
-        [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
-    done
+            [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
+            [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+        done
+    else
+        # Fallback discovery: /usr/lib/modules/*/pkgbase not found
+        # Check module directories directly
+        local -a mdirs=(/usr/lib/modules/*)
+        for kdir in "${mdirs[@]}"; do
+            [[ -d "$kdir" ]] || continue
+            kver="${kdir##*/}"
+            if [[ -f "$kdir/modules.dep" || -d "$kdir/kernel" ]]; then
+                pkgb=""
+                case "$kver" in
+                    *-zen*)      pkgb="linux-zen" ;;
+                    *-lts*)      pkgb="linux-lts" ;;
+                    *-cachyos*)  pkgb="linux-cachyos" ;;
+                    *-hardened*) pkgb="linux-hardened" ;;
+                    *-rt*)       pkgb="linux-rt" ;;
+                    *-arch*)     pkgb="linux" ;;
+                esac
+                if [[ -z "$pkgb" ]] && command -v pacman &>/dev/null; then
+                    pkgb="$(pacman -Qqo "$kdir" 2>/dev/null | head -n1 || true)"
+                fi
+                [[ -z "$pkgb" ]] && pkgb="linux"
+                installed_kernels+=("$pkgb")
+
+                local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+                _resolve_kernel_and_initramfs "$pkgb" "$kver"
+
+                [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
+                [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+            fi
+        done
+    fi
+
+    # Fail closed if no kernels could be discovered
+    if (( ${#installed_kernels[@]} == 0 )); then
+        local -a pacman_k=()
+        if command -v pacman &>/dev/null; then
+            mapfile -t pacman_k < <(pacman -Qq 2>/dev/null | grep -E '^linux(-[a-z0-9_]+)?$' || true)
+        fi
+        if (( ${#pacman_k[@]} > 0 )); then
+            add_row "Kernel & modules" "FAIL ✖ (/usr/lib/modules unpopulated; pacman packages: ${pacman_k[*]})$([ -n "$running_k" ] && echo " | booted: $running_k")" "BOOT"
+            log "HEALTH kernel_modules=FAIL modules_unpopulated pacman_kernels='${pacman_k[*]}' booted=$running_k"
+        else
+            add_row "Kernel & modules" "FAIL ✖ (no kernel modules found in /usr/lib/modules)$([ -n "$running_k" ] && echo " | booted: $running_k")" "BOOT"
+            log "HEALTH kernel_modules=FAIL no_kernels_found booted=$running_k"
+        fi
+        ((ERRORS++))
+        return
+    fi
 
     if (( ${#missing_components[@]} > 0 )); then
-        add_row "Kernel & modules" "FAIL ✖ (${missing_components[*]})" "BOOT"
+        add_row "Kernel & modules" "FAIL ✖ (${missing_components[*]})$([ -n "$running_k" ] && echo " | booted: $running_k")" "BOOT"
         ((ERRORS++))
-        log "HEALTH kernel_modules=FAIL missing='${missing_components[*]}'"
+        log "HEALTH kernel_modules=FAIL missing='${missing_components[*]}' booted=$running_k"
     else
         local running_disp="${running_k}"
         add_row "Kernel & modules" "PASS ✔ (${installed_kernels[*]} | booted: $running_disp)" "BOOT"
@@ -2415,40 +2933,112 @@ check_initramfs() {
     # Maintained for backwards compatibility / specific sub-checks
     local running="${1:-$(uname -r)}"
     local pkgbase_file="/usr/lib/modules/$running/pkgbase"
-    local pkgbase="linux-lts"
-    [[ -f "$pkgbase_file" ]] && pkgbase="$(< "$pkgbase_file")"
+    local pkgbase=""
+
+    if [[ -f "$pkgbase_file" && -r "$pkgbase_file" ]]; then
+        pkgbase="$(< "$pkgbase_file")"
+        pkgbase="${pkgbase//[[:space:]]/}"
+    fi
+
+    if [[ -z "$pkgbase" ]]; then
+        case "$running" in
+            *-zen*)      pkgbase="linux-zen" ;;
+            *-lts*)      pkgbase="linux-lts" ;;
+            *-cachyos*)  pkgbase="linux-cachyos" ;;
+            *-hardened*) pkgbase="linux-hardened" ;;
+            *-rt*)       pkgbase="linux-rt" ;;
+            *-arch*)     pkgbase="linux" ;;
+            *)
+                if command -v pacman &>/dev/null; then
+                    pkgbase="$(pacman -Qqo "/usr/lib/modules/$running" 2>/dev/null | head -n1 || true)"
+                fi
+                ;;
+        esac
+    fi
+
+    if [[ -z "$pkgbase" ]]; then
+        add_row "Initramfs ($running)" "FAIL ✖ (cannot determine pkgbase for running kernel $running)" "BOOT"
+        ((ERRORS++))
+        log "HEALTH initramfs=FAIL unknown_pkgbase kver=$running"
+        return
+    fi
 
     local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
     _resolve_kernel_and_initramfs "$pkgbase" "$running"
 
-    if [[ -n "$k_initrd" && -f "$k_initrd" ]]; then
-        local sz_mb=$((k_sz / 1048576))
-        if [[ "$k_mode" == "uki" ]]; then
-            add_row "Initramfs ($pkgbase)" "PASS ✔ (UKI image [${sz_mb}MB])" "BOOT"
-            log "HEALTH initramfs=PASS mode=uki pkgbase=$pkgbase file=$k_initrd"
-        elif [[ "$k_mode" == "booster" ]]; then
-            add_row "Initramfs ($pkgbase)" "PASS ✔ (booster [${sz_mb}MB])" "BOOT"
-            log "HEALTH initramfs=PASS mode=booster pkgbase=$pkgbase file=$k_initrd"
-        elif [[ "$k_mode" == "bls" ]]; then
-            add_row "Initramfs ($pkgbase)" "PASS ✔ (BLS initrd [${sz_mb}MB])" "BOOT"
-            log "HEALTH initramfs=PASS mode=bls pkgbase=$pkgbase file=$k_initrd"
-        else
-            local gen
-            gen="$(detect_initramfs_generator)"
-            [[ "$gen" == "unknown" ]] && gen="normal"
-            if [[ -n "$k_fallback" && -f "$k_fallback" ]]; then
-                add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB] + fallback)" "BOOT"
-                log "HEALTH initramfs=PASS mode=$gen fallback=yes pkgbase=$pkgbase file=$k_initrd"
-            else
-                # For Dracut or custom mkinitcpio presets without fallback: this is a full PASS
-                add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB])" "BOOT"
-                log "HEALTH initramfs=PASS mode=$gen fallback=no pkgbase=$pkgbase file=$k_initrd"
-            fi
-        fi
-    else
+    if [[ -z "$k_initrd" || ! -f "$k_initrd" ]]; then
         add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing initramfs image)" "BOOT"
         ((ERRORS++))
-        log "HEALTH initramfs=FAIL normal_missing pkgbase=$pkgbase"
+        log "HEALTH initramfs=FAIL missing_image pkgbase=$pkgbase"
+        return
+    fi
+
+    # Integrity verification: reject 0-byte or truncated files (< 1MB)
+    local sz_mb=$((k_sz / 1048576))
+    if [[ ! -s "$k_initrd" || "$k_sz" -lt 1048576 ]]; then
+        add_row "Initramfs ($pkgbase)" "FAIL ✖ (truncated image: ${k_sz} bytes < 1MB)" "BOOT"
+        ((ERRORS++))
+        log "HEALTH initramfs=FAIL truncated size=$k_sz pkgbase=$pkgbase file=$k_initrd"
+        return
+    fi
+
+    # Unprivileged-safe content validation: verify structure when readable or with passwordless sudo
+    local parse_ok=true
+    local parse_error=""
+    if [[ -r "$k_initrd" ]] || sudo -n test -r "$k_initrd" &>/dev/null; then
+        if [[ "$k_mode" == "uki" ]]; then
+            local magic
+            magic="$(head -c 2 "$k_initrd" 2>/dev/null || sudo -n head -c 2 "$k_initrd" 2>/dev/null || true)"
+            if [[ "$magic" != "MZ" ]]; then
+                parse_ok=false
+                parse_error="invalid UKI PE header"
+            fi
+        elif [[ "$k_mode" == "booster" ]] && command -v booster &>/dev/null; then
+            if ! (booster ls "$k_initrd" &>/dev/null || sudo -n booster ls "$k_initrd" &>/dev/null); then
+                parse_ok=false
+                parse_error="booster parser failed"
+            fi
+        elif command -v lsinitrd &>/dev/null && detect_initramfs_generator | grep -q "dracut"; then
+            if ! (lsinitrd --size "$k_initrd" &>/dev/null || sudo -n lsinitrd --size "$k_initrd" &>/dev/null); then
+                parse_ok=false
+                parse_error="dracut parser failed"
+            fi
+        elif command -v lsinitcpio &>/dev/null && detect_initramfs_generator | grep -q "mkinitcpio"; then
+            if ! (lsinitcpio -a "$k_initrd" &>/dev/null || sudo -n lsinitcpio -a "$k_initrd" &>/dev/null); then
+                parse_ok=false
+                parse_error="lsinitcpio parser failed"
+            fi
+        fi
+    fi
+
+    if ! $parse_ok; then
+        add_row "Initramfs ($pkgbase)" "FAIL ✖ (${parse_error})" "BOOT"
+        ((ERRORS++))
+        log "HEALTH initramfs=FAIL error='$parse_error' pkgbase=$pkgbase file=$k_initrd"
+        return
+    fi
+
+    if [[ "$k_mode" == "uki" ]]; then
+        add_row "Initramfs ($pkgbase)" "PASS ✔ (UKI image [${sz_mb}MB])" "BOOT"
+        log "HEALTH initramfs=PASS mode=uki pkgbase=$pkgbase file=$k_initrd"
+    elif [[ "$k_mode" == "booster" ]]; then
+        add_row "Initramfs ($pkgbase)" "PASS ✔ (booster [${sz_mb}MB])" "BOOT"
+        log "HEALTH initramfs=PASS mode=booster pkgbase=$pkgbase file=$k_initrd"
+    elif [[ "$k_mode" == "bls" ]]; then
+        add_row "Initramfs ($pkgbase)" "PASS ✔ (BLS initrd [${sz_mb}MB])" "BOOT"
+        log "HEALTH initramfs=PASS mode=bls pkgbase=$pkgbase file=$k_initrd"
+    else
+        local gen
+        gen="$(detect_initramfs_generator)"
+        [[ "$gen" == "unknown" ]] && gen="normal"
+        if [[ -n "$k_fallback" && -f "$k_fallback" ]]; then
+            add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB] + fallback)" "BOOT"
+            log "HEALTH initramfs=PASS mode=$gen fallback=yes pkgbase=$pkgbase file=$k_initrd"
+        else
+            # For Dracut or custom mkinitcpio presets without fallback: this is a full PASS
+            add_row "Initramfs ($pkgbase)" "PASS ✔ ($gen [${sz_mb}MB])" "BOOT"
+            log "HEALTH initramfs=PASS mode=$gen fallback=no pkgbase=$pkgbase file=$k_initrd"
+        fi
     fi
 }
 
@@ -2459,11 +3049,29 @@ check_efi_mount() {
         return
     fi
 
-    local efi_mnt
-    efi_mnt="$(findmnt -n -o TARGET -t vfat 2>/dev/null | grep -iE '^/(boot|boot/efi|efi)$' | head -n1 || true)"
+    local efi_mnt=""
 
+    # 1. Authoritative bootctl ESP path
+    if command -v bootctl &>/dev/null; then
+        local b_esp
+        b_esp="$(bootctl -p 2>/dev/null || true)"
+        if [[ -n "$b_esp" && -d "$b_esp" ]]; then
+            efi_mnt="$b_esp"
+        fi
+    fi
+
+    # 2. Dynamic findmnt scan across standard ESP mountpoints
     if [[ -z "$efi_mnt" ]]; then
-        add_row "EFI partition (ESP)" "FAIL ✖ (no vfat mounted at /boot, /efi, or /boot/efi)"
+        efi_mnt="$(findmnt -n -o TARGET -t vfat 2>/dev/null | grep -iE '^/(boot/efi|efi|boot|esp)$' | head -n1 || true)"
+    fi
+
+    # 3. Dynamic fstab inspection
+    if [[ -z "$efi_mnt" ]]; then
+        efi_mnt="$(awk '!/^[[:space:]]*#/ && $3 == "vfat" && $2 ~ /^\/(boot\/efi|efi|boot|esp)$/ {print $2}' /etc/fstab 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ -z "$efi_mnt" || ! -d "$efi_mnt" ]]; then
+        add_row "EFI partition (ESP)" "FAIL ✖ (no ESP mounted at /boot/efi, /efi, /boot, or /esp)"
         ((ERRORS++))
         log "HEALTH efi=FAIL mounted=NO"
         return
@@ -2479,19 +3087,23 @@ check_efi_mount() {
     fi
 
     local avail_mb
-    avail_mb="$(df -BM "$efi_mnt" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4}')"
+    avail_mb="$(df -BM "$efi_mnt" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4}' || true)"
 
-    if [[ -n "$avail_mb" ]] && (( avail_mb < 50 )); then
+    if [[ -z "$avail_mb" || ! "$avail_mb" =~ ^[0-9]+$ ]]; then
+        add_row "EFI partition ($efi_mnt)" "INFO ℹ (mounted vfat, free space unreadable)"
+        ((INFO_COUNT++)) || true
+        log "HEALTH efi=INFO unreadable_free_space mount=$efi_mnt"
+    elif (( avail_mb < 50 )); then
         add_row "EFI partition ($efi_mnt)" "FAIL ✖ (critically low space: ${avail_mb}MB < 50MB)"
         ((ERRORS++))
         log "HEALTH efi=FAIL low_space=${avail_mb}MB mount=$efi_mnt"
-    elif [[ -n "$avail_mb" ]] && (( avail_mb < 100 )); then
+    elif (( avail_mb < 100 )); then
         add_row "EFI partition ($efi_mnt)" "WARN ⚠ (low free space: ${avail_mb}MB < 100MB)"
         ((WARNINGS++))
         log "HEALTH efi=WARN low_space=${avail_mb}MB mount=$efi_mnt"
     else
-        add_row "EFI partition ($efi_mnt)" "PASS ✔ (mounted vfat, free: ${avail_mb:-?}MB)"
-        log "HEALTH efi=PASS free_mb=${avail_mb:-unknown} mount=$efi_mnt"
+        add_row "EFI partition ($efi_mnt)" "PASS ✔ (mounted vfat, free: ${avail_mb}MB)"
+        log "HEALTH efi=PASS free_mb=${avail_mb} mount=$efi_mnt"
     fi
 }
 
@@ -2499,53 +3111,64 @@ check_reboot_pending() {
     local running_k
     running_k="$(uname -r)"
 
-    # Bulletproof Arch Linux pending reboot detection:
-    # A reboot is required when pacman has updated/removed the running kernel modules directory
+    # Arch Linux pending reboot detection:
+    # 1. Running kernel modules directory deleted during kernel update
     if [[ ! -d "/usr/lib/modules/$running_k" ]]; then
-        add_row "Reboot pending" "WARN ⚠ (running kernel $running_k deleted on disk)"
+        add_row "Reboot pending" "WARN ⚠ (running kernel $running_k modules deleted on disk)"
         ((WARNINGS++))
         log "HEALTH reboot_pending=YES reason=modules_dir_missing"
-    else
-        add_row "Reboot pending" "PASS ✔ (running kernel is current)"
-        log "HEALTH reboot_pending=NO"
+        return
     fi
+
+    # 2. Modules directory unpopulated or missing modules.dep
+    if [[ ! -f "/usr/lib/modules/$running_k/modules.dep" || ! -s "/usr/lib/modules/$running_k/modules.dep" ]]; then
+        add_row "Reboot pending" "WARN ⚠ (modules.dep missing/empty for $running_k)"
+        ((WARNINGS++))
+        log "HEALTH reboot_pending=YES reason=modules_dep_missing"
+        return
+    fi
+
+    add_row "Reboot pending" "PASS ✔ (running kernel is current)"
+    log "HEALTH reboot_pending=NO"
 }
 
 check_previous_boot() {
-    if ! journalctl -b -1 -n 1 &>/dev/null; then
-        add_row "Previous session shutdown" "INFO ℹ (no previous boot record)"
+    local has_prev_boot=false
+    if journalctl --list-boots --no-pager 2>/dev/null | grep -qE -- '^[[:space:]]*-1[[:space:]]'; then
+        has_prev_boot=true
+    fi
+
+    if ! $has_prev_boot; then
+        add_row "Previous session shutdown" "INFO ℹ (no previous boot record in journal)"
         log "HEALTH previous_boot=INFO no_record"
         return
     fi
 
-    local journal_unclean fsck_recovery last_shutdown
-    journal_unclean="$(journalctl -b 0 -u systemd-journald --no-pager 2>/dev/null | grep -im 1 "corrupted or uncleanly shut down" || true)"
-    fsck_recovery="$(journalctl -b 0 -u "systemd-fsck*" --no-pager 2>/dev/null | grep -im 1 -E "recovering journal|dirty bit is set" || true)"
-    last_shutdown="$(journalctl -b -1 -n 50 --no-pager 2>/dev/null | grep -m 1 -E "systemd-shutdown|Reached target (System Reboot|System Power Off|System Shutdown)" || true)"
+    local journal_unclean fsck_recovery kernel_panic last_shutdown
+    journal_unclean="$(LC_ALL=C journalctl -b 0 -u systemd-journald --no-pager 2>/dev/null | grep -im 1 -E "corrupted or uncleanly shut down|Journal file .* was not closed cleanly" || true)"
+    fsck_recovery="$(LC_ALL=C journalctl -b 0 -u "systemd-fsck*" --no-pager 2>/dev/null | grep -im 1 -E "recovering journal|dirty bit is set|contains a file system with errors" || true)"
+    kernel_panic="$(LC_ALL=C journalctl -b -1 -k -p 0..2 --no-pager 2>/dev/null | grep -im 1 -E "Kernel panic|BUG: unable to handle|Oops:|watchdog: BUG: soft lockup" || true)"
+    last_shutdown="$(LC_ALL=C journalctl -b -1 -n 150 --no-pager 2>/dev/null | grep -im 1 -E "systemd-shutdown|Reached target (System Reboot|System Power Off|System Shutdown)|systemd\[1\]: Shutting down|Journal stopped" || true)"
 
-    if [[ -n "$journal_unclean" || -n "$fsck_recovery" || -z "$last_shutdown" ]]; then
+    if [[ -n "$journal_unclean" || -n "$fsck_recovery" || -n "$kernel_panic" ]]; then
         add_row "Previous session shutdown" "WARN ⚠ (unclean shutdown / crash detected)"
         ((WARNINGS++))
         log "HEALTH previous_boot=WARN unclean=YES"
         {
             echo "### PREVIOUS BOOT / SHUTDOWN INTEGRITY"
-            if [[ -z "$last_shutdown" ]]; then
-                echo "Warning: Previous boot (-1) ended abruptly without a clean systemd shutdown sequence."
-            fi
-            if [[ -n "$journal_unclean" ]]; then
-                echo "Journald notice: $journal_unclean"
-            fi
-            if [[ -n "$fsck_recovery" ]]; then
-                echo "Filesystem recovery on boot: $fsck_recovery"
-            fi
+            [[ -n "$kernel_panic" ]] && echo "Kernel crash in previous boot (-1): $kernel_panic"
+            [[ -n "$journal_unclean" ]] && echo "Journald notice: $journal_unclean"
+            [[ -n "$fsck_recovery" ]] && echo "Filesystem recovery on boot: $fsck_recovery"
             echo ""
         } >> "$LOG_FILE"
-    else
+    elif [[ -n "$last_shutdown" ]]; then
         add_row "Previous session shutdown" "PASS ✔ (clean shutdown)"
         log "HEALTH previous_boot=PASS"
+    else
+        add_row "Previous session shutdown" "INFO ℹ (no shutdown marker recorded; no errors found)"
+        log "HEALTH previous_boot=INFO inconclusive"
     fi
 }
-
 # ---------------------------------------------------------------------------
 # Kernel <-> Bootloader Synchronization Engine (Universal Arch Ecosystem)
 # ---------------------------------------------------------------------------
