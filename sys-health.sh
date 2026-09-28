@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.31
+# Arch System Health & Diagnostics v2.32
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.31"
+VERSION="2.32"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -772,7 +772,10 @@ detect_initramfs_generator() {
             if [[ -f /usr/share/libalpm/hooks/90-dracut-install.hook || -f /etc/pacman.d/hooks/90-dracut-install.hook || -f /usr/share/libalpm/hooks/eos-dracut.hook ]]; then
                 echo "dracut"
                 return
-            elif [[ -f /usr/share/libalpm/hooks/90-mkinitcpio-install.hook ]]; then
+            elif [[ -f /usr/share/libalpm/hooks/90-mkinitcpio-install.hook || -f /etc/pacman.d/hooks/90-mkinitcpio-install.hook || -f /usr/share/libalpm/hooks/60-mkinitcpio-remove.hook ]]; then
+                echo "mkinitcpio"
+                return
+            elif compgen -G "/etc/mkinitcpio.d/*.preset" >/dev/null 2>&1 && ! compgen -G "/etc/dracut.conf.d/*.conf" >/dev/null 2>&1; then
                 echo "mkinitcpio"
                 return
             fi
@@ -3176,7 +3179,12 @@ _resolve_kernel_and_initramfs() {
                         [[ -d "$bdir" ]] || continue
                         local cand_bk="" cand_bi=""
                         if [[ -z "$resolved_k" && -n "$pk_val" ]]; then
-                            for cand_k in "${bdir}/${pk_val}" "${bdir}/vmlinuz-${pk_val}"; do
+                            for cand_k in "${bdir}/${pk_val}" "${bdir}/${pk_val##*/}" "${bdir}/vmlinuz-${pk_val}" "${bdir}/vmlinuz-${pk_val##*/}"; do
+                                [[ -f "$cand_k" ]] && { cand_bk="$cand_k"; break; }
+                            done
+                        fi
+                        if [[ -z "$resolved_k" && -n "$pk_dest" ]]; then
+                            for cand_k in "${bdir}/${pk_dest}" "${bdir}/${pk_dest##*/}"; do
                                 [[ -f "$cand_k" ]] && { cand_bk="$cand_k"; break; }
                             done
                         fi
@@ -3441,6 +3449,11 @@ check_kernel() {
                     *-hardened*) pkgb="linux-hardened" ;;
                     *-rt*)       pkgb="linux-rt" ;;
                     *-arch*)     pkgb="linux" ;;
+                    *-MANJARO*|*-manjaro*)
+                        if [[ "$kver" =~ ^([0-9]+)\.([0-9]+) ]]; then
+                            pkgb="linux${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+                        fi
+                        ;;
                 esac
                 if [[ -z "$pkgb" ]] && command -v pacman &>/dev/null; then
                     pkgb="$(pacman -Qqo "$kdir" 2>/dev/null | head -n1 || true)"
@@ -3504,6 +3517,11 @@ check_initramfs() {
             *-hardened*) pkgbase="linux-hardened" ;;
             *-rt*)       pkgbase="linux-rt" ;;
             *-arch*)     pkgbase="linux" ;;
+            *-MANJARO*|*-manjaro*)
+                if [[ "$running" =~ ^([0-9]+)\.([0-9]+) ]]; then
+                    pkgbase="linux${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+                fi
+                ;;
             *)
                 if command -v pacman &>/dev/null; then
                     pkgbase="$(pacman -Qqo "/usr/lib/modules/$running" 2>/dev/null | head -n1 || true)"
@@ -9628,7 +9646,19 @@ run_guarded_upgrade() {
                 local pkgb="${k##*:}"
                 local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
                 _resolve_kernel_and_initramfs "$pkgb" "$kver"
-                local target_initrd="${k_initrd:-/boot/initramfs-${pkgb}.img}"
+                local target_initrd="${k_initrd:-}"
+                if [[ -z "$target_initrd" ]]; then
+                    local -a cands=()
+                    if command -v boot_sync_kernel_candidates &>/dev/null; then
+                        mapfile -t cands < <(boot_sync_kernel_candidates "$pkgb" 2>/dev/null)
+                    fi
+                    local c_cand="${cands[1]:-${cands[0]:-$pkgb}}"
+                    if [[ "$c_cand" =~ ^[0-9] ]]; then
+                        target_initrd="/boot/initramfs-${c_cand}.img"
+                    else
+                        target_initrd="/boot/initramfs-${pkgb}.img"
+                    fi
+                fi
                 if command -v dracut &>/dev/null; then
                     echo "  [Initramfs Repair] Regenerate Dracut image for $pkgb ($kver):"
                     echo "    sudo dracut --force --kver \"$kver\""
