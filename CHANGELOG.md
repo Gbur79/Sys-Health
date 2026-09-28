@@ -6,9 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.32] - 2026-09-28
+
+### Fixed & Hardened (SRE Architectural Audit - Full Ecosystem Parity & Blast-Radius Expansion)
+- **Symmetric Kernel Image Path Resolution (`_resolve_kernel_and_initramfs`)**:
+  - Eliminated path mismatch when mkinitcpio presets specify absolute or prefixed paths (`/boot/vmlinuz-6.12-x86_64`) across split mountpoints or container environments.
+  - Added symmetric filename stem stripping (`${pk_val##*/}`, `${pk_dest##*/}`) matching initramfs resolution behavior.
+- **Resilient Manjaro Package Base Fallback (`check_kernel` & `check_initramfs`)**:
+  - Added heuristic version-branch parsing (`*-MANJARO*` ➔ `linux${maj}${min}`) preventing spurious fallbacks to generic `linux` when `/usr/lib/modules/*/pkgbase` is inaccessible.
+- **ALPM Hook & Preset Generator Disambiguation (`detect_initramfs_generator`)**:
+  - Enhanced dual-generator disambiguation by checking `/etc/pacman.d/hooks/`, removal hooks, and active `/etc/mkinitcpio.d/*.preset` definitions, preventing Manjaro systems with dormant Dracut packages from misidentifying the active generator.
+- **Adaptive Post-Flight Recovery Guidance (`run_guarded_upgrade`)**:
+  - Replaced hardcoded `/boot/initramfs-${pkgb}.img` repair hints with dynamically resolved candidate artifacts.
+
 ## [2.31] - 2026-09-28
 
-### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Manjaro & Multi-Distro Bootloader Sync Resolution)
+### Fixed & Hardened (SRE Architectural Audit - Manjaro & Multi-Distro Bootloader Sync Resolution)
 - **Universal Multi-Distro Bootloader Candidate Resolution Engine (`boot_sync_kernel_candidates`, `boot_sync_config_has_kernel`, `boot_sync_filename_has_kernel`)**:
   - Eliminated universal false-positive desynchronization warning on Manjaro (`missing entries: linux612,linux618`) occurring when kernels are fully present in `grub.cfg` and booting normally.
   - Implemented multi-tiered candidate discovery marrying kernel module metadata (`/usr/lib/modules/<kver>`, `${kver_majmin}-${host_arch}`) with declarative mkinitcpio presets (`_parse_mkinitcpio_preset`).
