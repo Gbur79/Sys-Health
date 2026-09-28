@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.30] - 2026-09-28
+
+### Fixed & Hardened (SRE Architectural Audit - Multi-Distro Kernel & Mkinitcpio Sandboxing)
+- **Declarative Mkinitcpio Preset Sandboxing (`_parse_mkinitcpio_preset` & `_resolve_kernel_and_initramfs`)**:
+  - Eliminated universal kernel check failure on Manjaro/Mabox (`linux612`, `linux618`) caused by mismatch between package base names and release-branch artifact names (`vmlinuz-6.18-x86_64`).
+  - Implemented secure, sandboxed subshell parser for `/etc/mkinitcpio.d/*.preset` files, extracting `ALL_kver`, `ALL_kerneldest`, `${PRESET}_image`, and `${PRESET}_uki` without caller variable pollution or arbitrary code risks.
+- **Dynamic Multi-Kernel Pattern Expansion (Tier 2 Flat Layout)**:
+  - Added `${kver_majmin}-${host_arch}` candidate matching across traditional flat layouts, booster images, and degraded fallbacks.
+  - Ensures robust kernel and initramfs discovery even on systems where presets are omitted, modified, or bypassed by custom build pipelines.
+
 ## [2.29] - 2026-09-28
 
 ### Fixed & Hardened (SRE Architectural Audit - Mirror Topology, Discovery & Transactional Ranking Engine)
