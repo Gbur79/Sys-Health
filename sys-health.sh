@@ -3910,7 +3910,7 @@ boot_sync_kernel_candidates() {
                         stem="${stem%.img}"
                         stem="${stem%.efi}"
                         stem="${stem%-fallback}"
-                        [[ -n "$stem" ]] && cands+=("$stem")
+                        [[ "$stem" =~ ^[[:alnum:]_.+-]+$ ]] && cands+=("$stem")
                     done
                 fi
             fi
