@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.30
+# Arch System Health & Diagnostics v2.31
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.30"
+VERSION="2.31"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -3831,17 +3831,134 @@ boot_sync_kernel_bases() {
     done | sort -u
 }
 
+boot_sync_kernel_candidates() {
+    local kernel="$1"
+    local -a cands=("$kernel")
+    local pkgbase_file cur_base kdir kver kver_majmin host_arch
+    host_arch="$(uname -m 2>/dev/null || echo "x86_64")"
+
+    # 1. Inspect module directories: correlate kernel pkgbase with kver & arch
+    for pkgbase_file in /usr/lib/modules/*/pkgbase; do
+        [[ -r "$pkgbase_file" ]] || continue
+        IFS= read -r cur_base < "$pkgbase_file" || continue
+        cur_base="${cur_base//[[:space:]]/}"
+        if [[ "$cur_base" == "$kernel" ]]; then
+            kdir="${pkgbase_file%/pkgbase}"
+            kver="${kdir##*/}"
+            cands+=("$kver")
+            if [[ "$kver" =~ ^([0-9]+\.[0-9]+) ]]; then
+                kver_majmin="${BASH_REMATCH[1]}"
+                cands+=("${kver_majmin}-${host_arch}")
+            fi
+            break
+        fi
+    done
+
+    # 2. Declarative mkinitcpio presets (authoritative distribution/custom paths)
+    if [[ -d "/etc/mkinitcpio.d" ]]; then
+        local preset_file="" cand_p
+        for cand_p in \
+            "/etc/mkinitcpio.d/${kernel}.preset" \
+            "/etc/mkinitcpio.d/linux-${kernel#linux}.preset" \
+            "/etc/mkinitcpio.d/linux${kernel#linux-}.preset"; do
+            if [[ -f "$cand_p" && -r "$cand_p" ]]; then
+                preset_file="$cand_p"
+                break
+            fi
+        done
+        if [[ -z "$preset_file" && -n "$kver_majmin" ]]; then
+            for cand_p in "/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
+                if [[ -f "$cand_p" && -r "$cand_p" ]]; then
+                    preset_file="$cand_p"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$preset_file" && -r "$preset_file" ]]; then
+            if command -v _parse_mkinitcpio_preset &>/dev/null; then
+                local -a p_vars=()
+                mapfile -t p_vars < <(_parse_mkinitcpio_preset "$preset_file")
+                if (( ${#p_vars[@]} >= 4 )); then
+                    local pk_val="${p_vars[0]}" pk_dest="${p_vars[1]}"
+                    local p_img="${p_vars[2]}" p_uki="${p_vars[3]}"
+                    local p_fb_img="${p_vars[4]:-}" p_fb_uki="${p_vars[5]:-}"
+                    local raw stem
+                    for raw in "$pk_val" "$pk_dest" "$p_img" "$p_uki" "$p_fb_img" "$p_fb_uki"; do
+                        [[ -n "$raw" ]] || continue
+                        stem="${raw##*/}"
+                        stem="${stem#vmlinuz-}"
+                        stem="${stem#initramfs-}"
+                        stem="${stem%.img}"
+                        stem="${stem%.efi}"
+                        stem="${stem%-fallback}"
+                        [[ -n "$stem" ]] && cands+=("$stem")
+                    done
+                fi
+            fi
+        fi
+    fi
+
+    # Output deduplicated candidates
+    printf "%s\n" "${cands[@]}" | awk '!seen[$0]++'
+}
+
+_escape_ere_pattern() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//./\\.}"
+    s="${s//+/\\+}"
+    s="${s//\*/\\*}"
+    s="${s//\?/\\?}"
+    s="${s//[/\[}"
+    s="${s//]/\]}"
+    s="${s//(/\\(}"
+    s="${s//)/\\)}"
+    s="${s//^/\\^}"
+    s="${s//\$/\\$}"
+    s="${s//|/\\|}"
+    echo "$s"
+}
+
 boot_sync_config_has_kernel() {
     local content="$1"
     local base="$2"
-    local pat="(vmlinuz-|initramfs-|initrd-|Linux[[:space:]]+)${base}([[:space:]/'\".,)]|$)"
+    local -a cands=()
+    mapfile -t cands < <(boot_sync_kernel_candidates "$base")
+
+    local cand cand_escaped cand_pat pat
+    local -a escaped_cands=()
+    for cand in "${cands[@]}"; do
+        [[ -n "$cand" ]] || continue
+        cand_escaped="$(_escape_ere_pattern "$cand")"
+        escaped_cands+=("$cand_escaped")
+    done
+
+    (( ${#escaped_cands[@]} == 0 )) && escaped_cands=("$base")
+    cand_pat="$(IFS='|'; echo "${escaped_cands[*]}")"
+    pat="(vmlinuz-|initramfs-|initrd-|Linux[[:space:]]+)(${cand_pat})([[:space:]/'\".,)]|$)"
+
     grep -qiE "$pat" <<< "$content"
 }
 
 boot_sync_filename_has_kernel() {
     local filename="$1"
     local base="$2"
-    local pat="(^|[-_.])${base}([-_.]|$)"
+    local -a cands=()
+    mapfile -t cands < <(boot_sync_kernel_candidates "$base")
+
+    local cand cand_escaped cand_pat pat
+    local -a escaped_cands=()
+    for cand in "${cands[@]}"; do
+        [[ -n "$cand" ]] || continue
+        cand_escaped="$(_escape_ere_pattern "$cand")"
+        escaped_cands+=("$cand_escaped")
+    done
+
+    (( ${#escaped_cands[@]} == 0 )) && escaped_cands=("$base")
+    cand_pat="$(IFS='|'; echo "${escaped_cands[*]}")"
+    pat="(^|[-_.])(${cand_pat})([-_.]|$)"
+
     grep -qiE "$pat" <<< "$filename"
 }
 
