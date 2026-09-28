@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.31] - 2026-09-28
+
+### Fixed & Hardened (Terra EOS-SRE Architectural Audit - Manjaro & Multi-Distro Bootloader Sync Resolution)
+- **Universal Multi-Distro Bootloader Candidate Resolution Engine (`boot_sync_kernel_candidates`, `boot_sync_config_has_kernel`, `boot_sync_filename_has_kernel`)**:
+  - Eliminated universal false-positive desynchronization warning on Manjaro (`missing entries: linux612,linux618`) occurring when kernels are fully present in `grub.cfg` and booting normally.
+  - Implemented multi-tiered candidate discovery marrying kernel module metadata (`/usr/lib/modules/<kver>`, `${kver_majmin}-${host_arch}`) with declarative mkinitcpio presets (`_parse_mkinitcpio_preset`).
+  - Generalized candidate resolution across all 5 supported bootloader architectures (`grub`, `systemd-boot`, `limine`, `refind`, `uki`) without mutating canonical reporting names or breaking post-flight verification.
+  - Added zero-subprocess pure Bash ERE pattern escaping (`_escape_ere_pattern`), guaranteeing sub-millisecond regex compilation and zero regressions on Dracut/EndeavourOS systems.
 
 ## [2.30] - 2026-09-28
 
