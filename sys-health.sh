@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.29
+# Arch System Health & Diagnostics v2.30
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.29"
+VERSION="2.30"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2993,6 +2993,34 @@ _find_pacnew_files() {
     find "${scan_dirs[@]}" -maxdepth 7 -type f -name '*.pacnew' 2>/dev/null | sort -u || true
 }
 
+# --- Declarative mkinitcpio preset parser (isolated subshell sandbox) ---
+_parse_mkinitcpio_preset() {
+    local preset="$1"
+    [[ -f "$preset" && -r "$preset" ]] || return 1
+    (
+        set +e +u +o pipefail 2>/dev/null
+        ALL_kver="" ALL_kerneldest="" PRESETS=()
+        # shellcheck source=/dev/null
+        source "$preset" 2>/dev/null || exit 1
+
+        local p0="${PRESETS[0]:-default}"
+        local p0_kver="${p0}_kver" p0_kdest="${p0}_kerneldest"
+        local p0_img="${p0}_image" p0_uki="${p0}_uki"
+        local p1="${PRESETS[1]:-fallback}"
+        local p1_img="${p1}_image" p1_uki="${p1}_uki"
+
+        local k_val="${!p0_kver:-${ALL_kver:-}}"
+        local k_dest="${!p0_kdest:-${ALL_kerneldest:-}}"
+        local img_val="${!p0_img:-${default_image:-}}"
+        local uki_val="${!p0_uki:-${default_uki:-${default_efi_image:-}}}"
+        local fb_img="${!p1_img:-${fallback_image:-}}"
+        local fb_uki="${!p1_uki:-${fallback_uki:-}}"
+
+        printf "%s\n%s\n%s\n%s\n%s\n%s\n" \
+            "$k_val" "$k_dest" "$img_val" "$uki_val" "$fb_img" "$fb_uki"
+    )
+}
+
 _resolve_kernel_and_initramfs() {
     local pkgb="$1"
     local kver="$2"
@@ -3008,6 +3036,13 @@ _resolve_kernel_and_initramfs() {
     local bdir u_cand entry l_rel i_rel cand_k cand_i cand_f bls_k bls_i
     local uki_pat="^(.*[-_])?${pkgb}([-_.][0-9].*)?$"
 
+    local kver_majmin=""
+    if [[ "$kver" =~ ^([0-9]+\.[0-9]+) ]]; then
+        kver_majmin="${BASH_REMATCH[1]}"
+    fi
+    local host_arch
+    host_arch="$(uname -m 2>/dev/null || echo "x86_64")"
+
     # 1. UKI Check (Unified Kernel Image - Type #2 BLS)
     for bdir in "${boot_dirs[@]}"; do
         [[ -d "$bdir" ]] || continue
@@ -3015,7 +3050,7 @@ _resolve_kernel_and_initramfs() {
             [[ -f "$u_cand" ]] || continue
             local bname="${u_cand%.efi}"
             bname="${bname##*/}"
-            if [[ "$bname" =~ $uki_pat || ( -n "$kver" && "$bname" == *"$kver"* ) ]]; then
+            if [[ "$bname" =~ $uki_pat || ( -n "$kver" && "$bname" == *"$kver"* ) || ( -n "$kver_majmin" && "$bname" == *"$kver_majmin"* ) ]]; then
                 k_vmlinuz="$u_cand"
                 k_initrd="$u_cand"
                 k_mode="uki"
@@ -3038,11 +3073,14 @@ _resolve_kernel_and_initramfs() {
                 local entry_matches=false
                 if [[ -n "$l_rel" ]]; then
                     local l_base="${l_rel##*/}"
-                    if [[ "$l_base" =~ $uki_pat || ( -n "$kver" && "$l_rel" == *"$kver"* ) ]]; then
+                    if [[ "$l_base" =~ $uki_pat || ( -n "$kver" && "$l_rel" == *"$kver"* ) || ( -n "$kver_majmin" && "$l_rel" == *"$kver_majmin"* ) ]]; then
                         entry_matches=true
                     fi
                 fi
                 if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "linux[[:space:]]+.*${kver}" "$entry" 2>/dev/null; then
+                    entry_matches=true
+                fi
+                if ! $entry_matches && [[ -n "$kver_majmin" ]] && grep -qiE "linux[[:space:]]+.*${kver_majmin}" "$entry" 2>/dev/null; then
                     entry_matches=true
                 fi
 
@@ -3080,31 +3118,159 @@ _resolve_kernel_and_initramfs() {
         fi
     done
 
-    # 3. Traditional Flat Layout (Atomic per boot root: both kernel & initrd must coexist in same bdir)
+    # 2.5 Authoritative mkinitcpio Preset Parsing (Tier 1 Dynamic Declarative Discovery)
+    # Checks /etc/mkinitcpio.d/ presets for exact user/distribution image paths (Manjaro, Arch, Mabox)
+    if [[ -d "/etc/mkinitcpio.d" ]]; then
+        local preset_file="" cand_p
+        for cand_p in \
+            "/etc/mkinitcpio.d/${pkgb}.preset" \
+            "/etc/mkinitcpio.d/linux-${pkgb#linux}.preset" \
+            "/etc/mkinitcpio.d/linux${pkgb#linux-}.preset"; do
+            if [[ -f "$cand_p" && -r "$cand_p" ]]; then
+                preset_file="$cand_p"
+                break
+            fi
+        done
+        if [[ -z "$preset_file" && -n "$kver_majmin" ]]; then
+            for cand_p in "/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
+                if [[ -f "$cand_p" && -r "$cand_p" ]]; then
+                    preset_file="$cand_p"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$preset_file" ]]; then
+            local -a p_vars=()
+            mapfile -t p_vars < <(_parse_mkinitcpio_preset "$preset_file")
+            if (( ${#p_vars[@]} >= 4 )); then
+                local pk_val="${p_vars[0]}" pk_dest="${p_vars[1]}"
+                local p_img="${p_vars[2]}" p_uki="${p_vars[3]}"
+                local p_fb_img="${p_vars[4]:-}" p_fb_uki="${p_vars[5]:-}"
+
+                # Handle preset-configured UKI
+                if [[ -n "$p_uki" && -f "$p_uki" ]]; then
+                    k_vmlinuz="$p_uki"
+                    k_initrd="$p_uki"
+                    k_mode="uki"
+                    k_sz="$(stat -c %s "$p_uki" 2>/dev/null || echo 0)"
+                    [[ -n "$p_fb_uki" && -f "$p_fb_uki" ]] && k_fallback="$p_fb_uki"
+                    return 0
+                fi
+
+                # Resolve preset kernel destination / path
+                local resolved_k="" resolved_i=""
+                if [[ -n "$pk_dest" && "$pk_dest" == /* && -f "$pk_dest" ]]; then
+                    resolved_k="$pk_dest"
+                elif [[ -n "$pk_val" && "$pk_val" == /* && -f "$pk_val" ]]; then
+                    resolved_k="$pk_val"
+                fi
+
+                if [[ -n "$p_img" && "$p_img" == /* && -f "$p_img" ]]; then
+                    resolved_i="$p_img"
+                fi
+
+                # If preset specified filenames or relative paths, locate under boot_dirs
+                if [[ -z "$resolved_k" || -z "$resolved_i" ]]; then
+                    for bdir in "${boot_dirs[@]}"; do
+                        [[ -d "$bdir" ]] || continue
+                        local cand_bk="" cand_bi=""
+                        if [[ -z "$resolved_k" && -n "$pk_val" ]]; then
+                            for cand_k in "${bdir}/${pk_val}" "${bdir}/vmlinuz-${pk_val}"; do
+                                [[ -f "$cand_k" ]] && { cand_bk="$cand_k"; break; }
+                            done
+                        fi
+                        if [[ -z "$resolved_i" && -n "$p_img" ]]; then
+                            for cand_i in "${bdir}/${p_img}" "${bdir}/${p_img##*/}"; do
+                                [[ -f "$cand_i" ]] && { cand_bi="$cand_i"; break; }
+                            done
+                        fi
+                        if [[ -n "$cand_bk" && -n "$cand_bi" ]]; then
+                            resolved_k="$cand_bk"
+                            resolved_i="$cand_bi"
+                            break
+                        fi
+                    done
+                fi
+
+                # Atomic validation: both kernel and initrd must coexist and be verified
+                if [[ -n "$resolved_k" && -f "$resolved_k" && -n "$resolved_i" && -f "$resolved_i" ]]; then
+                    k_vmlinuz="$resolved_k"
+                    k_initrd="$resolved_i"
+                    k_mode="normal"
+                    k_sz="$(stat -c %s "$resolved_i" 2>/dev/null || echo 0)"
+                    if [[ -n "$p_fb_img" && -f "$p_fb_img" ]]; then
+                        k_fallback="$p_fb_img"
+                    elif [[ -n "$p_fb_img" ]]; then
+                        for bdir in "${boot_dirs[@]}"; do
+                            if [[ -f "${bdir}/${p_fb_img##*/}" ]]; then
+                                k_fallback="${bdir}/${p_fb_img##*/}"
+                                break
+                            fi
+                        done
+                    fi
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # 3. Traditional Flat Layout (Tier 2: Agnostic Dynamic Pattern Expansion)
+    # Strictly atomic per boot root: both kernel & initrd must coexist in same bdir
     for bdir in "${boot_dirs[@]}"; do
         [[ -d "$bdir" ]] || continue
         local cur_k="" cur_i="" cur_f="" cur_mode="normal"
 
-        for cand_k in \
-            "${bdir}/vmlinuz-${pkgb}" \
-            "${bdir}/vmlinuz-${kver}" \
-            "${bdir}/${pkgb}/vmlinuz" \
-            "${bdir}/${pkgb}/linux"; do
+        local -a k_candidates=(
+            "${bdir}/vmlinuz-${pkgb}"
+            "${bdir}/vmlinuz-${kver}"
+        )
+        if [[ -n "$kver_majmin" ]]; then
+            k_candidates+=(
+                "${bdir}/vmlinuz-${kver_majmin}-${host_arch}"
+                "${bdir}/vmlinuz-${kver_majmin}"
+            )
+        fi
+        k_candidates+=(
+            "${bdir}/${pkgb}/vmlinuz"
+            "${bdir}/${pkgb}/linux"
+        )
+
+        for cand_k in "${k_candidates[@]}"; do
             if [[ -f "$cand_k" ]]; then
                 cur_k="$cand_k"
                 break
             fi
         done
 
-        for cand_i in \
-            "${bdir}/initramfs-${pkgb}.img" \
-            "${bdir}/initramfs-${kver}.img" \
-            "${bdir}/initramfs-${pkgb}" \
-            "${bdir}/initrd-${pkgb}.img" \
-            "${bdir}/initrd-${pkgb}" \
-            "${bdir}/initrd-${kver}" \
-            "${bdir}/${pkgb}/initramfs.img" \
-            "${bdir}/${pkgb}/initrd"; do
+        local -a i_candidates=(
+            "${bdir}/initramfs-${pkgb}.img"
+            "${bdir}/initramfs-${kver}.img"
+        )
+        if [[ -n "$kver_majmin" ]]; then
+            i_candidates+=(
+                "${bdir}/initramfs-${kver_majmin}-${host_arch}.img"
+                "${bdir}/initramfs-${kver_majmin}.img"
+            )
+        fi
+        i_candidates+=(
+            "${bdir}/initramfs-${pkgb}"
+            "${bdir}/initrd-${pkgb}.img"
+            "${bdir}/initrd-${pkgb}"
+            "${bdir}/initrd-${kver}"
+        )
+        if [[ -n "$kver_majmin" ]]; then
+            i_candidates+=(
+                "${bdir}/initrd-${kver_majmin}-${host_arch}.img"
+                "${bdir}/initrd-${kver_majmin}.img"
+            )
+        fi
+        i_candidates+=(
+            "${bdir}/${pkgb}/initramfs.img"
+            "${bdir}/${pkgb}/initrd"
+        )
+
+        for cand_i in "${i_candidates[@]}"; do
             if [[ -f "$cand_i" ]]; then
                 cur_i="$cand_i"
                 cur_mode="normal"
@@ -3113,9 +3279,17 @@ _resolve_kernel_and_initramfs() {
         done
 
         if [[ -z "$cur_i" ]]; then
-            for cand_i in \
-                "${bdir}/booster-${pkgb}.img" \
-                "${bdir}/booster-${kver}.img"; do
+            local -a b_candidates=(
+                "${bdir}/booster-${pkgb}.img"
+                "${bdir}/booster-${kver}.img"
+            )
+            if [[ -n "$kver_majmin" ]]; then
+                b_candidates+=(
+                    "${bdir}/booster-${kver_majmin}-${host_arch}.img"
+                    "${bdir}/booster-${kver_majmin}.img"
+                )
+            fi
+            for cand_i in "${b_candidates[@]}"; do
                 if [[ -f "$cand_i" ]]; then
                     cur_i="$cand_i"
                     cur_mode="booster"
@@ -3131,11 +3305,22 @@ _resolve_kernel_and_initramfs() {
             k_mode="$cur_mode"
             k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
 
-            for cand_f in \
-                "${bdir}/initramfs-${pkgb}-fallback.img" \
-                "${bdir}/initramfs-${pkgb}_fallback.img" \
-                "${bdir}/initramfs-${kver}-fallback.img" \
-                "${bdir}/initrd-${pkgb}-fallback.img"; do
+            local -a f_candidates=(
+                "${bdir}/initramfs-${pkgb}-fallback.img"
+                "${bdir}/initramfs-${pkgb}_fallback.img"
+                "${bdir}/initramfs-${kver}-fallback.img"
+            )
+            if [[ -n "$kver_majmin" ]]; then
+                f_candidates+=(
+                    "${bdir}/initramfs-${kver_majmin}-${host_arch}-fallback.img"
+                    "${bdir}/initramfs-${kver_majmin}-fallback.img"
+                )
+            fi
+            f_candidates+=(
+                "${bdir}/initrd-${pkgb}-fallback.img"
+            )
+
+            for cand_f in "${f_candidates[@]}"; do
                 if [[ -f "$cand_f" ]]; then
                     k_fallback="$cand_f"
                     break
@@ -3166,18 +3351,45 @@ _resolve_kernel_and_initramfs() {
     for bdir in "${boot_dirs[@]}"; do
         [[ -d "$bdir" ]] || continue
         local deg_k="" deg_i=""
-        for cand_k in "${bdir}/vmlinuz-${pkgb}" "${bdir}/vmlinuz-${kver}"; do
+
+        local -a deg_k_cand=(
+            "${bdir}/vmlinuz-${pkgb}"
+            "${bdir}/vmlinuz-${kver}"
+        )
+        [[ -n "$kver_majmin" ]] && deg_k_cand+=(
+            "${bdir}/vmlinuz-${kver_majmin}-${host_arch}"
+            "${bdir}/vmlinuz-${kver_majmin}"
+        )
+        for cand_k in "${deg_k_cand[@]}"; do
             if [[ -f "$cand_k" ]]; then
                 deg_k="$cand_k"
                 break
             fi
         done
-        for cand_i in "${bdir}/initramfs-${pkgb}.img" "${bdir}/initramfs-${kver}.img" "${bdir}/booster-${pkgb}.img"; do
+
+        local -a deg_i_cand=(
+            "${bdir}/initramfs-${pkgb}.img"
+            "${bdir}/initramfs-${kver}.img"
+        )
+        [[ -n "$kver_majmin" ]] && deg_i_cand+=(
+            "${bdir}/initramfs-${kver_majmin}-${host_arch}.img"
+            "${bdir}/initramfs-${kver_majmin}.img"
+        )
+        deg_i_cand+=(
+            "${bdir}/booster-${pkgb}.img"
+            "${bdir}/booster-${kver}.img"
+        )
+        [[ -n "$kver_majmin" ]] && deg_i_cand+=(
+            "${bdir}/booster-${kver_majmin}-${host_arch}.img"
+        )
+
+        for cand_i in "${deg_i_cand[@]}"; do
             if [[ -f "$cand_i" ]]; then
                 deg_i="$cand_i"
                 break
             fi
         done
+
         if [[ -n "$deg_k" || -n "$deg_i" ]]; then
             k_vmlinuz="$deg_k"
             k_initrd="$deg_i"
