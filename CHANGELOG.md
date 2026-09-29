@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.37] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - BLS Machine-ID & DAC Boundaries / PATCH-026)
+- **systemd-boot BLS Type #1 Machine-ID Discovery (`_boot_sync_audit`, `boot_sync_config_has_kernel`)**:
+  - Broadened bootloader synchronization parser to dynamically recognize standard systemd `kernel-install` layouts containing machine-id directories (`linux /<machine-id>/<kver>/linux`).
+  - Added entry filename interrogation (`boot_sync_filename_has_kernel`) on `loader/entries/*.conf` before reading content, preventing false-positive `WARN ⚠` on healthy systemd-boot setups.
+  - Hardened config directive pattern to match `version`, `title`, and directory path segments while strictly preserving kernel package boundaries (preventing `linux` from falsely matching `linux-lts` or generic `/linux` filenames).
+- **Multi-Kernel Major.Minor Collision Immunity (`_resolve_kernel_and_initramfs`)**:
+  - Implemented strict two-pass resolution for Type #1 BLS entries. Prioritizes exact kernel version and `pkgbase` matches in Pass 1, falling back to major.minor version matching only in Pass 2.
+  - Prevents concurrent installations of identical kernel versions (e.g. CachyOS 7.2 and XanMod 7.2) from cross-contaminating boot image resolution.
+- **Unprivileged DAC Permission Resiliency (`check_initramfs`)**:
+  - Eliminated raw unprivileged bash `test -s` check on ESP paths with 0750 permissions, relying strictly on `_boot_file_size` telemetry. Eliminates false-positive `FAIL ✖ (truncated image: 68727953 bytes < 1MB)` during non-root executions.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / PATCH-026)**:
+  - Added Part 7 test fixtures covering: BLS Type #1 machine-id layout, same-branch multi-kernel isolation, and 0750 DAC permission tolerance (total hermetic test count expanded from 28 to 31, 100% PASS).
+
 ## [2.36] - 2026-09-29
 
 ### Added & Hardened (SRE Architectural Audit - CPU Microcode & Audio Subsystem / PATCH-025)
