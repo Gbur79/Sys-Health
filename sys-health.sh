@@ -3021,6 +3021,12 @@ detect_boot_directories() {
         return 0
     fi
 
+    # Standard /boot on root filesystem (prioritized for kernel/initramfs)
+    if [[ -d "/boot" && "$seen" != *" /boot "* ]]; then
+        dirs+=("/boot")
+        seen+="/boot "
+    fi
+
     # 1. Authoritative ESP and XBOOTLDR paths from bootctl (if available)
     if command -v bootctl &>/dev/null; then
         bctl_esp="$(bootctl -p 2>/dev/null || true)"
@@ -3119,12 +3125,34 @@ _parse_mkinitcpio_preset() {
 # Safe Boot Access & Privilege Boundary Helpers
 # ------------------------------------------------------------------------------
 
+_path_ancestor_restricted() {
+    local p="${1%/*}"
+    while [[ -n "$p" && "$p" != "/" ]]; do
+        if [[ -e "$p" ]]; then
+            if [[ ! -x "$p" ]]; then
+                return 0
+            fi
+        else
+            local parent="${p%/*}"
+            [[ -z "$parent" ]] && parent="/"
+            if [[ -d "$parent" && -x "$parent" ]]; then
+                return 1
+            fi
+        fi
+        p="${p%/*}"
+    done
+    return 1
+}
+
 _boot_dir_searchable() {
     local dir="$1"
     [[ -z "$dir" ]] && return 1
     [[ -d "$dir" && -x "$dir" ]] && return 0
-    if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo -n test -d "$dir" -a -x "$dir" 2>/dev/null && return 0
+    (( EUID == 0 )) && return 1
+    if _path_ancestor_restricted "$dir"; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo -n test -d "$dir" -a -x "$dir" 2>/dev/null && return 0
+        fi
     fi
     return 1
 }
@@ -3133,8 +3161,11 @@ _boot_file_test() {
     local file="$1"
     [[ -z "$file" ]] && return 1
     [[ -f "$file" ]] && return 0
-    if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo -n test -f "$file" 2>/dev/null && return 0
+    (( EUID == 0 )) && return 1
+    if _path_ancestor_restricted "$file"; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo -n test -f "$file" 2>/dev/null && return 0
+        fi
     fi
     return 1
 }
@@ -3827,9 +3858,13 @@ check_initramfs() {
                 parse_error="booster parser failed"
             fi
         elif command -v lsinitrd &>/dev/null && detect_initramfs_generator | grep -q "dracut"; then
-            if ! (lsinitrd --size "$k_initrd" &>/dev/null || sudo -n lsinitrd --size "$k_initrd" &>/dev/null); then
-                parse_ok=false
-                parse_error="dracut parser failed"
+            local magic
+            magic="$(head -c 6 "$k_initrd" 2>/dev/null || sudo -n head -c 6 "$k_initrd" 2>/dev/null || true)"
+            if [[ "$magic" != "070701" && "$magic" != "070702" ]]; then
+                if ! (file "$k_initrd" 2>/dev/null || sudo -n file "$k_initrd" 2>/dev/null) | grep -qiE 'cpio|gzip|zstandard|zstd|archive|data'; then
+                    parse_ok=false
+                    parse_error="dracut parser failed"
+                fi
             fi
         elif command -v lsinitcpio &>/dev/null && detect_initramfs_generator | grep -q "mkinitcpio"; then
             if ! (lsinitcpio -a "$k_initrd" &>/dev/null || sudo -n lsinitcpio -a "$k_initrd" &>/dev/null); then
@@ -4009,9 +4044,11 @@ boot_sync_collect_paths() {
     {
         if [[ -n "$root_prefix" ]]; then
             printf '%s\n' "$root_prefix" "$root_prefix/boot" "$root_prefix/efi" "$root_prefix/boot/efi"
+        else
+            printf '/\n/boot\n/efi\n/boot/efi\n'
+            findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(boot|efi|esp)(/.*)?$' || :
+            findmnt --fstab -rn -o TARGET 2>/dev/null | grep -E '^/(boot|efi|esp)(/.*)?$' || :
         fi
-        findmnt -rn -o TARGET 2>/dev/null || :
-        findmnt --fstab -rn -o TARGET 2>/dev/null || :
     } | sort -u |
         while IFS= read -r raw; do
             [[ -n "$raw" ]] || continue
@@ -6682,7 +6719,7 @@ except Exception as e:
     gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
     
     if command -v gamemoded &>/dev/null; then
-        if gamemoded -t &>/dev/null; then
+        if gamemoded -s &>/dev/null; then
             gamemode_status="PASS"
         else
             gamemode_status="FAIL_TEST"
