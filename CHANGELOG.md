@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.36] - 2026-09-29
+
+### Added & Hardened (SRE Architectural Audit - CPU Microcode & Audio Subsystem / PATCH-025)
+- **Runtime CPU Early Microcode Verification (`check_cpu_microcode`)**:
+  - Implemented kernel boot log and hardware sysfs interrogation (`/sys/devices/system/cpu/cpu0/microcode/version`), dynamically detecting early microcode delta updates (e.g. `Intel early update: 0x1e ➔ 0x28`).
+  - Added hardware virtualization detection (`systemd-detect-virt`), gracefully bypassing bare-metal microcode requirements on VM guests (KVM, QEMU, Proxmox) and container environments (`PASS ✔ [VM guest - host managed]`).
+  - Added unpatched BIOS detection, warning when bare-metal Intel/AMD hosts run without `intel-ucode` or `amd-ucode` packages installed.
+  - Eliminated `set -o pipefail` SIGPIPE / 141 trap when grepping large kernel log buffers by utilizing bash here-string stream redirection (`<<< "$klog"`).
+- **Audio Subsystem, DSP Firmware & WirePlumber Stack Audit (`check_audio`)**:
+  - Added hardware sound card discovery via ALSA `/proc/asound/cards` and PCI audio device enumeration.
+  - Added proactive kernel log inspection for missing digital signal processor (DSP) firmware (e.g. `sof-firmware`, `alsa-ucm-conf`), preventing silent audio loss on modern Intel (10th-15th gen) and AMD laptops.
+  - Added cross-privilege user session bridge: allows `sudo sys-health` to inspect active user session managers (`PipeWire`, `PulseAudio`, `WirePlumber`) via `/run/user/$target_uid` without D-Bus connection failures.
+  - Added "Dummy Output" / `auto_null` stall detection, warning when PipeWire fails to bind physical hardware audio sinks.
+  - Provided graceful fallback for headless servers and minimal ALSA configurations.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / PATCH-025)**:
+  - Added Part 6 test fixtures covering: Intel early microcode delta assertion, VM guest bypass, bare-metal missing microcode warning, kernel DSP firmware missing detection, PipeWire Dummy Output stall warning, and headless ALSA clean pass (total hermetic test count expanded from 22 to 28, 100% PASS).
+
 ## [2.35] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Hardware & Drivers Resiliency / PATCH-024)
