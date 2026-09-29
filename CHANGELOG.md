@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.41] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Bootloader Sync DAC Boundaries & systemd-boot Entry Matching / PATCH-030)
+- **DAC Privilege Boundary Traversal on ESP Mountpoints (`boot_sync_collect_paths`)**:
+  - Replaced unprivileged bash `[[ -d "$path" ]]` and `[[ -f "$path" ]]` checks with DAC-aware helper functions `_boot_dir_searchable` and `_boot_file_test`.
+  - Enables unprivileged executions using passwordless `sudo -n` to traverse EFI System Partitions mounted with restricted permissions (`0750` or `0700` `root:root`, e.g. `/efi/loader/entries`), preventing false empty directory discovery.
+- **systemd-boot Colon Key-Value Directive Alignment (`boot_sync_config_has_kernel`)**:
+  - Updated regex parser to support colon-separated key-value directives (`version:?`, `title:?`, `menuentry:?`, `linux:?`, `initrd:?`).
+  - Added matching on `id:` and `source:` entries output by `bootctl --no-pager list`.
+  - Fixes false `bootloader_sync=WARN` reports where `bootctl list` successfully retrieved all installed kernels but was rejected by the configuration parser due to trailing colons in `systemd-boot` output.
+- **Clarified Primary Boot Entry Semantics & Fallback Policy (`_boot_sync_audit`)**:
+  - Refined warning message from `missing entries: ...` to `missing main entries: ... ($hint_cmd)`.
+  - Formally documents and guarantees in code and SRE tests that fallback bootloader entries (e.g. `*-fallback.conf`) are strictly optional and intentionally not required for bootloader sync certification.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / PATCH-030)**:
+  - Added Fixture 7.4: verifies `bootctl list` colon-formatted string parsing across multiple kernel candidates.
+  - Added Fixture 7.5: verifies systemd-boot single primary entry passing without requiring fallback entries (total hermetic test count expanded from 43 to 45, 100% PASS).
+
 ## [2.40] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Safe Maintenance & Deep Clean Engine Certification / PATCH-029)
