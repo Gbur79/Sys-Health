@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.40
+# Arch System Health & Diagnostics v2.41
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.40"
+VERSION="2.41"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -4016,7 +4016,12 @@ boot_sync_collect_paths() {
         while IFS= read -r raw; do
             [[ -n "$raw" ]] || continue
             printf -v root '%b' "$raw"
-            [[ "$root" == /* && -d "$root" ]] || continue
+            [[ "$root" == /* ]] || continue
+            if [[ -n "$root_prefix" ]]; then
+                [[ -d "$root" ]] || continue
+            else
+                _boot_dir_searchable "$root" || [[ -d "$root" ]] || continue
+            fi
             [[ "$root" == "/" ]] && root=""
 
             case "$kind" in
@@ -4029,7 +4034,7 @@ boot_sync_collect_paths() {
                         "$root/EFI/grub/grub.cfg" \
                         "$root/efi/grub/grub.cfg" \
                         "$root/grub.cfg"; do
-                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                        _boot_file_test "$path" && printf '%s\n' "$path"
                     done
                     ;;
                 loader)
@@ -4037,7 +4042,7 @@ boot_sync_collect_paths() {
                         "$root/loader/entries" \
                         "$root/boot/loader/entries" \
                         "$root/efi/loader/entries"; do
-                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                        _boot_dir_searchable "$path" && printf '%s\n' "$path"
                     done
                     ;;
                 uki)
@@ -4045,7 +4050,7 @@ boot_sync_collect_paths() {
                         "$root/EFI/Linux" \
                         "$root/efi/EFI/Linux" \
                         "$root/boot/EFI/Linux"; do
-                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                        _boot_dir_searchable "$path" && printf '%s\n' "$path"
                     done
                     ;;
                 limine)
@@ -4056,7 +4061,7 @@ boot_sync_collect_paths() {
                         "$root/boot/limine.cfg" \
                         "$root/EFI/limine/limine.conf" \
                         "$root/EFI/limine/limine.cfg"; do
-                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                        _boot_file_test "$path" && printf '%s\n' "$path"
                     done
                     ;;
                 refind)
@@ -4065,7 +4070,7 @@ boot_sync_collect_paths() {
                         "$root/boot/refind_linux.conf" \
                         "$root/EFI/refind/refind_linux.conf" \
                         "$root/efi/EFI/refind/refind_linux.conf"; do
-                        [[ -f "$path" ]] && printf '%s\n' "$path"
+                        _boot_file_test "$path" && printf '%s\n' "$path"
                     done
                     ;;
                 refind-dir)
@@ -4073,7 +4078,7 @@ boot_sync_collect_paths() {
                         "$root/EFI/refind" \
                         "$root/efi/EFI/refind" \
                         "$root/boot/EFI/refind"; do
-                        [[ -d "$path" ]] && printf '%s\n' "$path"
+                        _boot_dir_searchable "$path" && printf '%s\n' "$path"
                     done
                     ;;
             esac
@@ -4223,20 +4228,26 @@ boot_sync_config_has_kernel() {
         return 0
     fi
 
-    # 2. Key-value directive lines: version <cand>
-    pat="^[[:space:]]*version[[:space:]]+(${cand_pat})([^[:alnum:]_-]|$)"
+    # 2. Key-value directive lines: version <cand> (or version: <cand> from bootctl list)
+    pat="^[[:space:]]*version:?[[:space:]]+(${cand_pat})([^[:alnum:]_-]|$)"
     if grep -qiE "$pat" <<< "$content"; then
         return 0
     fi
 
     # 3. title or menuentry line containing candidate as a delimited word
-    pat="^[[:space:]]*(title|menuentry)[[:space:]]+.*(^|[^[:alnum:]_.-])(${cand_pat})([^[:alnum:]_-]|$)"
+    pat="^[[:space:]]*(title|menuentry):?[[:space:]]+.*(^|[^[:alnum:]_.-])(${cand_pat})([^[:alnum:]_-]|$)"
     if grep -qiE "$pat" <<< "$content"; then
         return 0
     fi
 
     # 4. BLS directory path layout: linux/initrd directive containing /<cand>/
-    pat="^[[:space:]]*(linux|initrd)[[:space:]]+.*/(${cand_pat})/"
+    pat="^[[:space:]]*(linux|initrd):?[[:space:]]+.*/(${cand_pat})/"
+    if grep -qiE "$pat" <<< "$content"; then
+        return 0
+    fi
+
+    # 5. bootctl list id/source fields containing candidate
+    pat="^[[:space:]]*(id|source):?[[:space:]]+.*(^|[-_.])(${cand_pat})([-_.]|$)"
     grep -qiE "$pat" <<< "$content"
 }
 
@@ -4312,7 +4323,8 @@ boot_sync_report() {
     [[ "$result" != "WARN" && "$result" != "FAIL" ]]
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.37 | PATCH-026 | Fixtures: test-suite.sh Part 2, Part 7]
+# [SRE-AUDIT: CERTIFIED | Sol v2.41 | PATCH-030 | Fixtures: test-suite.sh Part 2, Part 7]
+# Note: Fallback bootloader entries (e.g. *-fallback.conf) are strictly optional and intentionally not required.
 _boot_sync_audit() {
     local emit_row="${1:-1}"
     local engine=""
@@ -4565,7 +4577,7 @@ _boot_sync_audit() {
         [[ "$engine" == "grub" ]] && hint_cmd="run sudo grub-mkconfig -o /boot/grub/grub.cfg"
         [[ "$engine" == "systemd-boot" ]] && hint_cmd="run sudo reinstall-kernels or inspect /boot/loader/entries"
 
-        boot_sync_report "$engine" "WARN" "missing entries: $missing_csv ($hint_cmd)" "$emit_row"
+        boot_sync_report "$engine" "WARN" "missing main entries: $missing_csv ($hint_cmd)" "$emit_row"
         return 1
     fi
 
