@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.36
+# Arch System Health & Diagnostics v2.37
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.36"
+VERSION="2.37"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -3137,6 +3137,7 @@ _resolve_kernel_and_initramfs() {
                     [[ -n "$f" ]] && bls_entries+=("$f")
                 done < <(sudo -n find "${bdir}/loader/entries" -maxdepth 1 -name "*.conf" 2>/dev/null || true)
             fi
+            # Pass 1: Exact kver or exact pkgbase match
             for entry in "${bls_entries[@]}"; do
                 local e_content
                 e_content="$(boot_sync_cat "$entry")"
@@ -3145,16 +3146,20 @@ _resolve_kernel_and_initramfs() {
                 i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' <<< "$e_content" | tail -n1 || true)"
 
                 local entry_matches=false
-                if [[ -n "$l_rel" ]]; then
+                local e_name="${entry##*/}"
+                local e_base="${e_name%.conf}"
+                if [[ "$e_base" =~ $uki_pat || ( -n "$kver" && "$e_name" == *"$kver"* ) ]]; then
+                    entry_matches=true
+                elif [[ -n "$l_rel" ]]; then
                     local l_base="${l_rel##*/}"
-                    if [[ "$l_base" =~ $uki_pat || ( -n "$kver" && "$l_rel" == *"$kver"* ) || ( -n "$kver_majmin" && "$l_rel" == *"$kver_majmin"* ) ]]; then
+                    if [[ "$l_base" =~ $uki_pat || ( -n "$kver" && "$l_rel" == *"$kver"* ) ]]; then
                         entry_matches=true
                     fi
                 fi
-                if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "linux[[:space:]]+.*${kver}" <<< "$e_content" 2>/dev/null; then
+                if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "(linux|initrd|version)[[:space:]]+.*${kver}" <<< "$e_content" 2>/dev/null; then
                     entry_matches=true
                 fi
-                if ! $entry_matches && [[ -n "$kver_majmin" ]] && grep -qiE "linux[[:space:]]+.*${kver_majmin}" <<< "$e_content" 2>/dev/null; then
+                if ! $entry_matches && grep -qiE "(linux|initrd|title)[[:space:]]+.*${pkgb}" <<< "$e_content" 2>/dev/null; then
                     entry_matches=true
                 fi
 
@@ -3176,6 +3181,41 @@ _resolve_kernel_and_initramfs() {
                     fi
                 fi
             done
+
+            # Pass 2: Fallback to kver_majmin only if exact match was not found
+            if [[ -n "$kver_majmin" ]]; then
+                for entry in "${bls_entries[@]}"; do
+                    local e_content
+                    e_content="$(boot_sync_cat "$entry")"
+                    [[ -n "$e_content" ]] || continue
+                    l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' <<< "$e_content" | head -n1 || true)"
+                    i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' <<< "$e_content" | tail -n1 || true)"
+
+                    local entry_matches=false
+                    if [[ -n "$l_rel" && "$l_rel" == *"$kver_majmin"* ]]; then
+                        entry_matches=true
+                    elif grep -qiE "linux[[:space:]]+.*${kver_majmin}" <<< "$e_content" 2>/dev/null; then
+                        entry_matches=true
+                    fi
+
+                    if $entry_matches; then
+                        local entry_k="" entry_i=""
+                        if [[ -n "$l_rel" ]] && _boot_file_test "${bdir}/${l_rel#/}"; then
+                            entry_k="${bdir}/${l_rel#/}"
+                        fi
+                        if [[ -n "$i_rel" ]] && _boot_file_test "${bdir}/${i_rel#/}"; then
+                            entry_i="${bdir}/${i_rel#/}"
+                        fi
+                        if [[ -n "$entry_k" && -n "$entry_i" ]]; then
+                            k_vmlinuz="$entry_k"
+                            k_initrd="$entry_i"
+                            k_mode="bls"
+                            k_sz="$(_boot_file_size "$k_initrd")"
+                            return 0
+                        fi
+                    fi
+                done
+            fi
         fi
 
         # Machine-ID token directory layout within bdir
@@ -3678,7 +3718,7 @@ check_initramfs() {
 
     # Integrity verification: reject 0-byte or truncated files (< 1MB)
     local sz_mb=$((k_sz / 1048576))
-    if [[ ! -s "$k_initrd" || "$k_sz" -lt 1048576 ]]; then
+    if (( k_sz < 1048576 )); then
         add_row "Initramfs ($pkgbase)" "FAIL ✖ (truncated image: ${k_sz} bytes < 1MB)" "BOOT"
         ((ERRORS++))
         log "HEALTH initramfs=FAIL truncated size=$k_sz pkgbase=$pkgbase file=$k_initrd"
@@ -4089,8 +4129,29 @@ boot_sync_config_has_kernel() {
 
     (( ${#escaped_cands[@]} == 0 )) && escaped_cands=("$base")
     cand_pat="$(IFS='|'; echo "${escaped_cands[*]}")"
-    pat="(vmlinuz-|initramfs-|initrd-|Linux[[:space:]]+)(${cand_pat})([[:space:]/'\".,)]|$)"
 
+    local pat_suffix='(\.img|\.efi|[-_.]fallback(\.img)?|[[:space:]/'\''",)]|$)'
+
+    # 1. Classical boot filenames: vmlinuz-<cand>, initramfs-<cand>, initrd-<cand>
+    pat="(vmlinuz-|initramfs-|initrd-)(${cand_pat})${pat_suffix}"
+    if grep -qiE "$pat" <<< "$content"; then
+        return 0
+    fi
+
+    # 2. Key-value directive lines: version <cand>
+    pat="^[[:space:]]*version[[:space:]]+(${cand_pat})([^[:alnum:]_-]|$)"
+    if grep -qiE "$pat" <<< "$content"; then
+        return 0
+    fi
+
+    # 3. title or menuentry line containing candidate as a delimited word
+    pat="^[[:space:]]*(title|menuentry)[[:space:]]+.*(^|[^[:alnum:]_.-])(${cand_pat})([^[:alnum:]_-]|$)"
+    if grep -qiE "$pat" <<< "$content"; then
+        return 0
+    fi
+
+    # 4. BLS directory path layout: linux/initrd directive containing /<cand>/
+    pat="^[[:space:]]*(linux|initrd)[[:space:]]+.*/(${cand_pat})/"
     grep -qiE "$pat" <<< "$content"
 }
 
@@ -4301,6 +4362,11 @@ _boot_sync_audit() {
                 found=0
 
                 for file in "${loader_files[@]}"; do
+                    if boot_sync_filename_has_kernel "$(basename -- "$file")" "$kernel"; then
+                        found=1
+                        readable=1
+                        break
+                    fi
                     if content=$(boot_sync_cat "$file"); then
                         readable=1
                         if boot_sync_config_has_kernel "$content" "$kernel"; then
