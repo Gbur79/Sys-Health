@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.34
+# Arch System Health & Diagnostics v2.36
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.34"
+VERSION="2.36"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -448,7 +448,7 @@ add_row() {
             "Kernel & modules"|"Initramfs"*|"EFI partition"*|"Reboot pending"|"Previous session shutdown"|"Bootloader"*)
                 sec="BOOT"
                 ;;
-            "GPU runtime"*|"GPU errors & lockups"|"DKMS"*|"CPU temperature"|"SMART disk health"|"SSD/NVMe TRIM timer"|"Power & Battery"*)
+            "CPU microcode"*|"GPU runtime"*|"GPU errors & lockups"|"DKMS"*|"CPU temperature"|"SMART disk health"|"Audio subsystem"*|"SSD/NVMe TRIM timer"|"Power & Battery"*)
                 sec="HW"
                 ;;
             "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys")
@@ -4425,6 +4425,121 @@ check_bootloader_sync() {
     _boot_sync_audit 1
 }
 
+check_cpu_microcode() {
+    local root="${SYS_HEALTH_ROOT:-}"
+
+    # 1. Virtualization & Container Isolation
+    local virt_type=""
+    if command -v systemd-detect-virt &>/dev/null; then
+        virt_type="$(systemd-detect-virt 2>/dev/null || true)"
+    fi
+    if [[ -z "$virt_type" ]] && grep -qiE 'hypervisor|qemu|kvm' "${root}/proc/cpuinfo" 2>/dev/null; then
+        virt_type="virtualized"
+    fi
+
+    if [[ -n "$virt_type" && "$virt_type" != "none" ]]; then
+        add_row "CPU microcode" "PASS ✔ (VM guest [$virt_type] - host managed)" "HW"
+        log "HEALTH cpu_microcode=PASS virt=$virt_type"
+        return 0
+    fi
+
+    # 2. Architecture Boundary (Microcode updates apply to x86_64)
+    local arch
+    arch="$(uname -m 2>/dev/null || echo "unknown")"
+    if [[ "$arch" != "x86_64" ]]; then
+        add_row "CPU microcode" "INFO ℹ (non-x86 architecture: $arch)" "HW"
+        log "HEALTH cpu_microcode=INFO arch=$arch"
+        return 0
+    fi
+
+    # 3. CPU Vendor Identification
+    local vendor="unknown"
+    if grep -q "GenuineIntel" "${root}/proc/cpuinfo" 2>/dev/null; then
+        vendor="Intel"
+    elif grep -q "AuthenticAMD" "${root}/proc/cpuinfo" 2>/dev/null; then
+        vendor="AMD"
+    fi
+
+    # 4. Read Current Runtime Microcode Revision
+    local cur_rev=""
+    if [[ -r "${root}/sys/devices/system/cpu/cpu0/microcode/version" ]]; then
+        cur_rev="$(< "${root}/sys/devices/system/cpu/cpu0/microcode/version")"
+    elif [[ -r "${root}/proc/cpuinfo" ]]; then
+        cur_rev="$(awk '/microcode/ {print $3; exit}' "${root}/proc/cpuinfo" 2>/dev/null || true)"
+    fi
+    cur_rev="${cur_rev//[[:space:]]/}"
+
+    # 5. Interrogate Kernel Boot Log for Early Microcode Loading
+    local klog=""
+    klog="$(journalctl -b 0 -k --no-pager 2>/dev/null || dmesg 2>/dev/null || true)"
+
+    local updated_early=false
+    local from_hex="" to_hex=""
+
+    # Pattern A: Modern Intel/AMD (Updated early from: 0x... / Current revision: 0x...)
+    if grep -q "microcode: Updated early from:" <<< "$klog"; then
+        local raw_from raw_to
+        raw_from="$(awk '/microcode: Updated early from:/ {print $NF; exit}' <<< "$klog")"
+        raw_to="$(awk '/microcode: Current revision:/ {print $NF; exit}' <<< "$klog")"
+        if [[ -n "$raw_from" && -n "$raw_to" ]]; then
+            from_hex="$(printf '0x%x' "$(( raw_from ))" 2>/dev/null || echo "$raw_from")"
+            to_hex="$(printf '0x%x' "$(( raw_to ))" 2>/dev/null || echo "$raw_to")"
+            updated_early=true
+        fi
+    # Pattern B: Legacy Intel (microcode updated early to revision 0x...)
+    elif grep -qiE 'microcode updated early to (revision )?0x[0-9a-fA-F]+' <<< "$klog"; then
+        to_hex="$(grep -oiE 'microcode updated early to (revision )?0x[0-9a-fA-F]+' <<< "$klog" | grep -oiE '0x[0-9a-fA-F]+' | head -n1 || true)"
+        updated_early=true
+    # Pattern C: AMD patch_level / early update (updated early: 0x... -> 0x...)
+    elif grep -qiE 'microcode: CPU0: patch_level=|updated early: 0x' <<< "$klog"; then
+        to_hex="${cur_rev}"
+        updated_early=true
+    fi
+
+    # 6. Check Installed Microcode Package on Host
+    local ucode_pkg=""
+    [[ "$vendor" == "Intel" ]] && ucode_pkg="intel-ucode"
+    [[ "$vendor" == "AMD" ]] && ucode_pkg="amd-ucode"
+
+    local pkg_installed=false
+    if command -v pacman &>/dev/null && [[ -n "$ucode_pkg" ]]; then
+        if pacman ${root:+--root "$root"} -Q "$ucode_pkg" &>/dev/null; then
+            pkg_installed=true
+        fi
+    fi
+
+    # 7. Check for Microcode Loading Errors in Kernel Log
+    local ucode_err=""
+    ucode_err="$(grep -Ei 'microcode:.*(failed|error)' <<< "$klog" | head -n1 || true)"
+
+    # 8. Evaluate Status
+    if [[ -n "$ucode_err" ]]; then
+        add_row "CPU microcode" "WARN ⚠ ($ucode_err)" "HW"
+        ((WARNINGS++))
+        log "HEALTH cpu_microcode=WARN error='$ucode_err'"
+    elif $updated_early; then
+        local detail="${vendor} early update: "
+        if [[ -n "$from_hex" && -n "$to_hex" ]]; then
+            detail+="${from_hex} ➔ ${to_hex}"
+        else
+            detail+="${to_hex:-$cur_rev}"
+        fi
+        add_row "CPU microcode" "PASS ✔ ($detail)" "HW"
+        log "HEALTH cpu_microcode=PASS vendor=$vendor status=updated_early rev='${to_hex:-$cur_rev}'"
+    elif [[ -n "$ucode_pkg" ]] && ! $pkg_installed; then
+        add_row "CPU microcode" "WARN ⚠ (${ucode_pkg} not installed - unpatched BIOS: ${cur_rev:-unknown})" "HW"
+        ((WARNINGS++))
+        log "HEALTH cpu_microcode=WARN missing_pkg=$ucode_pkg cur_rev=$cur_rev"
+    elif [[ -n "$cur_rev" ]]; then
+        add_row "CPU microcode" "PASS ✔ (${vendor} rev: ${cur_rev} [BIOS current])" "HW"
+        log "HEALTH cpu_microcode=PASS vendor=$vendor status=bios_current rev=$cur_rev"
+    else
+        add_row "CPU microcode" "INFO ℹ (status unverified)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH cpu_microcode=INFO status=unverified"
+    fi
+}
+
 check_gpu() {
     local lspci_out
     lspci_out="$(lspci -k 2>/dev/null || true)"
@@ -4866,6 +4981,141 @@ check_smart() {
     else
         add_row "SMART disk health" "PASS ✔ ($passed/$smart_capable OK)" "HW"
         log "HEALTH smart=PASS passed=$passed capable=$smart_capable total=$total"
+    fi
+}
+
+check_audio() {
+    local root="${SYS_HEALTH_ROOT:-}"
+
+    # 1. Hardware Detection via Kernel ALSA (/proc/asound/cards)
+    local -a sound_cards=()
+    if [[ -r "${root}/proc/asound/cards" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*[0-9]+[[:space:]]+\[([^\]]+)\] ]]; then
+                sound_cards+=("${BASH_REMATCH[1]}")
+            fi
+        done < "${root}/proc/asound/cards"
+    fi
+
+    local pci_audio=""
+    if command -v lspci &>/dev/null; then
+        pci_audio="$(lspci 2>/dev/null | grep -iE 'audio|sound|multimedia' || true)"
+    fi
+
+    if (( ${#sound_cards[@]} == 0 )) && [[ -z "$pci_audio" ]]; then
+        add_row "Audio subsystem" "INFO ℹ (no audio hardware detected)" "HW"
+        log "HEALTH audio=INFO reason=no_hardware"
+        return 0
+    fi
+
+    # 2. Interrogate Kernel Log for Missing DSP Firmware (e.g. sof-firmware)
+    local klog=""
+    klog="$(journalctl -b 0 -k --no-pager 2>/dev/null || dmesg 2>/dev/null || true)"
+
+    if grep -qiE 'Direct firmware load for .*sof.* failed|error: failed to load DSP firmware' <<< "$klog"; then
+        if command -v pacman &>/dev/null && ! pacman ${root:+--root "$root"} -Q sof-firmware &>/dev/null; then
+            add_row "Audio subsystem" "WARN ⚠ (missing sof-firmware - DSP audio unavailable)" "HW"
+            ((WARNINGS++))
+            log "HEALTH audio=WARN reason=missing_sof_firmware"
+            return 0
+        fi
+    fi
+
+    # 3. Discover Active Audio Server & User Session Context
+    local target_uid="${EUID}"
+    if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        target_uid="$(id -u "$SUDO_USER" 2>/dev/null || echo "$EUID")"
+    fi
+
+    local user_runtime="/run/user/${target_uid}"
+    local pipewire_active=false wireplumber_active=false pulse_active=false
+
+    # Probe systemd user units
+    if [[ "$EUID" -eq 0 && -d "$user_runtime" ]]; then
+        if systemctl --user -M "${target_uid}@" is-active pipewire &>/dev/null; then
+            pipewire_active=true
+        fi
+        if systemctl --user -M "${target_uid}@" is-active wireplumber &>/dev/null; then
+            wireplumber_active=true
+        fi
+        if systemctl --user -M "${target_uid}@" is-active pulseaudio &>/dev/null; then
+            pulse_active=true
+        fi
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" || -d "$user_runtime" ]]; then
+        if systemctl --user is-active pipewire &>/dev/null; then
+            pipewire_active=true
+        fi
+        if systemctl --user is-active wireplumber &>/dev/null; then
+            wireplumber_active=true
+        fi
+        if systemctl --user is-active pulseaudio &>/dev/null; then
+            pulse_active=true
+        fi
+    fi
+
+    # Fallback to process search if systemctl user probe is restricted
+    if ! $pipewire_active && pgrep -u "$target_uid" -x pipewire &>/dev/null; then
+        pipewire_active=true
+    fi
+    if ! $wireplumber_active && pgrep -u "$target_uid" -x wireplumber &>/dev/null; then
+        wireplumber_active=true
+    fi
+    if ! $pulse_active && pgrep -u "$target_uid" -x pulseaudio &>/dev/null; then
+        pulse_active=true
+    fi
+
+    # 4. Check for Audio Sinks (Physical vs Dummy Output)
+    local -a active_sinks=()
+    local has_dummy_sink=false
+
+    if command -v pactl &>/dev/null && [[ -d "$user_runtime" ]]; then
+        local raw_sinks=""
+        raw_sinks="$(XDG_RUNTIME_DIR="$user_runtime" pactl list sinks short 2>/dev/null || true)"
+        if [[ -n "$raw_sinks" ]]; then
+            while IFS=$'\t' read -r _ sname _ _ _; do
+                [[ -z "$sname" ]] && continue
+                if [[ "$sname" =~ (auto_null|dummy) ]]; then
+                    has_dummy_sink=true
+                else
+                    active_sinks+=("$sname")
+                fi
+            done <<< "$raw_sinks"
+        fi
+    fi
+
+    # 5. Evaluate Status
+    local card_count="${#sound_cards[@]}"
+    local card_desc="${sound_cards[0]:-ALSA}"
+    (( card_count > 1 )) && card_desc+=", +$((card_count - 1)) more"
+
+    if $pipewire_active; then
+        if $has_dummy_sink && (( ${#active_sinks[@]} == 0 )) && (( card_count > 0 )); then
+            add_row "Audio subsystem" "WARN ⚠ (PipeWire stuck on Dummy Output - physical sinks missing)" "HW"
+            ((WARNINGS++))
+            log "HEALTH audio=WARN state=dummy_output"
+        elif ! $wireplumber_active && pgrep -u "$target_uid" -x "kwin_wayland|gnome-shell|plasmashell" &>/dev/null; then
+            add_row "Audio subsystem" "WARN ⚠ (PipeWire active but WirePlumber session manager inactive)" "HW"
+            ((WARNINGS++))
+            log "HEALTH audio=WARN state=wireplumber_down"
+        else
+            local mgr="WirePlumber"
+            ! $wireplumber_active && mgr="pipewire-media-session"
+            local sink_info="${#active_sinks[@]} sink(s)"
+            (( ${#active_sinks[@]} == 0 )) && sink_info="ALSA: ${card_desc}"
+            add_row "Audio subsystem" "PASS ✔ (PipeWire [$mgr] | $sink_info)" "HW"
+            log "HEALTH audio=PASS server=pipewire manager=$mgr sinks=${#active_sinks[@]}"
+        fi
+    elif $pulse_active; then
+        local sink_info="${#active_sinks[@]} sink(s)"
+        (( ${#active_sinks[@]} == 0 )) && sink_info="ALSA: ${card_desc}"
+        add_row "Audio subsystem" "PASS ✔ (PulseAudio | $sink_info)" "HW"
+        log "HEALTH audio=PASS server=pulseaudio sinks=${#active_sinks[@]}"
+    elif (( card_count > 0 )); then
+        add_row "Audio subsystem" "PASS ✔ (ALSA hardware: ${card_desc} | sound server inactive/headless)" "HW"
+        log "HEALTH audio=PASS server=alsa cards=$card_count"
+    else
+        add_row "Audio subsystem" "INFO ℹ (no audio hardware detected)" "HW"
+        log "HEALTH audio=INFO"
     fi
 }
 
@@ -6477,6 +6727,12 @@ generate_summary_json() {
                     fix="Inspect journal logs for previous boot: journalctl -b -1 -p 3"
                     risk="LOW"
                     ;;
+                cpu_microcode)
+                    code="HW_CPU_MICROCODE_UNPATCHED"
+                    summary="CPU running unpatched or missing early microcode updates"
+                    fix="Install intel-ucode or amd-ucode and regenerate bootloader configuration"
+                    risk="HIGH"
+                    ;;
                 gpu|gpu_errors)
                     code="GPU_DRIVER_OR_LOG_STALL"
                     summary="GPU driver missing or hardware/driver lockup in logs"
@@ -6514,6 +6770,12 @@ generate_summary_json() {
                         fix="Inspect drive health manually: sudo smartctl -a <device>"
                         risk="MEDIUM"
                     fi
+                    ;;
+                audio)
+                    code="HW_AUDIO_SUBSYSTEM_ISSUE"
+                    summary="Audio subsystem failure, missing DSP firmware, or Dummy Output"
+                    fix="Check user service: systemctl --user status pipewire wireplumber, or install sof-firmware"
+                    risk="MEDIUM"
                     ;;
                 fstrim)
                     code="STORAGE_TRIM_INACTIVE"
@@ -6774,11 +7036,13 @@ run_health_check() {
     render_audit_section "BOOT & CORE OS" "$AUDIT_TABLE_BOOT"
 
     # --- 2. HARDWARE & DRIVERS ---
+    check_cpu_microcode
     check_gpu
     check_gpu_errors
     check_dkms
     check_temperature
     check_smart
+    check_audio
     check_power
     check_fstrim
     render_audit_section "HARDWARE & DRIVERS" "$AUDIT_TABLE_HW"
@@ -6966,6 +7230,9 @@ reconstruct_tables_from_log() {
                 ;;
 
             # --- HARDWARE & DRIVERS ---
+            cpu_microcode)
+                AUDIT_TABLE_HW+="$(_format_audit_row "CPU microcode" "$val" "$details")\n"
+                ;;
             gpu)
                 local gmodel="" gdriver="" gtemp=""
                 if [[ "$details" =~ model=\'([^\']+)\' ]]; then
@@ -7033,6 +7300,35 @@ reconstruct_tables_from_log() {
                     AUDIT_TABLE_HW+="SMART disk health | INFO ℹ (no physical disks detected)\n"
                 else
                     AUDIT_TABLE_HW+="$(_format_audit_row "SMART disk health" "$val" "$details")\n"
+                fi
+                ;;
+            audio)
+                if [[ "$val" == "PASS" ]]; then
+                    local srv="ALSA" mgr="WirePlumber" s_cnt="0"
+                    [[ "$details" =~ server=([^ ]+) ]] && srv="${BASH_REMATCH[1]}"
+                    [[ "$details" =~ manager=([^ ]+) ]] && mgr="${BASH_REMATCH[1]}"
+                    [[ "$details" =~ sinks=([0-9]+) ]] && s_cnt="${BASH_REMATCH[1]}"
+                    if [[ "$srv" == "pipewire" ]]; then
+                        AUDIT_TABLE_HW+="Audio subsystem | PASS ✔ (PipeWire [$mgr] | ${s_cnt} sink(s))\n"
+                    elif [[ "$srv" == "pulseaudio" ]]; then
+                        AUDIT_TABLE_HW+="Audio subsystem | PASS ✔ (PulseAudio | ${s_cnt} sink(s))\n"
+                    else
+                        AUDIT_TABLE_HW+="Audio subsystem | PASS ✔ (ALSA hardware | sound server inactive/headless)\n"
+                    fi
+                elif [[ "$val" == "INFO" ]]; then
+                    AUDIT_TABLE_HW+="Audio subsystem | INFO ℹ (no audio hardware detected)\n"
+                elif [[ "$val" == "WARN" ]]; then
+                    if [[ "$details" =~ missing_sof_firmware ]]; then
+                        AUDIT_TABLE_HW+="Audio subsystem | WARN ⚠ (missing sof-firmware - DSP audio unavailable)\n"
+                    elif [[ "$details" =~ dummy_output ]]; then
+                        AUDIT_TABLE_HW+="Audio subsystem | WARN ⚠ (PipeWire stuck on Dummy Output - physical sinks missing)\n"
+                    elif [[ "$details" =~ wireplumber_down ]]; then
+                        AUDIT_TABLE_HW+="Audio subsystem | WARN ⚠ (PipeWire active but WirePlumber session manager inactive)\n"
+                    else
+                        AUDIT_TABLE_HW+="$(_format_audit_row "Audio subsystem" "$val" "$details")\n"
+                    fi
+                else
+                    AUDIT_TABLE_HW+="$(_format_audit_row "Audio subsystem" "$val" "$details")\n"
                 fi
                 ;;
             power)
