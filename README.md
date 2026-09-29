@@ -1,7 +1,7 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.32](https://img.shields.io/badge/Version-2.32-orange.svg)](CHANGELOG.md)
+[![Version: 2.36](https://img.shields.io/badge/Version-2.36-orange.svg)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -72,8 +72,17 @@ sys-health AI Session:
 * **Multi-Kernel & DKMS Synchronization:** Audits every installed kernel series (`linux`, `linux-lts`, `linux-zen`), ensuring matching kernel headers, module directories, and compiled DKMS modules exist for each.
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
 * **Crash & Unclean Shutdown Forensics:** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, or hard system freezes.
-* **Hardware, Thermals & GPU Health:** Real-time driver checks (NVIDIA, AMD, Intel), Xorg fliplock stalls, kernel Xid errors, CPU thermals (`lm_sensors`), disk SMART attributes (`smartctl`), and SSD TRIM timer status (`fstrim.timer`).
-* **Storage, Services & SysRq:** Root filesystem free space thresholds, failed systemd units (system and user sessions), and Magic SysRq emergency recovery validation (`kernel.sysrq`).
+* **Runtime CPU Early Microcode Verification (`check_cpu_microcode`):** Interrogates `/sys/devices/system/cpu/cpu0/microcode/version` and early kernel logs (`journalctl -b 0 -k`), detecting runtime early microcode injection (e.g. `Intel early update: 0x1e ➔ 0x28`) and unpatched BIOS states. Gracefully accommodates virtual machines (`KVM`, `QEMU`, `Proxmox`, `VMware`) and containers (`PASS ✔ [VM guest - host managed]`).
+* **Hardened Hardware, Thermals & GPU Diagnostics (`check_gpu`, `check_gpu_errors`, `check_dkms`, `check_smart`, `check_power`, `check_fstrim`):**
+  * Universal 4-digit PCI domain delimitation (`0000:xx:xx.x`), preventing audio/network controller leakage into GPU driver states.
+  * Real-time GPU driver telemetry (NVIDIA proprietary/legacy, AMD RADV, Intel Arc Xe with GuC initialization noise immunity).
+  * Freshness-guarded Xorg fliplock inspection validated against current system boot time (`btime`).
+  * Multi-kernel DKMS headers audit across all installed kernel directories (`/usr/lib/modules/*/pkgbase`).
+  * Low-power HDD spin-down standby preservation (`smartctl -n standby`) and graceful VirtIO block device degradation (`/dev/vda`).
+  * Hybrid SSD + HDD storage awareness for TRIM timer validation, ignoring spinning mechanical disks lacking discard.
+  * Multi-battery laptop power telemetry (e.g. ThinkPad Power Bridge BAT0 + BAT1).
+* **Audio Subsystem, DSP Firmware & WirePlumber Stack (`check_audio`):** Audits sound cards via ALSA `/proc/asound/cards` and PCI enumeration. Proactively inspects kernel logs for missing digital signal processor (DSP) firmware (`sof-firmware`, `alsa-ucm-conf`) common on modern Intel (10th-15th gen) and AMD laptops. Features a cross-privilege user session bridge (`sudo` -> PipeWire/PulseAudio/WirePlumber) and flags stalled Dummy Output (`auto_null`) devices.
+* **Storage, Services & SysRq:** Root filesystem free space thresholds, failed systemd units (system and user sessions), emergency read-only mount detection (`ro`), and Magic SysRq emergency recovery validation (`kernel.sysrq`).
 * **Network & Gateway Diagnostics:**
   * Active route and physical interface link state (`operstate == up`).
   * Real-time gateway ICMP round-trip latency and jitter (IPv4/IPv6).
@@ -99,7 +108,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
   5. *Network & Mirror Resilience Gate (Gate 3):* Verifies control-plane TLS/DNS connectivity via a multi-endpoint high-availability fallback pool (`archlinux.org`, `1.1.1.1`, `cloudflare.com`), probes primary mirror reachability, and triggers smart self-healing ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) if the primary mirror is dead (preventing fatal socket timeouts), if the mirrorlist is empty/corrupt, if cross-continental latency exceeds 800ms, or if lists are older than 30 days. Employs 100% dynamic universalism across distribution ecosystems (Arch x86_64, EndeavourOS, CachyOS multi-file transactions, Manjaro, Artix, ALARM ARM-gate) with atomic staging and unique per-run backup rollback protection (`.sys-health-bak.$$.$RANDOM`).
   6. *Smart Arch News Correlator Gate (Gate 4):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
-  7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants (e.g., legacy Maxwell GTX 970 vs modern drivers), kernel header completeness across all installed kernels, and pending reboots.
+  7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants across legacy branches (Maxwell, Kepler, `nvidia-580xx`, `nvidia-470xx`, `nvidia-390xx` vs modern open/proprietary drivers), kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
   Executes the canonical distribution package manager (`eos-update`, `yay`, `paru`, or `pacman`).
 * **Phase 3: Post-Flight Integrity Verification:**
