@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+
+## [2.33] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Permission Boundary & Kernel Detection Parity / Beiruty EOS Forum Report)
+- **DAC Permission Boundary Awareness (`_resolve_kernel_and_initramfs`, `check_kernel`, `check_initramfs`)**:
+  - Eliminated false-positive `FAIL ✖ (missing kernel / missing initramfs)` when boot partitions (`/boot`, `/efi`) are mounted with standard restrictive permissions (`0700` / `umask=0077`, e.g. `systemd-boot`).
+  - Added graceful degradation: when candidate boot mountpoints cannot be traversed due to POSIX permissions and no sudo credentials exist, the result is downgraded to `INFO ℹ (boot partition permissions 0700; run with sudo to audit boot images)` with zero errors instead of a fatal failure.
+  - Implemented passwordless sudo integration (`_boot_file_test`, `_boot_dir_searchable`, `_boot_file_size`, `boot_sync_cat` via `sudo -n`) allowing full kernel and initramfs verification when `HAVE_SUDO=1` or when sudo credentials are cached.
+- **Running Kernel Immunity**:
+  - Guaranteed that the actively booted kernel (`uname -r`) cannot be classified as missing from disk, eliminating false alarms on custom or freshly compiled kernels.
+- **Expanded Custom Kernel Heuristics (`check_initramfs`)**:
+  - Added `*-xanmod*) pkgbase="linux-xanmod" ;;` to heuristic kernel package base mapping and connected module discovery to `SYS_HEALTH_ROOT`.
+- **Hermetic Test Harness Expansion (`dev-tools/test-suite.sh` / PATCH-022)**:
+  - Added Part 3 test fixtures covering: restricted `0700` boot partition graceful `INFO` degradation, genuine missing kernel failure assertions on accessible boot partitions, and multi-kernel flat boot discovery (total hermetic test count expanded from 12 to 15).
 ## [2.32] - 2026-09-28
 
 ### Fixed & Hardened (SRE Architectural Audit - Full Ecosystem Parity & Blast-Radius Expansion)
