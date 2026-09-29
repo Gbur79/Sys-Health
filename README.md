@@ -136,7 +136,7 @@ A zero-dependency, live performance sampling flight recorder designed to run **w
 ### 5. Standalone & Third-Party Software Updates Hub (`--software`)
 Bridges the gap for software installed outside distribution repositories:
 * **Dynamic, Context-Aware Action UI:** Builds update menus dynamically—only tools with confirmed, pending updates are presented.
-* **Binary Ownership Protection (`is_pacman_owned`):** Blocks standalone updaters from overwriting packages managed by `pacman`, protecting package database integrity and preventing shim corruption (`pyenv`, `asdf`, `cargo`).
+* **Multi-Distro Binary Ownership Protection (`check_binary_ownership`):** Blocks standalone updaters from overwriting packages managed by `pacman`, foreign package managers (Homebrew, Nix), or runtime shims (`cargo`, `pyenv`, `asdf`, `mise`), protecting package database integrity and multi-boot shared `$HOME` environments.
 * **Partial Upgrade Shield:** Warns and prompts if AUR updates are attempted while core Arch repository updates are pending, preventing `.so` library mismatches.
 * **Supported Ecosystems:**
   * **Goose AI Assistant:** Live local version vs. GitHub releases with 1-click update.
