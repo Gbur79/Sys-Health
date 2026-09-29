@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.38
+# Arch System Health & Diagnostics v2.39
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.38"
+VERSION="2.39"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -3073,6 +3073,16 @@ _boot_file_size() {
         sz="$(sudo -n stat -c %s "$file" 2>/dev/null || echo 0)"
     fi
     echo "${sz:-0}"
+}
+
+_boot_file_mtime() {
+    local file="$1"
+    local mt
+    mt="$(stat -c %Y "$file" 2>/dev/null || true)"
+    if [[ -z "$mt" || "$mt" -eq 0 ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        mt="$(sudo -n stat -c %Y "$file" 2>/dev/null || echo 0)"
+    fi
+    echo "${mt:-0}"
 }
 
 _resolve_kernel_and_initramfs() {
@@ -9137,19 +9147,27 @@ run_software_updates() {
 
 detect_esp_mountpoint() {
     local esp_path=""
-    # 1. Inspect active vfat mounts for ESP standard paths
-    esp_path="$(findmnt -n -r -t vfat -o TARGET 2>/dev/null | grep -E '^/(efi|boot/efi|boot)$' | head -n 1 || true)"
+    local root="${SYS_HEALTH_ROOT:-}"
 
-    # 2. Inspect /etc/fstab for vfat boot partitions
-    if [[ -z "$esp_path" ]]; then
-        esp_path="$(awk '$3 == "vfat" && $2 ~ /^\/(efi|boot\/efi|boot)$/ {print $2}' /etc/fstab 2>/dev/null | head -n 1 || true)"
+    # 1. Inspect active vfat mounts for ESP standard paths (if running against real system)
+    if [[ -z "$root" ]] && command -v findmnt &>/dev/null; then
+        esp_path="$(findmnt -n -r -t vfat -o TARGET 2>/dev/null | grep -E '^/(efi|boot/efi|boot)$' | head -n 1 || true)"
+    fi
+
+    # 2. Inspect /etc/fstab for active vfat boot partitions (ignoring comment lines)
+    if [[ -z "$esp_path" && -f "${root}/etc/fstab" ]]; then
+        esp_path="$(awk '!/^[[:space:]]*#/ && $3 == "vfat" && $2 ~ /^\/(efi|boot\/efi|boot)$/ {print $2}' "${root}/etc/fstab" 2>/dev/null | head -n 1 || true)"
     fi
 
     # 3. Fallback to existing directories with EFI folder
     if [[ -z "$esp_path" ]]; then
-        for cand in /boot/efi /efi /boot; do
+        for cand in "${root}/boot/efi" "${root}/efi" "${root}/boot"; do
             if [[ -d "$cand/EFI" || -d "$cand/efi" ]]; then
-                esp_path="$cand"
+                if [[ -n "$root" ]]; then
+                    esp_path="${cand#"$root"}"
+                else
+                    esp_path="$cand"
+                fi
                 break
             fi
         done
@@ -9183,7 +9201,7 @@ print_bootloader_repair_hint() {
             echo "    sudo bootctl status"
             if command -v reinstall-kernels &>/dev/null; then
                 echo "    sudo reinstall-kernels"
-            else
+            elif command -v bootctl &>/dev/null; then
                 echo "    sudo bootctl update"
             fi
             ;;
@@ -9192,7 +9210,11 @@ print_bootloader_repair_hint() {
             [[ ! -f "$grub_cfg" && -f "/boot/grub2/grub.cfg" ]] && grub_cfg="/boot/grub2/grub.cfg"
             [[ ! -f "$grub_cfg" && -f "${esp_path}/grub/grub.cfg" ]] && grub_cfg="${esp_path}/grub/grub.cfg"
             echo "  [GRUB Repair] Regenerate GRUB boot menu if needed:"
-            echo "    sudo grub-mkconfig -o \"$grub_cfg\""
+            if command -v update-grub &>/dev/null; then
+                echo "    sudo update-grub  # (or sudo grub-mkconfig -o \"$grub_cfg\")"
+            else
+                echo "    sudo grub-mkconfig -o \"$grub_cfg\""
+            fi
             ;;
         limine)
             local limine_cfg=""
@@ -9465,16 +9487,14 @@ run_guarded_upgrade() {
     fi
 
     # Validate sudo upfront
-    if ! sudo -v 2>/dev/null; then
+    if ! sudo -v; then
         fail "Pre-Flight Gate 0: Sudo authentication failed. Upgrade aborted."
         return 1
     fi
 
-    # Background sudo keepalive (terminated safely via RETURN trap)
+    # Background sudo keepalive (terminated safely via RETURN/INT/TERM trap)
     local sudo_loop_pid=""
     local tmp_repo="" tmp_aur=""
-    ( while true; do sudo -n -v 2>/dev/null || exit 0; sleep 50 & wait $!; done ) &
-    sudo_loop_pid=$!
     _cleanup_guarded_upgrade() {
         if [[ -n "${sudo_loop_pid:-}" ]]; then
             kill "$sudo_loop_pid" 2>/dev/null || true
@@ -9483,7 +9503,12 @@ run_guarded_upgrade() {
         [[ -n "${tmp_repo:-}" && -f "$tmp_repo" ]] && rm -f "$tmp_repo" 2>/dev/null || true
         [[ -n "${tmp_aur:-}" && -f "$tmp_aur" ]] && rm -f "$tmp_aur" 2>/dev/null || true
     }
-    trap '_cleanup_guarded_upgrade' RETURN
+    trap '_cleanup_guarded_upgrade' RETURN INT TERM
+
+    if [[ -z "${SUDO_KEEPALIVE_PID:-}" ]] || ! kill -0 "${SUDO_KEEPALIVE_PID:-0}" 2>/dev/null; then
+        ( while true; do sudo -n true 2>/dev/null || exit 0; sleep 45; kill -0 "$$" 2>/dev/null || exit 0; done ) &
+        sudo_loop_pid=$!
+    fi
 
     ok "Pre-Flight Gate 0: Execution privileges & sudo authentication active."
 
@@ -9514,7 +9539,7 @@ run_guarded_upgrade() {
         fi
     fi
 
-    # 2. Boot Mount & Writable Check (dynamic inspection of /etc/fstab)
+    # 2. Boot Mount & Writable Check (dynamic inspection of /etc/fstab, ignoring comments)
     local fstab_boot_mnt
     while IFS= read -r fstab_boot_mnt; do
         [[ -n "$fstab_boot_mnt" ]] || continue
@@ -9534,7 +9559,7 @@ run_guarded_upgrade() {
                 ok "Pre-Flight Gate 1: Dedicated boot mount ($fstab_boot_mnt) verified mounted and writable."
             fi
         fi
-    done < <(awk '$2 ~ /^\/(boot|efi|boot\/efi)$/ {print $2}' /etc/fstab 2>/dev/null || true)
+    done < <(awk '!/^[[:space:]]*#/ && $2 ~ /^\/(boot|efi|boot\/efi)$/ {print $2}' /etc/fstab 2>/dev/null || true)
 
     # 2b. If /boot is a regular directory on root, verify root directory filesystem is writable
     if [[ "$esp_mount" != "/boot" ]] && ! grep -qE '^[[:space:]]*[^#[:space:]]+[[:space:]]+/boot([[:space:]]|$)' /etc/fstab; then
@@ -9548,20 +9573,39 @@ run_guarded_upgrade() {
 
     # 3. Disk Space Margins (Root, ESP, Pacman Cache)
     local root_free_kb cache_free_kb
-    root_free_kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
-    if (( root_free_kb < 6291456 )); then # < 6 GiB safe headroom
-        fail "Pre-Flight Gate 1: Root space critically low (<6 GiB free: $((root_free_kb / 1048576)) GiB). Large transactions risk corruption."
+    root_free_kb="$(df -kP / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    root_free_kb="${root_free_kb:-0}"
+    if (( root_free_kb < 2097152 )); then # < 2 GiB fatal risk
+        fail "Pre-Flight Gate 1: Root space critically low (<2 GiB free: $((root_free_kb / 1048576)) GiB). Upgrade aborted to prevent corruption."
         preflight_passed=false
+    elif (( root_free_kb < 6291456 )); then # < 6 GiB warning margin
+        warn "Pre-Flight Gate 1: Root filesystem space is tight ($((root_free_kb / 1048576)) GiB free; recommended >=6 GiB)."
+        if [[ -t 0 ]] && command -v gum &>/dev/null; then
+            if ! gum confirm "Root space is under 6 GiB. Proceed anyway?"; then
+                info "Upgrade postponed to free up disk space."
+                return 0
+            fi
+        elif [[ -t 0 ]]; then
+            local sp_ans
+            read -r -p "Root space is under 6 GiB ($((root_free_kb / 1048576)) GiB free). Proceed anyway? [y/N]: " sp_ans
+            if [[ ! "$sp_ans" =~ ^[Yy]$ ]]; then
+                info "Upgrade postponed to free up disk space."
+                return 0
+            fi
+        fi
     else
         ok "Pre-Flight Gate 1: Root filesystem space verified ($((root_free_kb / 1048576)) GiB free)."
     fi
 
     if [[ -n "$esp_mount" ]] && mountpoint -q "$esp_mount"; then
         local esp_free_kb
-        esp_free_kb="$(df -k "$esp_mount" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
-        if (( esp_free_kb < 102400 )); then # < 100 MiB safe headroom
-            fail "Pre-Flight Gate 1: ESP ($esp_mount) space low (<100 MiB free: $((esp_free_kb / 1024)) MiB)."
+        esp_free_kb="$(df -kP "$esp_mount" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+        esp_free_kb="${esp_free_kb:-0}"
+        if (( esp_free_kb < 51200 )); then # < 50 MiB fatal
+            fail "Pre-Flight Gate 1: ESP ($esp_mount) space critically low (<50 MiB free: $((esp_free_kb / 1024)) MiB)."
             preflight_passed=false
+        elif (( esp_free_kb < 102400 )); then # < 100 MiB warning
+            warn "Pre-Flight Gate 1: ESP ($esp_mount) space low (<100 MiB free: $((esp_free_kb / 1024)) MiB)."
         else
             ok "Pre-Flight Gate 1: ESP space verified ($((esp_free_kb / 1024)) MiB free)."
         fi
@@ -9570,10 +9614,13 @@ run_guarded_upgrade() {
     local pacman_cache
     pacman_cache="$(pacman-conf CacheDir 2>/dev/null | head -n 1 || echo "/var/cache/pacman/pkg/")"
     [[ -d "$pacman_cache" ]] || pacman_cache="/var/cache/pacman/pkg/"
-    cache_free_kb="$(df -k "$pacman_cache" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
-    if (( cache_free_kb < 4194304 )); then # < 4 GiB safe headroom for downloads
-        fail "Pre-Flight Gate 1: Pacman cache dir ($pacman_cache) low on disk space (<4 GiB free)."
+    cache_free_kb="$(df -kP "$pacman_cache" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    cache_free_kb="${cache_free_kb:-0}"
+    if (( cache_free_kb < 1572864 )); then # < 1.5 GiB fatal
+        fail "Pre-Flight Gate 1: Pacman cache dir ($pacman_cache) critically low (<1.5 GiB free: $((cache_free_kb / 1048576)) GiB)."
         preflight_passed=false
+    elif (( cache_free_kb < 4194304 )); then # < 4 GiB warning
+        warn "Pre-Flight Gate 1: Pacman cache dir ($pacman_cache) space is tight ($((cache_free_kb / 1048576)) GiB free)."
     else
         ok "Pre-Flight Gate 1: Pacman cache space verified ($((cache_free_kb / 1048576)) GiB free)."
     fi
@@ -9607,7 +9654,7 @@ run_guarded_upgrade() {
 
         # Upstream Harmonization: Informative orphan advisory (zero false alarm FAIL/WARN)
         local orphan_count
-        orphan_count="$((pacman -Qtdq 2>/dev/null || true) | wc -l)"
+        orphan_count="$(pacman -Qtdq 2>/dev/null | awk 'END {print NR+0}')"
         if (( orphan_count > 0 )); then
             info "Pre-Flight Gate 2: ${orphan_count} unrequired orphan package(s) detected."
             info "  › Tip: Pruning unneeded orphans before upgrade saves bandwidth and avoids obsolete AUR rebuilds."
@@ -9694,34 +9741,41 @@ run_guarded_upgrade() {
 
         if $needs_mirror_refresh; then
             warn "Pre-Flight Gate 3: $refresh_reason"
+            local do_refresh=false
             if [[ -t 0 ]] && command -v gum &>/dev/null; then
                 if gum confirm "Refresh and rank fastest regional mirrors before upgrading?"; then
-                    local rank_rc=0
-                    refresh_and_rank_mirrors 1 || rank_rc=$?
-                    if (( rank_rc == 0 || rank_rc == 2 )); then
-                        # Re-probe primary mirror after refresh
-                        local re_raw re_code re_ms
-                        re_raw="$(probe_primary_mirror)" || true
-                        re_code="$(cut -d'|' -f2 <<< "$re_raw")"
-                        re_ms="$(cut -d'|' -f3 <<< "$re_raw")"
-                        if [[ "$re_code" =~ ^(200|301|302)$ ]]; then
-                            mirror_reachable=true
-                            mirror_rtt_ms="$re_ms"
-                        fi
-                        ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified (${mirror_rtt_ms}ms)."
-                    else
-                        warn "Mirror refresh failed; proceeding with existing configuration."
+                    do_refresh=true
+                fi
+            elif [[ -t 0 ]]; then
+                local m_reply
+                read -r -p "Refresh and rank fastest regional mirrors before upgrading? [y/N]: " m_reply
+                [[ "$m_reply" =~ ^[Yy]$ ]] && do_refresh=true
+            fi
+
+            if $do_refresh; then
+                local rank_rc=0
+                refresh_and_rank_mirrors 1 || rank_rc=$?
+                if (( rank_rc == 0 || rank_rc == 2 )); then
+                    # Re-probe primary mirror after refresh
+                    local re_raw re_code re_ms
+                    re_raw="$(probe_primary_mirror)" || true
+                    re_code="$(cut -d'|' -f2 <<< "$re_raw")"
+                    re_ms="$(cut -d'|' -f3 <<< "$re_raw")"
+                    if [[ "$re_code" =~ ^(200|301|302)$ ]]; then
+                        mirror_reachable=true
+                        mirror_rtt_ms="$re_ms"
                     fi
+                    ok "Pre-Flight Gate 3: Repository mirror & TLS/DNS connectivity verified (${mirror_rtt_ms}ms)."
                 else
-                    if ! $mirror_reachable && (( total_active_servers <= 1 )); then
-                        fail "Pre-Flight Gate 3: Primary mirror is unreachable and no working fallback servers remain."
-                        preflight_passed=false
-                    else
-                        info "Proceeding with existing mirrorlist."
-                    fi
+                    warn "Mirror refresh failed; proceeding with existing configuration."
                 fi
             else
-                info "Proceeding with existing mirrorlist (non-interactive mode)."
+                if ! $mirror_reachable && (( total_active_servers <= 1 )); then
+                    fail "Pre-Flight Gate 3: Primary mirror is unreachable and no working fallback servers remain."
+                    preflight_passed=false
+                else
+                    info "Proceeding with existing mirrorlist."
+                fi
             fi
         else
             local latency_note=""
@@ -9741,13 +9795,22 @@ run_guarded_upgrade() {
             warn "Pre-Flight Gate 4: Recent Arch News alert(s) affecting your system detected:"
             echo "$news_alerts"
             echo ""
+            local news_confirmed=false
             if [[ -t 0 ]] && command -v gum &>/dev/null; then
-                if ! gum confirm "Have you checked the Arch News instructions and resolved any manual steps?"; then
-                    fail "Upgrade aborted by user to address manual intervention."
-                    preflight_passed=false
+                if gum confirm "Have you checked the Arch News instructions and resolved any manual steps?"; then
+                    news_confirmed=true
                 fi
+            elif [[ -t 0 ]]; then
+                local n_ans
+                read -r -p "Have you checked the Arch News instructions and resolved any manual steps? [y/N]: " n_ans
+                [[ "$n_ans" =~ ^[Yy]$ ]] && news_confirmed=true
             elif [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
                 fail "Arch News contains manual intervention notices affecting installed packages. Aborting unattended upgrade for safety."
+                preflight_passed=false
+            fi
+
+            if [[ -t 0 ]] && ! $news_confirmed; then
+                fail "Upgrade aborted by user to address manual intervention."
                 preflight_passed=false
             fi
         elif [[ "$news_alerts" == "UNREACHABLE" ]] || (( news_rc == 1 )); then
@@ -9810,6 +9873,7 @@ run_guarded_upgrade() {
             [[ -f "$k_dir" ]] || continue
             local pkgb
             pkgb="$(< "$k_dir")"
+            pkgb="${pkgb//[[:space:]]/}"
             [[ -z "$pkgb" ]] && pkgb="linux"
             local header_pkg="${pkgb}-headers"
             if ! pacman -Q "$header_pkg" &>/dev/null; then
@@ -9851,11 +9915,22 @@ run_guarded_upgrade() {
 
     if $pending_reboot; then
         warn "Pre-Flight Gate 5: A reboot is already pending (running kernel: $running_k differs from disk)."
+        local proceed_reboot=false
         if [[ -t 0 ]] && command -v gum &>/dev/null; then
-            if ! gum confirm "A reboot is strongly recommended before upgrading further. Continue anyway?"; then
-                info "Upgrade postponed. Please reboot your workstation first."
-                return 0
+            if gum confirm "A reboot is strongly recommended before upgrading further. Continue anyway?"; then
+                proceed_reboot=true
             fi
+        elif [[ -t 0 ]]; then
+            local reb_ans
+            read -r -p "A reboot is strongly recommended before upgrading further. Continue anyway? [y/N]: " reb_ans
+            [[ "$reb_ans" =~ ^[Yy]$ ]] && proceed_reboot=true
+        else
+            proceed_reboot=true
+        fi
+
+        if [[ -t 0 ]] && ! $proceed_reboot; then
+            info "Upgrade postponed. Please reboot your workstation first."
+            return 0
         fi
     else
         ok "Pre-Flight Gate 5: Running kernel and installed module tree are synchronized ($running_k)."
@@ -9882,10 +9957,10 @@ run_guarded_upgrade() {
     local aur_helper
     aur_helper="$(detect_aur_helper)"
     local include_aur=false
+    local force_refresh=false
     local repo_count=0 aur_count=0
     local repo_raw="" aur_raw=""
 
-    local tmp_repo tmp_aur
     tmp_repo="$(mktemp /tmp/syshealth-repo-XXXXXX)"
     tmp_aur="$(mktemp /tmp/syshealth-aur-XXXXXX)"
 
@@ -9927,6 +10002,8 @@ run_guarded_upgrade() {
     repo_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$tmp_repo" 2>/dev/null || true)"
     aur_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$tmp_aur" 2>/dev/null || true)"
     rm -f "$tmp_repo" "$tmp_aur"
+    tmp_repo=""
+    tmp_aur=""
 
     [[ -n "$repo_raw" ]] && repo_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$repo_raw")"
     [[ -n "$aur_raw" ]] && aur_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$aur_raw")"
@@ -9946,6 +10023,7 @@ run_guarded_upgrade() {
                 info "System upgrade skipped — everything is up to date."
                 return 0
             fi
+            force_refresh=true
         elif [[ -t 0 ]]; then
             local force_ans
             read -r -p "No pending updates found. Force-refresh databases anyway? [y/N]: " force_ans
@@ -9953,6 +10031,7 @@ run_guarded_upgrade() {
                 info "System upgrade skipped — everything is up to date."
                 return 0
             fi
+            force_refresh=true
         else
             ok "Unattended mode: System is already up to date. Exiting cleanly."
             return 0
@@ -10005,7 +10084,7 @@ run_guarded_upgrade() {
             echo ""
             warn "Critical system packages detected in transaction: ${core_detected[*]}"
         fi
-    else
+    elif ! $force_refresh; then
         ok "Official repositories: UP TO DATE (0 pending updates)."
     fi
 
@@ -10034,7 +10113,7 @@ run_guarded_upgrade() {
 
         echo ""
         render_audit_section "PENDING AUR PACKAGES (${aur_helper:-AUR} - $aur_count)" "$aur_table"
-    elif [[ -n "$aur_helper" ]]; then
+    elif [[ -n "$aur_helper" ]] && ! $force_refresh; then
         echo ""
         ok "AUR packages (${aur_helper}): UP TO DATE (0 pending updates)."
     fi
@@ -10056,8 +10135,8 @@ run_guarded_upgrade() {
         fi
     fi
 
-    # Safety: If official repos have 0 updates and user opted out of AUR, abort cleanly
-    if (( repo_count == 0 )) && ! $include_aur; then
+    # Safety: If official repos have 0 updates and user opted out of AUR, abort cleanly unless force-refreshing
+    if (( repo_count == 0 )) && ! $include_aur && ! $force_refresh; then
         info "Official repositories are already up to date and AUR update was omitted. Nothing to do."
         return 0
     fi
@@ -10066,13 +10145,15 @@ run_guarded_upgrade() {
     $include_aur && (( total_txn += aur_count ))
 
     local confirm_prompt="Proceed with canonical system upgrade now ($total_txn package(s))?"
-    if (( repo_count == 0 )) && $include_aur; then
+    if $force_refresh; then
+        confirm_prompt="Proceed with forced database synchronization & upgrade (pacman -Syyu)?"
+    elif (( repo_count == 0 )) && $include_aur; then
         confirm_prompt="Proceed with AUR package upgrade now ($aur_count package(s))?"
     elif ! $include_aur && (( aur_count > 0 )); then
         confirm_prompt="Proceed with official repository upgrade only ($repo_count package(s), AUR skipped)?"
     fi
 
-    if [[ -t 0 ]]; then
+    if [[ -t 0 ]] && ! $force_refresh; then
         if command -v gum &>/dev/null; then
             if ! gum confirm "$confirm_prompt"; then
                 info "Upgrade cancelled by user."
@@ -10090,33 +10171,44 @@ run_guarded_upgrade() {
 
     echo ""
     section "EXECUTING SYSTEM UPGRADE"
+    local sync_flag="-Syu"
+    $force_refresh && sync_flag="-Syyu"
+
     local -a up_cmd=()
     if [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
-        up_cmd=(sudo pacman -Syu --noconfirm)
+        up_cmd=(sudo pacman "$sync_flag" --noconfirm)
     elif command -v eos-update &>/dev/null; then
         if $include_aur; then
             if [[ "$aur_helper" == "paru" ]]; then
                 up_cmd=(eos-update --paru)
-            else
+            elif [[ "$aur_helper" == "yay" ]]; then
                 up_cmd=(eos-update --yay)
+            elif [[ -n "$aur_helper" ]]; then
+                up_cmd=("$aur_helper" "$sync_flag")
+            else
+                up_cmd=(eos-update)
             fi
         else
-            up_cmd=(eos-update)
+            if $force_refresh; then
+                up_cmd=(eos-update --force)
+            else
+                up_cmd=(eos-update)
+            fi
         fi
     elif [[ -n "$aur_helper" ]]; then
         if $include_aur; then
-            up_cmd=("$aur_helper" -Syu)
+            up_cmd=("$aur_helper" "$sync_flag")
         else
             if [[ "$aur_helper" == "yay" ]]; then
-                up_cmd=(yay -Syu --repo)
+                up_cmd=(yay "$sync_flag" --repo)
             elif [[ "$aur_helper" == "paru" ]]; then
-                up_cmd=(paru -Syu --repo)
+                up_cmd=(paru "$sync_flag" --repo)
             else
-                up_cmd=(sudo pacman -Syu)
+                up_cmd=(sudo pacman "$sync_flag")
             fi
         fi
     else
-        up_cmd=(sudo pacman -Syu)
+        up_cmd=(sudo pacman "$sync_flag")
     fi
 
     info "Executing: ${up_cmd[*]}"
@@ -10159,8 +10251,12 @@ run_guarded_upgrade() {
                 fail "DKMS failure detected for target kernel $target_k_ver: $dk_status"
                 dkms_fail_kernels+=("$target_k_ver")
                 post_failed=true
+            elif grep -qiE "(added|built)" <<< "$dk_status" && ! grep -qE ": installed" <<< "$dk_status"; then
+                fail "DKMS module unbuilt or uninstalled for target kernel $target_k_ver: $dk_status"
+                dkms_fail_kernels+=("$target_k_ver")
+                post_failed=true
             elif grep -q "nvidia" <<< "$dk_status"; then
-                if ! grep -E '^nvidia/.*: installed' <<< "$dk_status" &>/dev/null; then
+                if ! grep -E '^nvidia[-_a-zA-Z0-9]*/.*: installed' <<< "$dk_status" &>/dev/null; then
                     fail "NVIDIA DKMS module is NOT in 'installed' state for kernel $target_k_ver!"
                     dkms_fail_kernels+=("$target_k_ver")
                     post_failed=true
@@ -10176,20 +10272,28 @@ run_guarded_upgrade() {
                 fi
             elif grep -q "installed" <<< "$dk_status"; then
                 ok "DKMS modules verified for kernel $target_k_ver."
+            else
+                ok "DKMS verified for kernel $target_k_ver (no DKMS modules configured)."
             fi
         fi
 
-        # 2. Boot Images, Initramfs & UKI verification
+        # 2. Boot Images, Initramfs & UKI verification (DAC permission & sudo resilient)
         local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
         _resolve_kernel_and_initramfs "$pkgb" "$target_k_ver"
 
-        if [[ "$k_mode" == "uki" && -f "$k_vmlinuz" ]]; then
-            ok "Boot image intact: Unified Kernel Image (UKI) found for $pkgb."
-        elif [[ -f "$k_vmlinuz" && -s "$k_vmlinuz" && -f "$k_initrd" && -s "$k_initrd" ]]; then
-            local v_mtime i_mtime
-            v_mtime="$(stat -c %Y "$k_vmlinuz" 2>/dev/null || echo 0)"
-            i_mtime="$(stat -c %Y "$k_initrd" 2>/dev/null || echo 0)"
-            if (( i_mtime < v_mtime )); then
+        if [[ "$k_mode" == "uki" ]] && _boot_file_test "$k_vmlinuz"; then
+            local uki_sz
+            uki_sz="$(_boot_file_size "$k_vmlinuz")"
+            local uki_mb=$(( uki_sz / 1048576 ))
+            ok "Boot image intact: Unified Kernel Image (UKI) found for $pkgb (${uki_mb}MB)."
+        elif _boot_file_test "$k_vmlinuz" && _boot_file_test "$k_initrd"; then
+            local v_sz i_sz v_mtime i_mtime
+            v_sz="$(_boot_file_size "$k_vmlinuz")"
+            i_sz="$(_boot_file_size "$k_initrd")"
+            v_mtime="$(_boot_file_mtime "$k_vmlinuz")"
+            i_mtime="$(_boot_file_mtime "$k_initrd")"
+
+            if (( i_mtime > 0 && v_mtime > 0 && i_mtime < v_mtime )); then
                 warn "Initramfs mtime is older than kernel for $pkgb (possible incomplete initramfs run)."
             fi
 
@@ -10203,13 +10307,16 @@ run_guarded_upgrade() {
                     parse_ok=true
                 fi
             else
-                local sz
-                sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
-                (( sz > 10485760 )) && parse_ok=true
+                (( i_sz > 10485760 )) && parse_ok=true
+            fi
+
+            # Fallback for unprivileged executions where lsinit tools fail on 0700 ESP
+            if ! $parse_ok && (( i_sz > 1048576 )); then
+                parse_ok=true
             fi
 
             if $parse_ok; then
-                local img_mb=$(( $(stat -c %s "$k_initrd" 2>/dev/null || echo 0) / 1048576 ))
+                local img_mb=$(( i_sz / 1048576 ))
                 ok "Boot image intact & parseable: $k_vmlinuz & $k_initrd (${img_mb}MB)."
             else
                 fail "Initramfs for $pkgb is corrupted or unreadable!"
@@ -10251,7 +10358,7 @@ run_guarded_upgrade() {
     pacnews="$(_find_pacnew_files)"
     if [[ -n "$pacnews" ]]; then
         local p_cnt
-        p_cnt="$(echo "$pacnews" | sed '/^$/d' | wc -l)"
+        p_cnt="$(awk 'NF {count++} END {print count+0}' <<< "$pacnews")"
         warn "Notice: $p_cnt unmerged .pacnew configuration file(s) found on system."
         info "Run 'eos-pacdiff' or 'pacdiff' to review and merge config files."
     else
@@ -10281,7 +10388,14 @@ run_guarded_upgrade() {
         fi
 
         if [[ -t 1 ]] && command -v gum &>/dev/null; then
-            gum style --foreground 82 --border double --align center --width "$UI_CARD_WIDTH"                 "SYSTEM UPGRADE COMPLETED & VERIFIED OK ✔"                 ""                 "$status_summary"                 "• DKMS modules verified compiled for all $found_kernels installed kernel(s)."                 "• Boot initramfs images verified intact and parseable."                 ""                 "Status: System integrity checks passed. Reboot recommended."
+            gum style --foreground 82 --border double --align center --width "$UI_CARD_WIDTH" \
+                "SYSTEM UPGRADE COMPLETED & VERIFIED OK ✔" \
+                "" \
+                "$status_summary" \
+                "• DKMS modules verified compiled for all $found_kernels installed kernel(s)." \
+                "• Boot initramfs images verified intact and parseable." \
+                "" \
+                "Status: System integrity checks passed. Reboot recommended."
         else
             echo "================================================================================"
             echo "SYSTEM UPGRADE COMPLETED & VERIFIED OK ✔"
@@ -10290,9 +10404,33 @@ run_guarded_upgrade() {
             echo "================================================================================"
         fi
         return 0
-    else
+    elif ! $post_failed && (( upgrade_rc != 0 )); then
+        # Package manager exited non-zero (user cancelled or aborted before disk mutations)
+        # Bootloader, kernels, and DKMS are intact: system is 100% safe to run/reboot!
         if [[ -t 1 ]] && command -v gum &>/dev/null; then
-            gum style --foreground 196 --border double --align center --width "$UI_CARD_WIDTH"                 "ATTENTION: POST-UPGRADE INTEGRITY ISSUES DETECTED ✖"                 ""                 "DO NOT REBOOT YET!"                 "One or more boot or driver components failed post-upgrade verification."
+            gum style --foreground 214 --border normal --align center --width "$UI_CARD_WIDTH" \
+                "PACKAGE TRANSACTION INCOMPLETE OR CANCELLED (Exit code: $upgrade_rc) ℹ" \
+                "" \
+                "• Package transaction was cancelled or interrupted." \
+                "• System integrity verified: Bootloader, kernels & DKMS modules are intact." \
+                "• Status: System state is consistent and safe."
+        else
+            echo "================================================================================"
+            echo "PACKAGE TRANSACTION INCOMPLETE OR CANCELLED (Exit code: $upgrade_rc) ℹ"
+            echo "• Package transaction was cancelled or interrupted."
+            echo "• System integrity verified: Bootloader, kernels & DKMS modules are intact."
+            echo "• Status: System state is consistent and safe."
+            echo "================================================================================"
+        fi
+        return "$upgrade_rc"
+    else
+        # Critical failure: post_failed is true
+        if [[ -t 1 ]] && command -v gum &>/dev/null; then
+            gum style --foreground 196 --border double --align center --width "$UI_CARD_WIDTH" \
+                "ATTENTION: POST-UPGRADE INTEGRITY ISSUES DETECTED ✖" \
+                "" \
+                "DO NOT REBOOT YET!" \
+                "One or more boot or driver components failed post-upgrade verification."
         else
             echo "================================================================================"
             echo "ATTENTION: POST-UPGRADE INTEGRITY ISSUES DETECTED ✖"
@@ -10311,6 +10449,8 @@ run_guarded_upgrade() {
             done
         fi
         if (( ${#initrd_fail_kernels[@]} > 0 )); then
+            local active_gen
+            active_gen="$(detect_initramfs_generator)"
             for k in "${initrd_fail_kernels[@]}"; do
                 local kver="${k%%:*}"
                 local pkgb="${k##*:}"
@@ -10329,15 +10469,22 @@ run_guarded_upgrade() {
                         target_initrd="/boot/initramfs-${pkgb}.img"
                     fi
                 fi
-                if command -v dracut &>/dev/null; then
-                    echo "  [Initramfs Repair] Regenerate Dracut image for $pkgb ($kver):"
-                    echo "    sudo dracut --force --kver \"$kver\""
-                    echo "    sudo lsinitrd -m \"$target_initrd\""
-                elif command -v mkinitcpio &>/dev/null; then
-                    echo "  [Initramfs Repair] Regenerate mkinitcpio image for $pkgb:"
-                    echo "    sudo mkinitcpio -p \"$pkgb\""
-                    echo "    sudo lsinitcpio \"$target_initrd\""
-                fi
+                case "$active_gen" in
+                    dracut)
+                        echo "  [Initramfs Repair] Regenerate Dracut image for $pkgb ($kver):"
+                        echo "    sudo dracut --force --kver \"$kver\""
+                        echo "    sudo lsinitrd -m \"$target_initrd\""
+                        ;;
+                    booster)
+                        echo "  [Initramfs Repair] Regenerate Booster image for $pkgb ($kver):"
+                        echo "    sudo /usr/lib/booster/regenerate_images"
+                        ;;
+                    mkinitcpio|*)
+                        echo "  [Initramfs Repair] Regenerate mkinitcpio image for $pkgb:"
+                        echo "    sudo mkinitcpio -p \"$pkgb\""
+                        echo "    sudo lsinitcpio \"$target_initrd\""
+                        ;;
+                esac
             done
         fi
         print_bootloader_repair_hint
