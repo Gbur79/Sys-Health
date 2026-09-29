@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.32"
+VERSION="2.33"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -701,29 +701,30 @@ detect_active_bootloader() {
         fi
     fi
 
-    for f in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/grub/grub.cfg /boot/efi/EFI/grub/grub.cfg /efi/EFI/grub/grub.cfg; do
+    local root="${SYS_HEALTH_ROOT:-}"
+    for f in "${root}/boot/grub/grub.cfg" "${root}/boot/grub2/grub.cfg" "${root}/efi/grub/grub.cfg" "${root}/boot/efi/EFI/grub/grub.cfg" "${root}/efi/EFI/grub/grub.cfg"; do
         if [[ -f "$f" ]]; then
             echo "grub"
             return 0
         fi
     done
 
-    for f in /boot/limine/limine.conf /boot/limine.conf /boot/limine.cfg /efi/limine/limine.conf /efi/limine.conf /boot/efi/limine.conf; do
+    for f in "${root}/boot/limine/limine.conf" "${root}/boot/limine.conf" "${root}/boot/limine.cfg" "${root}/efi/limine/limine.conf" "${root}/efi/limine.conf" "${root}/boot/efi/limine.conf"; do
         if [[ -f "$f" ]]; then
             echo "limine"
             return 0
         fi
     done
 
-    if [[ -f /boot/refind_linux.conf || -d /boot/efi/EFI/refind || -d /efi/EFI/refind ]]; then
+    if [[ -f "${root}/boot/refind_linux.conf" || -d "${root}/boot/efi/EFI/refind" || -d "${root}/efi/EFI/refind" ]]; then
         echo "refind"
         return 0
     fi
 
     local -a uki_paths=(
-        /efi/EFI/Linux/*.efi
-        /boot/EFI/Linux/*.efi
-        /boot/efi/EFI/Linux/*.efi
+        "${root}"/efi/EFI/Linux/*.efi
+        "${root}"/boot/EFI/Linux/*.efi
+        "${root}"/boot/efi/EFI/Linux/*.efi
     )
     for uki in "${uki_paths[@]}"; do
         if [[ -f "$uki" ]]; then
@@ -732,10 +733,10 @@ detect_active_bootloader() {
         fi
     done
 
-    if [[ -d /boot/grub || -d /boot/grub2 ]]; then
+    if [[ -d "${root}/boot/grub" || -d "${root}/boot/grub2" ]]; then
         echo "grub"
         return 0
-    elif [[ -d /boot/loader || -d /efi/loader ]]; then
+    elif [[ -d "${root}/boot/loader" || -d "${root}/efi/loader" ]]; then
         echo "systemd-boot"
         return 0
     fi
@@ -767,23 +768,24 @@ detect_bootloader() {
 }
 
 detect_initramfs_generator() {
-    if command -v dracut &>/dev/null && [[ -d /etc/dracut.conf.d || -f /etc/dracut.conf || -d /usr/lib/dracut ]]; then
-        if command -v mkinitcpio &>/dev/null && [[ -f /etc/mkinitcpio.conf || -d /etc/mkinitcpio.d ]]; then
-            if [[ -f /usr/share/libalpm/hooks/90-dracut-install.hook || -f /etc/pacman.d/hooks/90-dracut-install.hook || -f /usr/share/libalpm/hooks/eos-dracut.hook ]]; then
+    local root="${SYS_HEALTH_ROOT:-}"
+    if (command -v dracut &>/dev/null || [[ -n "$root" ]]) && [[ -d "${root}/etc/dracut.conf.d" || -f "${root}/etc/dracut.conf" || -d "${root}/usr/lib/dracut" ]]; then
+        if (command -v mkinitcpio &>/dev/null || [[ -n "$root" ]]) && [[ -f "${root}/etc/mkinitcpio.conf" || -d "${root}/etc/mkinitcpio.d" ]]; then
+            if [[ -f "${root}/usr/share/libalpm/hooks/90-dracut-install.hook" || -f "${root}/etc/pacman.d/hooks/90-dracut-install.hook" || -f "${root}/usr/share/libalpm/hooks/eos-dracut.hook" ]]; then
                 echo "dracut"
                 return
-            elif [[ -f /usr/share/libalpm/hooks/90-mkinitcpio-install.hook || -f /etc/pacman.d/hooks/90-mkinitcpio-install.hook || -f /usr/share/libalpm/hooks/60-mkinitcpio-remove.hook ]]; then
+            elif [[ -f "${root}/usr/share/libalpm/hooks/90-mkinitcpio-install.hook" || -f "${root}/etc/pacman.d/hooks/90-mkinitcpio-install.hook" || -f "${root}/usr/share/libalpm/hooks/60-mkinitcpio-remove.hook" ]]; then
                 echo "mkinitcpio"
                 return
-            elif compgen -G "/etc/mkinitcpio.d/*.preset" >/dev/null 2>&1 && ! compgen -G "/etc/dracut.conf.d/*.conf" >/dev/null 2>&1; then
+            elif compgen -G "${root}/etc/mkinitcpio.d/*.preset" >/dev/null 2>&1 && ! compgen -G "${root}/etc/dracut.conf.d/*.conf" >/dev/null 2>&1; then
                 echo "mkinitcpio"
                 return
             fi
         fi
         echo "dracut"
-    elif command -v mkinitcpio &>/dev/null && [[ -f /etc/mkinitcpio.conf || -d /etc/mkinitcpio.d ]]; then
+    elif (command -v mkinitcpio &>/dev/null || [[ -n "$root" ]]) && [[ -f "${root}/etc/mkinitcpio.conf" || -d "${root}/etc/mkinitcpio.d" ]]; then
         echo "mkinitcpio"
-    elif command -v booster &>/dev/null; then
+    elif (command -v booster &>/dev/null || [[ -n "$root" ]]) && [[ -f "${root}/etc/booster.yaml" ]]; then
         echo "booster"
     else
         echo "unknown"
@@ -2748,16 +2750,16 @@ refresh_and_rank_mirrors() {
         local tmp_arch="$tmp_dir/arch-mirrorlist"
         local arch_gen_ok=false
 
-        if [[ "$os_id" =~ (manjaro) || "$os_like" =~ (manjaro) ]]; then
-            # Manjaro Distribution Gate
-            info "Manjaro distribution detected for $arch_mfile..."
+        if [[ "$os_id" =~ (manjaro|mabox) || "$os_like" =~ (manjaro|mabox) ]]; then
+            # Manjaro / Mabox Distribution Gate
+            info "Manjaro/Mabox distribution detected for $arch_mfile..."
             if command -v pacman-mirrors &>/dev/null; then
                 local m_bak="${arch_mfile}.sys-health-bak.$$.${RANDOM}"
                 local m_bak_ok=false
                 sudo cp -a "$arch_mfile" "$m_bak" 2>/dev/null && m_bak_ok=true
                 local m_ran=false
                 if [[ "$interactive" == "1" ]] && [[ -t 1 ]] && command -v gum &>/dev/null; then
-                    if gum spin --title "Ranking Manjaro mirrors with pacman-mirrors..." -- sudo pacman-mirrors -f 5; then
+                    if gum spin --title "Ranking Manjaro/Mabox mirrors with pacman-mirrors..." -- sudo pacman-mirrors -f 5; then
                         m_ran=true
                     fi
                 else
@@ -2767,18 +2769,18 @@ refresh_and_rank_mirrors() {
                 fi
                 if $m_ran; then
                     $m_bak_ok && sudo rm -f "$m_bak" 2>/dev/null || true
-                    ok "Manjaro mirrorlist ranked successfully."
-                    target_status["Manjaro"]="UPDATED"
+                    ok "Manjaro/Mabox mirrorlist ranked successfully."
+                    target_status["Manjaro/Mabox"]="UPDATED"
                 else
                     $m_bak_ok && sudo cp -a "$m_bak" "$arch_mfile" 2>/dev/null && sudo rm -f "$m_bak" 2>/dev/null || true
                     warn "pacman-mirrors failed; restored previous mirrorlist."
-                    target_status["Manjaro"]="FAILED"
+                    target_status["Manjaro/Mabox"]="FAILED"
                 fi
             elif command -v rate-mirrors &>/dev/null; then
                 rate-mirrors --protocol https --save="$tmp_arch" manjaro 2>"$tmp_dir/arch.err" || true
                 [[ -s "$tmp_arch" ]] && arch_gen_ok=true
             else
-                target_status["Manjaro"]="SKIPPED (pacman-mirrors missing)"
+                target_status["Manjaro/Mabox"]="SKIPPED (pacman-mirrors missing)"
             fi
         elif [[ "$os_id" =~ (artix) || "$os_like" =~ (artix) ]]; then
             # Artix Distribution Gate
@@ -2856,7 +2858,7 @@ refresh_and_rank_mirrors() {
             _validate_mirrorlist_content "$tmp_arch" "core" "$arch_cpu" 2 || v_rc=$?
             if (( v_rc == 0 )); then
                 local t_label="Arch Linux"
-                [[ "$os_id" =~ (manjaro) ]] && t_label="Manjaro"
+                [[ "$os_id" =~ (manjaro|mabox) ]] && t_label="Manjaro/Mabox"
                 [[ "$os_id" =~ (artix) ]] && t_label="Artix"
                 if _apply_staged_mirrorlist "$tmp_arch" "$arch_mfile" "$t_label"; then
                     target_status["$t_label"]="UPDATED"
@@ -2870,7 +2872,7 @@ refresh_and_rank_mirrors() {
                 warn "Validation probe failed on ranked primary mirror; keeping existing mirrorlist."
                 target_status["Arch Linux"]="FAILED (validation failed)"
             fi
-        elif [[ -z "${target_status["Arch Linux"]:-}" && -z "${target_status["Manjaro"]:-}" && -z "${target_status["Artix"]:-}" && -z "${target_status["Arch ARM"]:-}" ]]; then
+        elif [[ -z "${target_status["Arch Linux"]:-}" && -z "${target_status["Manjaro/Mabox"]:-}" && -z "${target_status["Artix"]:-}" && -z "${target_status["Arch ARM"]:-}" ]]; then
             target_status["Arch Linux"]="FAILED"
         fi
     fi
@@ -2930,6 +2932,20 @@ detect_boot_directories() {
     local -a dirs=()
     local seen=" "
     local bctl_esp bctl_xboot mnt fstab_mnt
+    local root_prefix="${SYS_HEALTH_ROOT:-}"
+
+    # 0. Hermetic Test / Mock root support
+    if [[ -n "$root_prefix" ]]; then
+        local cand
+        for cand in "${root_prefix}/boot" "${root_prefix}/efi" "${root_prefix}/boot/efi" "${root_prefix}/esp" "${root_prefix}"; do
+            if [[ -d "$cand" && "$seen" != *" $cand "* ]]; then
+                dirs+=("$cand")
+                seen+="$cand "
+            fi
+        done
+        printf "%s\n" "${dirs[@]}"
+        return 0
+    fi
 
     # 1. Authoritative ESP and XBOOTLDR paths from bootctl (if available)
     if command -v bootctl &>/dev/null; then
@@ -3024,6 +3040,40 @@ _parse_mkinitcpio_preset() {
     )
 }
 
+# ------------------------------------------------------------------------------
+# Safe Boot Access & Privilege Boundary Helpers
+# ------------------------------------------------------------------------------
+
+_boot_dir_searchable() {
+    local dir="$1"
+    [[ -z "$dir" ]] && return 1
+    [[ -d "$dir" && -x "$dir" ]] && return 0
+    if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo -n test -d "$dir" -a -x "$dir" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+_boot_file_test() {
+    local file="$1"
+    [[ -z "$file" ]] && return 1
+    [[ -f "$file" ]] && return 0
+    if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo -n test -f "$file" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+_boot_file_size() {
+    local file="$1"
+    local sz
+    sz="$(stat -c %s "$file" 2>/dev/null || true)"
+    if [[ -z "$sz" || "$sz" -eq 0 ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sz="$(sudo -n stat -c %s "$file" 2>/dev/null || echo 0)"
+    fi
+    echo "${sz:-0}"
+}
+
 _resolve_kernel_and_initramfs() {
     local pkgb="$1"
     local kver="$2"
@@ -3035,6 +3085,7 @@ _resolve_kernel_and_initramfs() {
     k_fallback=""
     k_mode=""
     k_sz=0
+    k_inaccessible=0
 
     local bdir u_cand entry l_rel i_rel cand_k cand_i cand_f bls_k bls_i
     local uki_pat="^(.*[-_])?${pkgb}([-_.][0-9].*)?$"
@@ -3049,15 +3100,23 @@ _resolve_kernel_and_initramfs() {
     # 1. UKI Check (Unified Kernel Image - Type #2 BLS)
     for bdir in "${boot_dirs[@]}"; do
         [[ -d "$bdir" ]] || continue
+        local -a u_cands=()
         for u_cand in "${bdir}/EFI/Linux"/*.efi "${bdir}/EFI/BOOT"/*.efi "${bdir}"/*.efi; do
-            [[ -f "$u_cand" ]] || continue
+            [[ -f "$u_cand" ]] && u_cands+=("$u_cand")
+        done
+        if (( ${#u_cands[@]} == 0 )) && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            while IFS= read -r f; do
+                [[ -n "$f" ]] && u_cands+=("$f")
+            done < <(sudo -n find "${bdir}/EFI/Linux" "${bdir}/EFI/BOOT" "$bdir" -maxdepth 1 -name "*.efi" 2>/dev/null || true)
+        fi
+        for u_cand in "${u_cands[@]}"; do
             local bname="${u_cand%.efi}"
             bname="${bname##*/}"
             if [[ "$bname" =~ $uki_pat || ( -n "$kver" && "$bname" == *"$kver"* ) || ( -n "$kver_majmin" && "$bname" == *"$kver_majmin"* ) ]]; then
                 k_vmlinuz="$u_cand"
                 k_initrd="$u_cand"
                 k_mode="uki"
-                k_sz="$(stat -c %s "$u_cand" 2>/dev/null || echo 0)"
+                k_sz="$(_boot_file_size "$u_cand")"
                 return 0
             fi
         done
@@ -3067,11 +3126,22 @@ _resolve_kernel_and_initramfs() {
     # Strictly atomic: kernel and initramfs must both reside under the SAME root owning the entry
     for bdir in "${boot_dirs[@]}"; do
         [[ -d "$bdir" ]] || continue
-        if [[ -d "${bdir}/loader/entries" ]]; then
+        local -a bls_entries=()
+        if [[ -d "${bdir}/loader/entries" ]] || _boot_dir_searchable "${bdir}/loader/entries"; then
             for entry in "${bdir}"/loader/entries/*.conf; do
-                [[ -f "$entry" ]] || continue
-                l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' "$entry" | head -n1 || true)"
-                i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' "$entry" | tail -n1 || true)"
+                [[ -f "$entry" ]] && bls_entries+=("$entry")
+            done
+            if (( ${#bls_entries[@]} == 0 )) && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                while IFS= read -r f; do
+                    [[ -n "$f" ]] && bls_entries+=("$f")
+                done < <(sudo -n find "${bdir}/loader/entries" -maxdepth 1 -name "*.conf" 2>/dev/null || true)
+            fi
+            for entry in "${bls_entries[@]}"; do
+                local e_content
+                e_content="$(boot_sync_cat "$entry")"
+                [[ -n "$e_content" ]] || continue
+                l_rel="$(awk '/^linux[[:space:]]+/ {print $2}' <<< "$e_content" | head -n1 || true)"
+                i_rel="$(awk '/^initrd[[:space:]]+/ {print $2}' <<< "$e_content" | tail -n1 || true)"
 
                 local entry_matches=false
                 if [[ -n "$l_rel" ]]; then
@@ -3080,27 +3150,27 @@ _resolve_kernel_and_initramfs() {
                         entry_matches=true
                     fi
                 fi
-                if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "linux[[:space:]]+.*${kver}" "$entry" 2>/dev/null; then
+                if ! $entry_matches && [[ -n "$kver" ]] && grep -qiE "linux[[:space:]]+.*${kver}" <<< "$e_content" 2>/dev/null; then
                     entry_matches=true
                 fi
-                if ! $entry_matches && [[ -n "$kver_majmin" ]] && grep -qiE "linux[[:space:]]+.*${kver_majmin}" "$entry" 2>/dev/null; then
+                if ! $entry_matches && [[ -n "$kver_majmin" ]] && grep -qiE "linux[[:space:]]+.*${kver_majmin}" <<< "$e_content" 2>/dev/null; then
                     entry_matches=true
                 fi
 
                 if $entry_matches; then
                     local entry_k="" entry_i=""
                     # Resolve relative to the root hosting this entry
-                    if [[ -n "$l_rel" && -f "${bdir}/${l_rel#/}" ]]; then
+                    if [[ -n "$l_rel" ]] && _boot_file_test "${bdir}/${l_rel#/}"; then
                         entry_k="${bdir}/${l_rel#/}"
                     fi
-                    if [[ -n "$i_rel" && -f "${bdir}/${i_rel#/}" ]]; then
+                    if [[ -n "$i_rel" ]] && _boot_file_test "${bdir}/${i_rel#/}"; then
                         entry_i="${bdir}/${i_rel#/}"
                     fi
                     if [[ -n "$entry_k" && -n "$entry_i" ]]; then
                         k_vmlinuz="$entry_k"
                         k_initrd="$entry_i"
                         k_mode="bls"
-                        k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                        k_sz="$(_boot_file_size "$k_initrd")"
                         return 0
                     fi
                 fi
@@ -3112,30 +3182,31 @@ _resolve_kernel_and_initramfs() {
         [[ -z "$bls_k" ]] && bls_k="$(compgen -G "${bdir}/*/${kver}/vmlinuz" 2>/dev/null | head -n1 || true)"
         bls_i="$(compgen -G "${bdir}/*/${kver}/initrd*" 2>/dev/null | head -n1 || true)"
         [[ -z "$bls_i" ]] && bls_i="$(compgen -G "${bdir}/*/${kver}/initramfs*" 2>/dev/null | head -n1 || true)"
-        if [[ -n "$bls_k" && -f "$bls_k" && -n "$bls_i" && -f "$bls_i" ]]; then
+        if [[ -n "$bls_k" ]] && _boot_file_test "$bls_k" && [[ -n "$bls_i" ]] && _boot_file_test "$bls_i"; then
             k_vmlinuz="$bls_k"
             k_initrd="$bls_i"
             k_mode="bls"
-            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+            k_sz="$(_boot_file_size "$k_initrd")"
             return 0
         fi
     done
 
     # 2.5 Authoritative mkinitcpio Preset Parsing (Tier 1 Dynamic Declarative Discovery)
     # Checks /etc/mkinitcpio.d/ presets for exact user/distribution image paths (Manjaro, Arch, Mabox)
-    if [[ -d "/etc/mkinitcpio.d" ]]; then
+    local root="${SYS_HEALTH_ROOT:-}"
+    if [[ -d "${root}/etc/mkinitcpio.d" ]]; then
         local preset_file="" cand_p
         for cand_p in \
-            "/etc/mkinitcpio.d/${pkgb}.preset" \
-            "/etc/mkinitcpio.d/linux-${pkgb#linux}.preset" \
-            "/etc/mkinitcpio.d/linux${pkgb#linux-}.preset"; do
+            "${root}/etc/mkinitcpio.d/${pkgb}.preset" \
+            "${root}/etc/mkinitcpio.d/linux-${pkgb#linux}.preset" \
+            "${root}/etc/mkinitcpio.d/linux${pkgb#linux-}.preset"; do
             if [[ -f "$cand_p" && -r "$cand_p" ]]; then
                 preset_file="$cand_p"
                 break
             fi
         done
         if [[ -z "$preset_file" && -n "$kver_majmin" ]]; then
-            for cand_p in "/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
+            for cand_p in "${root}/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
                 if [[ -f "$cand_p" && -r "$cand_p" ]]; then
                     preset_file="$cand_p"
                     break
@@ -3152,24 +3223,24 @@ _resolve_kernel_and_initramfs() {
                 local p_fb_img="${p_vars[4]:-}" p_fb_uki="${p_vars[5]:-}"
 
                 # Handle preset-configured UKI
-                if [[ -n "$p_uki" && -f "$p_uki" ]]; then
+                if [[ -n "$p_uki" ]] && _boot_file_test "$p_uki"; then
                     k_vmlinuz="$p_uki"
                     k_initrd="$p_uki"
                     k_mode="uki"
-                    k_sz="$(stat -c %s "$p_uki" 2>/dev/null || echo 0)"
-                    [[ -n "$p_fb_uki" && -f "$p_fb_uki" ]] && k_fallback="$p_fb_uki"
+                    k_sz="$(_boot_file_size "$p_uki")"
+                    [[ -n "$p_fb_uki" ]] && _boot_file_test "$p_fb_uki" && k_fallback="$p_fb_uki"
                     return 0
                 fi
 
                 # Resolve preset kernel destination / path
                 local resolved_k="" resolved_i=""
-                if [[ -n "$pk_dest" && "$pk_dest" == /* && -f "$pk_dest" ]]; then
+                if [[ -n "$pk_dest" && "$pk_dest" == /* ]] && _boot_file_test "$pk_dest"; then
                     resolved_k="$pk_dest"
-                elif [[ -n "$pk_val" && "$pk_val" == /* && -f "$pk_val" ]]; then
+                elif [[ -n "$pk_val" && "$pk_val" == /* ]] && _boot_file_test "$pk_val"; then
                     resolved_k="$pk_val"
                 fi
 
-                if [[ -n "$p_img" && "$p_img" == /* && -f "$p_img" ]]; then
+                if [[ -n "$p_img" && "$p_img" == /* ]] && _boot_file_test "$p_img"; then
                     resolved_i="$p_img"
                 fi
 
@@ -3180,17 +3251,17 @@ _resolve_kernel_and_initramfs() {
                         local cand_bk="" cand_bi=""
                         if [[ -z "$resolved_k" && -n "$pk_val" ]]; then
                             for cand_k in "${bdir}/${pk_val}" "${bdir}/${pk_val##*/}" "${bdir}/vmlinuz-${pk_val}" "${bdir}/vmlinuz-${pk_val##*/}"; do
-                                [[ -f "$cand_k" ]] && { cand_bk="$cand_k"; break; }
+                                if _boot_file_test "$cand_k"; then cand_bk="$cand_k"; break; fi
                             done
                         fi
                         if [[ -z "$resolved_k" && -n "$pk_dest" ]]; then
                             for cand_k in "${bdir}/${pk_dest}" "${bdir}/${pk_dest##*/}"; do
-                                [[ -f "$cand_k" ]] && { cand_bk="$cand_k"; break; }
+                                if _boot_file_test "$cand_k"; then cand_bk="$cand_k"; break; fi
                             done
                         fi
                         if [[ -z "$resolved_i" && -n "$p_img" ]]; then
                             for cand_i in "${bdir}/${p_img}" "${bdir}/${p_img##*/}"; do
-                                [[ -f "$cand_i" ]] && { cand_bi="$cand_i"; break; }
+                                if _boot_file_test "$cand_i"; then cand_bi="$cand_i"; break; fi
                             done
                         fi
                         if [[ -n "$cand_bk" && -n "$cand_bi" ]]; then
@@ -3202,16 +3273,16 @@ _resolve_kernel_and_initramfs() {
                 fi
 
                 # Atomic validation: both kernel and initrd must coexist and be verified
-                if [[ -n "$resolved_k" && -f "$resolved_k" && -n "$resolved_i" && -f "$resolved_i" ]]; then
+                if [[ -n "$resolved_k" ]] && _boot_file_test "$resolved_k" && [[ -n "$resolved_i" ]] && _boot_file_test "$resolved_i"; then
                     k_vmlinuz="$resolved_k"
                     k_initrd="$resolved_i"
                     k_mode="normal"
-                    k_sz="$(stat -c %s "$resolved_i" 2>/dev/null || echo 0)"
-                    if [[ -n "$p_fb_img" && -f "$p_fb_img" ]]; then
+                    k_sz="$(_boot_file_size "$resolved_i")"
+                    if [[ -n "$p_fb_img" ]] && _boot_file_test "$p_fb_img"; then
                         k_fallback="$p_fb_img"
                     elif [[ -n "$p_fb_img" ]]; then
                         for bdir in "${boot_dirs[@]}"; do
-                            if [[ -f "${bdir}/${p_fb_img##*/}" ]]; then
+                            if _boot_file_test "${bdir}/${p_fb_img##*/}"; then
                                 k_fallback="${bdir}/${p_fb_img##*/}"
                                 break
                             fi
@@ -3245,7 +3316,7 @@ _resolve_kernel_and_initramfs() {
         )
 
         for cand_k in "${k_candidates[@]}"; do
-            if [[ -f "$cand_k" ]]; then
+            if _boot_file_test "$cand_k"; then
                 cur_k="$cand_k"
                 break
             fi
@@ -3279,7 +3350,7 @@ _resolve_kernel_and_initramfs() {
         )
 
         for cand_i in "${i_candidates[@]}"; do
-            if [[ -f "$cand_i" ]]; then
+            if _boot_file_test "$cand_i"; then
                 cur_i="$cand_i"
                 cur_mode="normal"
                 break
@@ -3298,7 +3369,7 @@ _resolve_kernel_and_initramfs() {
                 )
             fi
             for cand_i in "${b_candidates[@]}"; do
-                if [[ -f "$cand_i" ]]; then
+                if _boot_file_test "$cand_i"; then
                     cur_i="$cand_i"
                     cur_mode="booster"
                     break
@@ -3311,7 +3382,7 @@ _resolve_kernel_and_initramfs() {
             k_vmlinuz="$cur_k"
             k_initrd="$cur_i"
             k_mode="$cur_mode"
-            k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+            k_sz="$(_boot_file_size "$k_initrd")"
 
             local -a f_candidates=(
                 "${bdir}/initramfs-${pkgb}-fallback.img"
@@ -3329,7 +3400,7 @@ _resolve_kernel_and_initramfs() {
             )
 
             for cand_f in "${f_candidates[@]}"; do
-                if [[ -f "$cand_f" ]]; then
+                if _boot_file_test "$cand_f"; then
                     k_fallback="$cand_f"
                     break
                 fi
@@ -3339,17 +3410,18 @@ _resolve_kernel_and_initramfs() {
     done
 
     # 4. Strictly single-kernel minimal fallback (e.g. custom kernel installed as /boot/vmlinuz)
-    local -a mod_pkgbases=(/usr/lib/modules/*/pkgbase)
+    local root="${SYS_HEALTH_ROOT:-}"
+    local -a mod_pkgbases=("${root}"/usr/lib/modules/*/pkgbase)
     local k_count=0
     [[ -f "${mod_pkgbases[0]}" ]] && k_count="${#mod_pkgbases[@]}"
 
     if (( k_count <= 1 )); then
         for bdir in "${boot_dirs[@]}"; do
-            if [[ -f "${bdir}/vmlinuz" && -f "${bdir}/initramfs.img" ]]; then
+            if _boot_file_test "${bdir}/vmlinuz" && _boot_file_test "${bdir}/initramfs.img"; then
                 k_vmlinuz="${bdir}/vmlinuz"
                 k_initrd="${bdir}/initramfs.img"
                 k_mode="normal"
-                k_sz="$(stat -c %s "$k_initrd" 2>/dev/null || echo 0)"
+                k_sz="$(_boot_file_size "$k_initrd")"
                 return 0
             fi
         done
@@ -3369,7 +3441,7 @@ _resolve_kernel_and_initramfs() {
             "${bdir}/vmlinuz-${kver_majmin}"
         )
         for cand_k in "${deg_k_cand[@]}"; do
-            if [[ -f "$cand_k" ]]; then
+            if _boot_file_test "$cand_k"; then
                 deg_k="$cand_k"
                 break
             fi
@@ -3392,7 +3464,7 @@ _resolve_kernel_and_initramfs() {
         )
 
         for cand_i in "${deg_i_cand[@]}"; do
-            if [[ -f "$cand_i" ]]; then
+            if _boot_file_test "$cand_i"; then
                 deg_i="$cand_i"
                 break
             fi
@@ -3402,19 +3474,40 @@ _resolve_kernel_and_initramfs() {
             k_vmlinuz="$deg_k"
             k_initrd="$deg_i"
             k_mode="normal"
-            [[ -n "$deg_i" ]] && k_sz="$(stat -c %s "$deg_i" 2>/dev/null || echo 0)"
+            [[ -n "$deg_i" ]] && k_sz="$(_boot_file_size "$deg_i")"
             return 0
         fi
     done
+
+    # 6. Privilege & Permission Boundary Audit:
+    # If resolution failed, determine if any candidate boot directory was unsearchable
+    if [[ -z "$k_vmlinuz" || -z "$k_initrd" ]]; then
+        local any_boot_accessible=false
+        local any_boot_inaccessible=false
+        for bdir in "${boot_dirs[@]}"; do
+            [[ -d "$bdir" ]] || continue
+            if _boot_dir_searchable "$bdir"; then
+                any_boot_accessible=true
+            else
+                any_boot_inaccessible=true
+            fi
+        done
+        if ! $any_boot_accessible || $any_boot_inaccessible; then
+            k_inaccessible=1
+        fi
+    fi
 }
 
 check_kernel() {
     local running_k
     running_k="$(uname -r)"
+    local root="${SYS_HEALTH_ROOT:-}"
     local -a installed_kernels=()
     local -a missing_components=()
-    local -a pkgbase_files=(/usr/lib/modules/*/pkgbase)
+    local -a unverified_components=()
+    local -a pkgbase_files=("${root}"/usr/lib/modules/*/pkgbase)
     local pkgbase_file kdir kver pkgb
+    local has_inaccessible_boot=false
 
     # Multi-kernel validation: inspect all installed kernel module directories
     if [[ -f "${pkgbase_files[0]}" ]]; then
@@ -3427,16 +3520,26 @@ check_kernel() {
             [[ -z "$pkgb" ]] && pkgb="linux"
             installed_kernels+=("$pkgb")
 
-            local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+            local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0 k_inaccessible=0
             _resolve_kernel_and_initramfs "$pkgb" "$kver"
 
-            [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
-            [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+            if [[ -z "$k_vmlinuz" || -z "$k_initrd" ]]; then
+                if (( k_inaccessible )); then
+                    has_inaccessible_boot=true
+                    unverified_components+=("$pkgb (inaccessible)")
+                elif [[ "$kver" == "$running_k" ]]; then
+                    # The running kernel is actively booted in RAM; cannot be physically missing
+                    unverified_components+=("$pkgb (booted)")
+                else
+                    [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
+                    [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+                fi
+            fi
         done
     else
         # Fallback discovery: /usr/lib/modules/*/pkgbase not found
         # Check module directories directly
-        local -a mdirs=(/usr/lib/modules/*)
+        local -a mdirs=("${root}"/usr/lib/modules/*)
         for kdir in "${mdirs[@]}"; do
             [[ -d "$kdir" ]] || continue
             kver="${kdir##*/}"
@@ -3461,11 +3564,20 @@ check_kernel() {
                 [[ -z "$pkgb" ]] && pkgb="linux"
                 installed_kernels+=("$pkgb")
 
-                local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+                local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0 k_inaccessible=0
                 _resolve_kernel_and_initramfs "$pkgb" "$kver"
 
-                [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
-                [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+                if [[ -z "$k_vmlinuz" || -z "$k_initrd" ]]; then
+                    if (( k_inaccessible )); then
+                        has_inaccessible_boot=true
+                        unverified_components+=("$pkgb (inaccessible)")
+                    elif [[ "$kver" == "$running_k" ]]; then
+                        unverified_components+=("$pkgb (booted)")
+                    else
+                        [[ -z "$k_vmlinuz" ]] && missing_components+=("$pkgb: missing kernel")
+                        [[ -z "$k_initrd" ]] && missing_components+=("$pkgb: missing initramfs")
+                    fi
+                fi
             fi
         done
     fi
@@ -3487,12 +3599,20 @@ check_kernel() {
         return
     fi
 
+    local running_disp="${running_k}"
+
     if (( ${#missing_components[@]} > 0 )); then
         add_row "Kernel & modules" "FAIL ✖ (${missing_components[*]})$([ -n "$running_k" ] && echo " | booted: $running_k")" "BOOT"
         ((ERRORS++))
         log "HEALTH kernel_modules=FAIL missing='${missing_components[*]}' booted=$running_k"
+    elif $has_inaccessible_boot; then
+        add_row "Kernel & modules" "INFO ℹ (${installed_kernels[*]} | boot partition permissions 0700; run with sudo to audit boot images | booted: $running_disp)" "BOOT"
+        ((INFO_COUNT++)) || :
+        log "HEALTH kernel_modules=INFO installed='${installed_kernels[*]}' booted=$running_k reason=boot_permissions_0700"
+    elif (( ${#unverified_components[@]} > 0 )); then
+        add_row "Kernel & modules" "PASS ✔ (${installed_kernels[*]} | unmapped boot artifacts: ${unverified_components[*]} | booted: $running_disp)" "BOOT"
+        log "HEALTH kernel_modules=PASS installed='${installed_kernels[*]}' unmapped='${unverified_components[*]}' booted=$running_k"
     else
-        local running_disp="${running_k}"
         add_row "Kernel & modules" "PASS ✔ (${installed_kernels[*]} | booted: $running_disp)" "BOOT"
         log "HEALTH kernel_modules=PASS installed='${installed_kernels[*]}' booted=$running_k"
     fi
@@ -3501,7 +3621,8 @@ check_kernel() {
 check_initramfs() {
     # Maintained for backwards compatibility / specific sub-checks
     local running="${1:-$(uname -r)}"
-    local pkgbase_file="/usr/lib/modules/$running/pkgbase"
+    local root="${SYS_HEALTH_ROOT:-}"
+    local pkgbase_file="${root}/usr/lib/modules/$running/pkgbase"
     local pkgbase=""
 
     if [[ -f "$pkgbase_file" && -r "$pkgbase_file" ]]; then
@@ -3514,6 +3635,7 @@ check_initramfs() {
             *-zen*)      pkgbase="linux-zen" ;;
             *-lts*)      pkgbase="linux-lts" ;;
             *-cachyos*)  pkgbase="linux-cachyos" ;;
+            *-xanmod*)   pkgbase="linux-xanmod" ;;
             *-hardened*) pkgbase="linux-hardened" ;;
             *-rt*)       pkgbase="linux-rt" ;;
             *-arch*)     pkgbase="linux" ;;
@@ -3524,7 +3646,7 @@ check_initramfs() {
                 ;;
             *)
                 if command -v pacman &>/dev/null; then
-                    pkgbase="$(pacman -Qqo "/usr/lib/modules/$running" 2>/dev/null | head -n1 || true)"
+                    pkgbase="$(pacman -Qqo "${root}/usr/lib/modules/$running" 2>/dev/null | head -n1 || true)"
                 fi
                 ;;
         esac
@@ -3537,10 +3659,16 @@ check_initramfs() {
         return
     fi
 
-    local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0
+    local k_vmlinuz="" k_initrd="" k_fallback="" k_mode="" k_sz=0 k_inaccessible=0
     _resolve_kernel_and_initramfs "$pkgbase" "$running"
 
-    if [[ -z "$k_initrd" || ! -f "$k_initrd" ]]; then
+    if [[ -z "$k_initrd" ]] || ! _boot_file_test "$k_initrd"; then
+        if (( k_inaccessible )); then
+            add_row "Initramfs ($pkgbase)" "INFO ℹ (boot partition permissions 0700; run with sudo to audit initramfs)" "BOOT"
+            ((INFO_COUNT++)) || :
+            log "HEALTH initramfs=INFO unverified pkgbase=$pkgbase reason=boot_permissions_0700"
+            return
+        fi
         add_row "Initramfs ($pkgbase)" "FAIL ✖ (missing initramfs image)" "BOOT"
         ((ERRORS++))
         log "HEALTH initramfs=FAIL missing_image pkgbase=$pkgbase"
@@ -3750,8 +3878,12 @@ check_previous_boot() {
 boot_sync_collect_paths() {
     local kind="$1"
     local raw root path
+    local root_prefix="${SYS_HEALTH_ROOT:-}"
 
     {
+        if [[ -n "$root_prefix" ]]; then
+            printf '%s\n' "$root_prefix" "$root_prefix/boot" "$root_prefix/efi" "$root_prefix/boot/efi"
+        fi
         findmnt -rn -o TARGET 2>/dev/null || :
         findmnt --fstab -rn -o TARGET 2>/dev/null || :
     } | sort -u |
@@ -3839,8 +3971,9 @@ boot_sync_cat() {
 }
 
 boot_sync_kernel_bases() {
+    local root="${SYS_HEALTH_ROOT:-}"
     local pkgbase_file base
-    for pkgbase_file in /usr/lib/modules/*/pkgbase; do
+    for pkgbase_file in "${root}"/usr/lib/modules/*/pkgbase; do
         [[ -r "$pkgbase_file" ]] || continue
         IFS= read -r base < "$pkgbase_file" || continue
         base="${base//[[:space:]]/}"
@@ -3851,12 +3984,13 @@ boot_sync_kernel_bases() {
 
 boot_sync_kernel_candidates() {
     local kernel="$1"
+    local root="${SYS_HEALTH_ROOT:-}"
     local -a cands=("$kernel")
     local pkgbase_file cur_base kdir kver kver_majmin host_arch
     host_arch="$(uname -m 2>/dev/null || echo "x86_64")"
 
     # 1. Inspect module directories: correlate kernel pkgbase with kver & arch
-    for pkgbase_file in /usr/lib/modules/*/pkgbase; do
+    for pkgbase_file in "${root}"/usr/lib/modules/*/pkgbase; do
         [[ -r "$pkgbase_file" ]] || continue
         IFS= read -r cur_base < "$pkgbase_file" || continue
         cur_base="${cur_base//[[:space:]]/}"
@@ -3873,19 +4007,19 @@ boot_sync_kernel_candidates() {
     done
 
     # 2. Declarative mkinitcpio presets (authoritative distribution/custom paths)
-    if [[ -d "/etc/mkinitcpio.d" ]]; then
+    if [[ -d "${root}/etc/mkinitcpio.d" ]]; then
         local preset_file="" cand_p
         for cand_p in \
-            "/etc/mkinitcpio.d/${kernel}.preset" \
-            "/etc/mkinitcpio.d/linux-${kernel#linux}.preset" \
-            "/etc/mkinitcpio.d/linux${kernel#linux-}.preset"; do
+            "${root}/etc/mkinitcpio.d/${kernel}.preset" \
+            "${root}/etc/mkinitcpio.d/linux-${kernel#linux}.preset" \
+            "${root}/etc/mkinitcpio.d/linux${kernel#linux-}.preset"; do
             if [[ -f "$cand_p" && -r "$cand_p" ]]; then
                 preset_file="$cand_p"
                 break
             fi
         done
         if [[ -z "$preset_file" && -n "$kver_majmin" ]]; then
-            for cand_p in "/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
+            for cand_p in "${root}/etc/mkinitcpio.d/"*"${kver_majmin}"*.preset; do
                 if [[ -f "$cand_p" && -r "$cand_p" ]]; then
                     preset_file="$cand_p"
                     break
@@ -3981,6 +4115,14 @@ boot_sync_filename_has_kernel() {
 }
 
 boot_sync_systemd_boot_active() {
+    local root="${SYS_HEALTH_ROOT:-}"
+    if [[ -n "$root" ]]; then
+        if [[ -d "${root}/loader/entries" || -d "${root}/boot/loader/entries" || -d "${root}/efi/loader/entries" ]]; then
+            return 0
+        fi
+        return 1
+    fi
+
     if command -v bootctl >/dev/null 2>&1; then
         local status
         status=$(bootctl --no-pager status 2>/dev/null || :)
@@ -4063,15 +4205,23 @@ _boot_sync_audit() {
     mapfile -t refind_dirs < <(boot_sync_collect_paths refind-dir)
 
     for dir in "${loader_dirs[@]}"; do
+        local -a find_cmd=(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.conf")
+        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            find_cmd=(sudo -n "${find_cmd[@]}")
+        fi
         while IFS= read -r f; do
             [[ -n "$f" ]] && loader_files+=("$f")
-        done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.conf" 2>/dev/null)
+        done < <("${find_cmd[@]}" 2>/dev/null || true)
     done
 
     for dir in "${uki_dirs[@]}"; do
+        local -a find_cmd=(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.efi")
+        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            find_cmd=(sudo -n "${find_cmd[@]}")
+        fi
         while IFS= read -r f; do
             [[ -n "$f" ]] && uki_files+=("$f")
-        done < <(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.efi" 2>/dev/null)
+        done < <("${find_cmd[@]}" 2>/dev/null || true)
     done
 
     if boot_sync_systemd_boot_active; then
@@ -4141,6 +4291,9 @@ _boot_sync_audit() {
             bootctl_list=""
             if command -v bootctl >/dev/null 2>&1; then
                 bootctl_list=$(bootctl --no-pager list 2>/dev/null || :)
+                if [[ -z "$bootctl_list" ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                    bootctl_list=$(sudo -n bootctl --no-pager list 2>/dev/null || :)
+                fi
             fi
 
             for kernel in "${kernels[@]}"; do
@@ -9677,6 +9830,11 @@ run_guarded_upgrade() {
 }
 
 
+
+# Sourcing guard: allow sourcing as a library for test suites
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # Non-interactive execution entry points
 # ------------------------------------------------------------------------------
