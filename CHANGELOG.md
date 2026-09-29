@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.40] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Safe Maintenance & Deep Clean Engine Certification / PATCH-029)
+- **MOD-09 SRE Certification & Zero-Privilege Gate (`run_maintenance` & Option 7)**:
+  - Enforced strict execution security boundary preventing Deep Clean (`--deep-clean` / TUI Option 7) from running under root or via `sudo` (`effective_euid == 0`). Prevents catastrophic degradation of desktop account permissions (`root:root` ownership inside `~/.cache` and `~/.local`) and eliminates unintended deletion within `/root`.
+- **Safe Delete Multi-FS & Active Socket Sweep (`safe_delete_children`)**:
+  - Expanded allowed filesystem boundary crossings to include `ext4`, `xfs`, `f2fs`, `btrfs`, `zfs`, and `tmpfs`, ensuring users with dedicated non-Btrfs cache partitions are not falsely rejected.
+  - Hardened protected system roots registry (`CRITICAL_SYSTEM_ROOTS`) with `/tmp`, `/run`, `/mnt`, `/media`, `/var/log`, `/var/lib`, and `/var/cache`.
+  - Added pre-emptive write permission pass (`chmod -R u+w`) to safely unlink read-only cache items.
+  - Implemented secondary deletion sweep excluding active UNIX domain sockets (`! -type s`), eliminating unhandled `EBUSY` runtime crashes during desktop session cleanups.
+- **Dynamic Pacman Multi-CacheDir Discovery (`run_maintenance`)**:
+  - Replaced legacy single-entry `head -n 1` with a dynamic discovery loop collecting all configured `CacheDir` paths from `pacman-conf CacheDir`.
+  - Implemented trailing slash normalization (`cdir="${cdir%/}"`) and aggregated multiple `-c` flags for `paccache`.
+- **Headless & SSH D-Bus Resilience in Desktop Trash (`empty_freedesktop_trash`)**:
+  - Eliminated false-alarm red error banners (`fail`) when emptying Desktop Trash without an active graphical session.
+  - Probes for active D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` or user runtime socket `/run/user/$UID/bus`) before invoking `gio trash --empty`, seamlessly falling back to canonical `$XDG_DATA_HOME/Trash` cleanup.
+- **Flatpak AppID Process Signatures & TOCTOU Elimination (`clean_browser_cache_safely` & `clean_all_detected_browsers`)**:
+  - Synchronized browser process registry with official Flatpak AppIDs (`org.mozilla.firefox`, `org.chromium.Chromium`, `io.github.ungoogled_software.ungoogled_chromium`, `com.google.Chrome`, `com.brave.Browser`, `io.gitlab.librewolf-community`, `net.waterfox.waterfox`) alongside binary variants (`opera-bin`, `librewolf-bin`).
+  - Shifted active-process TOCTOU validation immediately prior to directory deletion (after time-consuming `du -shx` size calculations).
+- **Btrfs Snapshot Disk-Space Reclaim Clarity (`run_maintenance`)**:
+  - Added runtime detection of Btrfs root filesystems with active snapshot directories (`/.snapshots`, `/var/.snapshots`, `/run/timeshift/backup`), notifying users that physical disk space will be reclaimed once snapshots referencing deleted caches expire or are rotated.
+- **Hermetic Regression Test Suite (Part 10)**:
+  - Added Part 10 to `dev-tools/test-suite.sh` with 5 hermetic fixtures covering Deep Clean root privilege gate, critical system roots protection, gaming shader cache immunity, multi-CacheDir aggregation, and browser active process TOCTOU isolation (all 43/43 tests passing).
+
 ## [2.39] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Guarded Upgrade End-to-End Resilience / PATCH-028)
