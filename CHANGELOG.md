@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.34] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - System Health & Services Resiliency)
+- **Universal .pacnew Aggregation (`_find_pacnew_files`)**:
+  - Eliminated dead-code path where `pacdiff` prevented physical scanning of bootloader directories; aggregated pacdiff ALPM tracked outputs with dynamic `/boot` and `/efi` traversal.
+  - Added hermetic root (`SYS_HEALTH_ROOT`) fallback scanning for chroots and mock testing environments.
+- **Read-Only Storage Mount Detection (`check_root_space`)**:
+  - Added detection of emergency read-only mounts (`ro`) across critical filesystems (`/`, `/home`, `/var`), flagging `FAIL ✖` instead of false `PASS` on damaged or remounted volumes.
+  - Added dedicated telemetry breakdown (`status=read_only`) and critical remediation guidance (`STORAGE_ROOT_READ_ONLY`).
+- **Headless / SSH User Session Bus Support (`check_failed_services`)**:
+  - Expanded systemd user manager probe to include `$XDG_RUNTIME_DIR/systemd/private` socket, enabling user service audits in pure terminal, cron, and SSH sessions without D-Bus brokers.
+- **Resilient Orphan Package Querying (`check_orphan_packages`)**:
+  - Isolated genuine ALPM failures (`rc > 1` or `error:`) from expected zero-orphan exits (`rc = 1`) with non-critical stderr output.
+- **Package Integrity Broken-Symlink Tolerance (`check_package_integrity`)**:
+  - Tolerated existing runtime symlinks (`-L`) and guarded unprivileged test checks to prevent false `WARN ⚠ (Corrupt)`.
+- **Hermetic Regression Suite Expansion (`dev-tools/test-suite.sh` / PATCH-023)**:
+  - Added Part 4 test fixtures covering: dual `.pacnew` discovery aggregation across `/etc` and `/boot`, clean orphan query handling with non-error stderr, and emergency read-only filesystem detection (total test count expanded to 18).
+
 ## [2.33] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Permission Boundary & Kernel Detection Parity / Beiruty EOS Forum Report)
