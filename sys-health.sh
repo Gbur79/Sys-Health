@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.32
+# Arch System Health & Diagnostics v2.34
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.33"
+VERSION="2.34"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2989,27 +2989,28 @@ detect_boot_directories() {
 }
 
 _find_pacnew_files() {
-    # 1. Official pacdiff discovery (inspects full pacman DB tracked configs)
-    if command -v pacdiff &>/dev/null; then
-        local pacdiff_out
-        pacdiff_out="$(pacdiff -o 2>/dev/null | grep -E '\.pacnew$' || true)"
-        if [[ -n "$pacdiff_out" ]]; then
-            printf "%s\n" "$pacdiff_out" | sort -u
-            return 0
-        else
-            return 0
-        fi
-    fi
-
-    # 2. Filesystem fallback: scan /etc and all active boot roots
-    local -a scan_dirs=("/etc")
+    local root="${SYS_HEALTH_ROOT:-}"
     local -a boot_dirs=()
+    mapfile -t boot_dirs < <(detect_boot_directories 2>/dev/null || true)
+    local -a scan_dirs=()
     local b
-    mapfile -t boot_dirs < <(detect_boot_directories)
     for b in "${boot_dirs[@]}"; do
         [[ -d "$b" ]] && scan_dirs+=("$b")
     done
-    find "${scan_dirs[@]}" -maxdepth 7 -type f -name '*.pacnew' 2>/dev/null | sort -u || true
+
+    {
+        # 1. Official pacdiff discovery (tracked ALPM backup configs)
+        if [[ -z "$root" ]] && command -v pacdiff &>/dev/null; then
+            pacdiff -o 2>/dev/null | grep -E '\.pacnew$' || true
+        else
+            [[ -d "${root}/etc" ]] && scan_dirs+=("${root}/etc")
+        fi
+
+        # 2. Bootloader & active ESP discovery (always scanned)
+        if (( ${#scan_dirs[@]} > 0 )); then
+            find "${scan_dirs[@]}" -maxdepth 5 -type f -name '*.pacnew' 2>/dev/null || true
+        fi
+    } | sort -u
 }
 
 # --- Declarative mkinitcpio preset parser (isolated subshell sandbox) ---
@@ -4931,9 +4932,16 @@ check_root_space() {
     local worst_usage=0
     local worst_mount="/"
     local checked_mounts=()
+    local -a ro_mounts=()
 
     for mnt in "${target_mounts[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null || [[ "$mnt" == "/" ]]; then
+            local m_opts
+            m_opts="$(findmnt -n -o OPTIONS -T "$mnt" 2>/dev/null || true)"
+            if [[ "$m_opts" =~ (^|,)ro(,|$) ]]; then
+                ro_mounts+=("$mnt")
+            fi
+
             local usage
             usage="$(df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}')"
             [[ -z "$usage" ]] && continue
@@ -4945,7 +4953,11 @@ check_root_space() {
         fi
     done
 
-    if (( worst_usage == 0 && ${#checked_mounts[@]} == 0 )); then
+    if (( ${#ro_mounts[@]} > 0 )); then
+        add_row "Root disk space" "FAIL ✖ (mounted READ-ONLY: ${ro_mounts[*]})" "SYS"
+        ((ERRORS++))
+        log "HEALTH root_space=FAIL status=read_only mounts='${ro_mounts[*]}'"
+    elif (( worst_usage == 0 && ${#checked_mounts[@]} == 0 )); then
         add_row "Root disk space" "WARN ⚠ (unable to read)" "SYS"
         ((WARNINGS++))
         log "HEALTH root_space=WARN unreadable"
@@ -5027,9 +5039,10 @@ check_failed_services() {
             fi
         done <<< "$active_user_units"
     else
-        # Unprivileged execution: check current user bus
+        # Unprivileged execution: check current user bus or private systemd socket
         local runtime_bus="${XDG_RUNTIME_DIR:-}/bus"
-        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" || -S "$runtime_bus" ]] && (systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null); then
+        local user_socket="${XDG_RUNTIME_DIR:-}/systemd/private"
+        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" || -S "$runtime_bus" || -S "$user_socket" ]] && (systemctl --user --quiet is-system-running 2>/dev/null || systemctl --user list-units &>/dev/null); then
             local raw_failed
             if raw_failed="$(systemctl --user --failed --no-legend --plain --no-pager 2>/dev/null)"; then
                 local failed_list
@@ -5137,6 +5150,12 @@ check_package_integrity() {
         return
     fi
 
+    if ! command -v pacman &>/dev/null; then
+        add_row "Package file integrity" "INFO ℹ (pacman unavailable)" "SYS"
+        log "HEALTH package_integrity=INFO pacman_missing"
+        return
+    fi
+
     local integrity_file="$RUN_RAW/pacman-integrity.txt"
     spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
         bash -c 'LC_ALL=C sudo -n pacman -Qk > "$1" 2>&1 || LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
@@ -5154,9 +5173,9 @@ check_package_integrity() {
             # Flag ONLY packages with genuinely missing critical binaries, libraries, or system configs (/usr, /etc, /opt)
             local missing_crit
             missing_crit="$(pacman -Ql "$pkg" 2>/dev/null | while read -r _ f; do
-                if [[ ! -e "$f" && ! "$f" =~ ^/(var|run|tmp|dev|proc|sys)/ ]]; then
+                if [[ ! -e "$f" && ! -L "$f" && ! "$f" =~ ^/(var|run|tmp|dev|proc|sys)/ ]]; then
                     # Double-check elevated existence if unprivileged to avoid false alarms on restricted directories
-                    if [[ "$EUID" -ne 0 ]] && sudo -n test -e "$f" 2>/dev/null; then
+                    if [[ "$EUID" -ne 0 ]] && { sudo -n test -e "$f" 2>/dev/null || sudo -n test -L "$f" 2>/dev/null; }; then
                         continue
                     fi
                     local pdir
@@ -5234,8 +5253,8 @@ check_orphan_packages() {
         rc=$?
     fi
 
-    # Pacman exits with 1 when zero orphans are found; genuine ALPM errors write to stderr
-    if (( rc != 0 )) && [[ -s "$err" ]]; then
+    # Pacman exits with 1 when zero orphans are found; genuine ALPM errors exit > 1 or log 'error:'
+    if (( rc > 1 )) || { (( rc != 0 )) && grep -qiE '^error:' "$err" 2>/dev/null; }; then
         add_row "Orphan packages" "WARN ⚠ (pacman query failed)" "SYS"
         ((WARNINGS++)) || true
         log "HEALTH orphans=WARN query_failed"
@@ -6427,10 +6446,17 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 root_space)
-                    code="STORAGE_ROOT_SPACE_CRITICAL"
-                    summary="Filesystem usage is over threshold on critical partition"
-                    fix="Run sys-health maintenance to clean package cache and old logs"
-                    risk="HIGH"
+                    if [[ "$details" =~ status=read_only ]]; then
+                        code="STORAGE_ROOT_READ_ONLY"
+                        summary="Critical filesystem is mounted in emergency READ-ONLY mode"
+                        fix="Inspect kernel logs (dmesg -T | grep -iE 'error|remount') and check filesystem integrity (fsck)"
+                        risk="CRITICAL"
+                    else
+                        code="STORAGE_ROOT_SPACE_CRITICAL"
+                        summary="Filesystem usage is over threshold on critical partition"
+                        fix="Run sys-health maintenance to clean package cache and old logs"
+                        risk="HIGH"
+                    fi
                     ;;
                 systemd_failed|systemd_user_failed)
                     code="SYS_SERVICE_FAILED"
@@ -6960,16 +6986,22 @@ reconstruct_tables_from_log() {
 
             # --- SYSTEM HEALTH & SERVICES ---
             root_space)
-                local rusage="${details#usage=}"
-                local rmount=""
-                if [[ "$details" =~ mount=([^ ]+) ]]; then
-                    rmount="${BASH_REMATCH[1]}"
+                if [[ "$details" =~ status=read_only ]]; then
+                    local rmounts=""
+                    [[ "$details" =~ mounts=\'([^\']+)\' ]] && rmounts="${BASH_REMATCH[1]}"
+                    AUDIT_TABLE_SYS+="Root disk space | FAIL ✖ (mounted READ-ONLY: ${rmounts})\n"
+                else
+                    local rusage="${details#usage=}"
+                    local rmount=""
+                    if [[ "$details" =~ mount=([^ ]+) ]]; then
+                        rmount="${BASH_REMATCH[1]}"
+                    fi
+                    local rnote="$rusage"
+                    if [[ -n "$rmount" && "$rmount" != "/" ]]; then
+                        rnote="$rmount: $rusage"
+                    fi
+                    AUDIT_TABLE_SYS+="$(_format_audit_row "Root disk space" "$val" "$rnote")\n"
                 fi
-                local rnote="$rusage"
-                if [[ -n "$rmount" && "$rmount" != "/" ]]; then
-                    rnote="$rmount: $rusage"
-                fi
-                AUDIT_TABLE_SYS+="$(_format_audit_row "Root disk space" "$val" "$rnote")\n"
                 ;;
             systemd_failed)
                 if [[ "$val" == "0" ]]; then
