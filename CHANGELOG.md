@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.41] - 2026-09-29
 
-### Fixed & Hardened (Sol EOS-SRE Architectural Audit - Bootloader Sync DAC Boundaries & systemd-boot Entry Matching / PATCH-030)
+### Fixed & Hardened (SRE Architectural Audit - Bootloader Sync DAC Boundaries & systemd-boot Entry Matching / PATCH-030)
 - **DAC Privilege Boundary Traversal on ESP Mountpoints (`boot_sync_collect_paths`)**:
   - Replaced unprivileged bash `[[ -d "$path" ]]` and `[[ -f "$path" ]]` checks with DAC-aware helper functions `_boot_dir_searchable` and `_boot_file_test`.
   - Enables unprivileged executions using passwordless `sudo -n` to traverse EFI System Partitions mounted with restricted permissions (`0750` or `0700` `root:root`, e.g. `/efi/loader/entries`), preventing false empty directory discovery.
