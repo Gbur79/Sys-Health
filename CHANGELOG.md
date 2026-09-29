@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.39] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Guarded Upgrade End-to-End Resilience / PATCH-028)
+- **Signal-Aware Trap & Background Keepalive Lifecycle (`run_guarded_upgrade`)**:
+  - Replaced isolated `RETURN` trap with comprehensive `RETURN INT TERM` signal handling, guaranteeing zero orphaned background keepalive loops and zero `/tmp` orphan residues upon Ctrl+C interruption.
+  - Added parent PID liveness interrogation (`kill -0 "$$"`) inside the sudo keepalive loop to immediately terminate background loops if the parent shell closes.
+- **Cancelled/Aborted Transaction Immunity & Panic Elimination (`run_guarded_upgrade`)**:
+  - Eliminated universal false-positive critical panic (*"ATTENTION: POST-UPGRADE INTEGRITY ISSUES DETECTED ✖ DO NOT REBOOT YET!"*) triggered whenever a package transaction exited non-zero (e.g. user answered 'n' to pacman's installation prompt or interrupted network downloads before disk mutations).
+  - Decoupled transaction return codes from system integrity verification: when `post_failed` is false and `upgrade_rc != 0`, emits a clear, reassuring status (*"PACKAGE TRANSACTION INCOMPLETE OR CANCELLED (Exit code: X) ℹ - System integrity verified: Bootloader, kernels & DKMS modules are intact. System state is consistent and safe."*).
+- **Unprivileged DAC Permission Resiliency in Post-Flight Audit (`run_guarded_upgrade`)**:
+  - Replaced raw unprivileged bash `[[ -f ... && -s ... ]]` tests on boot images with `_boot_file_test` and `_boot_file_size`.
+  - Added `_boot_file_mtime()` with `sudo -n` fallback to safely inspect file modification timestamps across `0700` ESP mountpoints without permission denied failures.
+  - Added lsinit failure graceful fallback for unprivileged users on `0700` ESP mounts when images exceed 1MB.
+- **`/etc/fstab` Comment Line Contamination Defense (`detect_esp_mountpoint` & Gate 1)**:
+  - Added strict comment filtering (`!/^[[:space:]]*#/`) across `/etc/fstab` awk parsers, preventing commented-out entries (such as `# /boot/efi was on /dev/sda1`) from falsely triggering missing mount errors or overriding active ESP targets.
+- **Elimination of Arithmetic Expansion Syntax Trap in Pre-Flight Gate 2 (`run_guarded_upgrade`)**:
+  - Replaced defective `$((pacman -Qtdq ... | wc -l))` arithmetic construct with deterministic awk accumulator (`pacman -Qtdq 2>/dev/null | awk 'END {print NR+0}'`).
+- **Forced Database Synchronization & Upgrade Loop Remediation (`run_guarded_upgrade`)**:
+  - Resolved dead-end logic trap where user-approved forced synchronization (`pacman -Syyu`) on an up-to-date system was instantly aborted by the 0-update safety guard ("Nothing to do").
+  - Implemented `force_refresh=true` state machine that bypasses the 0-update early exit and dispatches `-Syyu` (or `eos-update --force`).
+- **Terminal Universalism & Classic Shell Fallback (PATCH-001 Upstream Compliance)**:
+  - Implemented POSIX standard `read -r -p` interactive fallbacks across Gates 1 (tight root space), 3 (mirror refresh), 4 (Arch News manual intervention), and 5 (pending reboot), ensuring systems without `gum` never silently bypass confirmation gates or drop to non-interactive mode.
+- **DKMS Module State Hardening & Regex Expansion (`run_guarded_upgrade`)**:
+  - Proactively flagged unbuilt and uninstalled DKMS states (`added|built`), preventing partial kernel module setups from passing post-flight audit.
+  - Expanded NVIDIA DKMS regex to `^nvidia[-_a-zA-Z0-9]*/.*: installed`, seamlessly supporting `nvidia-open`, `nvidia-open-dkms`, and legacy branches.
+  - Added positive confirmation output when kernels run cleanly without DKMS modules.
+- **Dynamic Initramfs Generator Repair Delegation (`run_guarded_upgrade`)**:
+  - Routed post-flight initramfs remediation commands through `detect_initramfs_generator`, dynamically outputting tailored recovery commands for Dracut, Booster (`/usr/lib/booster/regenerate_images`), and Mkinitcpio without generator confusion.
+- **AUR Helper Dispatch Resiliency (`run_guarded_upgrade`)**:
+  - Prevented erroneous `eos-update --yay` invocation on EndeavourOS systems utilizing alternative helpers (such as `pikaur`), gracefully falling back to native helper invocations (`"$aur_helper" "$sync_flag"`).
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / PATCH-028)**:
+  - Added Part 9 test fixtures covering: ESP detector fstab comment immunity, preflight orphan query syntax verification, cancelled transaction panic decoupling, and dynamic initramfs repair generator delegation (total hermetic test count expanded from 34 to 38, 100% PASS).
+
 ## [2.38] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Multi-Distro & Third-Party Apps / PATCH-027)
