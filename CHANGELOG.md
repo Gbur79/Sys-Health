@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.38] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Multi-Distro & Third-Party Apps / PATCH-027)
+- **Local Rig Bias Quarantine & Schema Cleanliness (`run_software_updates`)**:
+  - Completely excised Karol's private local tool (`agy`) from core software update routines, interactive TUI menus, and `--software --json` telemetry output. Enforces 100% universalism and clean public telemetry contracts.
+- **Multi-Distro Binary Ownership Protection (`check_binary_ownership`)**:
+  - Expanded package classifier to dynamically distinguish Cargo-managed binaries (`~/.cargo/bin`), Nix profiles (`.nix-profile`, `/nix/store`), and Homebrew environments (`/home/linuxbrew`).
+  - Protects multi-boot / multi-distro workstations (e.g. `@Beiruty` setup) sharing `/home` from accidental binary overwrites or glibc ABI mismatch by preventing standalone self-updaters (`uv self update`, `goose update`) from running against externally managed binaries.
+  - Added descriptive, actionable update instructions specific to each foreign manager.
+- **Guarded Batch Update Completeness (`run_software_updates`)**:
+  - Fixed batch updater omission bug where `pipx upgrade-all` was tracked in pending action counts and individual menus but omitted during "Update all pending components".
+- **Network Resilience & Latency Safeguards (`run_software_updates`)**:
+  - Added `--connect-timeout 2` to GitHub release API queries and `timeout 5` to `flatpak remote-ls --updates`, eliminating terminal freezes on offline or high-latency network interfaces.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / PATCH-027)**:
+  - Added Test 1.5: telemetry assertion verifying complete absence of private rig keys (`agy`) in `--software --json`.
+  - Added Part 8 test fixtures covering: multi-manager binary ownership classification (`cargo`, `foreign`, `shim`, `standalone`) and batch updater `pipx` completeness (total hermetic test count expanded from 31 to 34, 100% PASS).
+
 ## [2.37] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - BLS Machine-ID & DAC Boundaries / PATCH-026)
