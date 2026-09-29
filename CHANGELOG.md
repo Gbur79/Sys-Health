@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.35] - 2026-09-29
+
+### Fixed & Hardened (SRE Architectural Audit - Hardware & Drivers Resiliency / PATCH-024)
+- **Intel Graphics `xe` Driver Noise Elimination (`check_gpu_errors`)**:
+  - Hardened kernel log error matching regex against benign informational lines (`xe ...: [drm] Finished loading GuC ...`), eliminating 100% false-positive GPU failure warnings on Intel Arc and Meteor/Lunar/Arrow Lake systems.
+- **Universal 4-Digit PCI Domain Delimitation (`check_gpu`, `check_gpu_errors`, `check_gaming`, `generate_summary_json`)**:
+  - Expanded PCI device boundary regex (`^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.`) across discrete GPU parsers, preventing non-display devices (audio controllers, ethernet NICs) from leaking into active GPU driver state.
+- **Multi-Kernel DKMS Header Audit (`check_dkms`)**:
+  - Implemented multi-kernel validation inspecting `/usr/lib/modules/*/pkgbase`, proactively flagging missing `<pkgb>-headers` across all installed kernels before rebooting into uncompiled module states.
+  - Added detection of unbuilt/uninstalled DKMS states (`added|built`) and empty module configs.
+- **SMART Disk Audit VirtIO & Spin-Down Hardening (`check_smart`)**:
+  - Added `-n standby` guard to prevent spinning up low-power/sleeping HDD drives during health checks.
+  - Added graceful degradation for VirtIO and non-SMART VM block devices (`Unable to detect device type`, `NODEV`), resolving false-positive `WARN ⚠` on KVM, Proxmox, and QEMU VMs.
+- **Hybrid SSD + HDD Storage TRIM Tolerance (`check_fstrim`)**:
+  - Filtered filesystem mount discovery by rotational device property (`lsblk -dno ROTA`), preventing classical spinning hard drives lacking the `discard` mount option from falsely triggering TRIM timer warnings.
+- **Multi-Battery Laptop Topology (`check_power`)**:
+  - Upgraded power audit to enumerate and aggregate multiple physical system batteries (e.g. ThinkPad bridge batteries BAT0 + BAT1), providing unified capacity and charge telemetry without false warnings when secondary batteries are active.
+- **Universal Legacy NVIDIA Guardrails (Pre-Flight Gate 5)**:
+  - Generalized driver collision checks across legacy branches (`nvidia-580xx`, `nvidia-470xx`, `nvidia-390xx`) and hardware families (Maxwell, Kepler), preventing concurrent package installation from bricking graphical sessions.
+- **Hermetic Regression Suite Expansion (`dev-tools/test-suite.sh` / PATCH-024)**:
+  - Added Part 5 test fixtures covering: Intel `xe` normal GuC init immunity, 4-digit PCI domain delimitation, VirtIO non-SMART graceful INFO handling, and multi-kernel DKMS headers detection (total hermetic test count expanded from 18 to 22).
+
 ## [2.34] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - System Health & Services Resiliency)
