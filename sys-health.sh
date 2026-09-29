@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.37
+# Arch System Health & Diagnostics v2.38
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.37"
+VERSION="2.38"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -8369,9 +8369,9 @@ detect_aur_helper() {
     fi
 }
 
-# Rigorous package ownership check hardened against aliases, shims and language runtimes
+# Rigorous package ownership check hardened against aliases, shims, language runtimes and multi-distro managers
 check_binary_ownership() {
-    # Returns via stdout: "pacman" | "shim" | "standalone" | "missing"
+    # Returns via stdout: "pacman" | "shim" | "cargo" | "foreign" | "standalone" | "missing"
     local bin="$1"
     [[ -z "$bin" ]] && { echo "missing"; return 1; }
 
@@ -8385,6 +8385,18 @@ check_binary_ownership() {
         return 0
     fi
 
+    # Cargo managed binaries in user home (~/.cargo/bin/)
+    if [[ "$resolved" =~ /\.cargo/bin/ ]]; then
+        echo "cargo"
+        return 0
+    fi
+
+    # Foreign package managers (Homebrew, Nix) common in multi-distro workstations
+    if [[ "$resolved" =~ (/home/linuxbrew/|\.nix-profile/|/nix/store/) ]]; then
+        echo "foreign"
+        return 0
+    fi
+
     if pacman -Qo "$resolved" &>/dev/null; then
         echo "pacman"
         return 0
@@ -8395,6 +8407,14 @@ check_binary_ownership() {
     if [[ -n "$real" && "$real" != "$resolved" ]]; then
         if [[ "$real" =~ (/shims/|/\.pyenv/|/\.asdf/|/\.nvm/|/mise/shims/|/\.rustup/toolchains/) ]]; then
             echo "shim"
+            return 0
+        fi
+        if [[ "$real" =~ /\.cargo/bin/ ]]; then
+            echo "cargo"
+            return 0
+        fi
+        if [[ "$real" =~ (/home/linuxbrew/|\.nix-profile/|/nix/store/) ]]; then
+            echo "foreign"
             return 0
         fi
         if pacman -Qo "$real" &>/dev/null; then
@@ -8526,6 +8546,10 @@ run_software_updates() {
                 uv_stat="PASS ✔ (v${uv_cur} - pacman managed)"
             elif [[ "$uv_owner" == "shim" ]]; then
                 uv_stat="PASS ✔ (v${uv_cur} - runtime/shim managed)"
+            elif [[ "$uv_owner" == "cargo" ]]; then
+                uv_stat="PASS ✔ (v${uv_cur} - cargo managed)"
+            elif [[ "$uv_owner" == "foreign" ]]; then
+                uv_stat="PASS ✔ (v${uv_cur} - foreign manager)"
             else
                 local uv_dry
                 uv_dry="$(uv self update --dry-run 2>&1 || true)"
@@ -8552,11 +8576,15 @@ run_software_updates() {
                 goose_stat="PASS ✔ (v${goose_cur} - pacman managed)"
             elif [[ "$g_owner" == "shim" ]]; then
                 goose_stat="PASS ✔ (v${goose_cur} - runtime/shim managed)"
+            elif [[ "$g_owner" == "cargo" ]]; then
+                goose_stat="PASS ✔ (v${goose_cur} - cargo managed)"
+            elif [[ "$g_owner" == "foreign" ]]; then
+                goose_stat="PASS ✔ (v${goose_cur} - foreign manager)"
             else
                 local goose_tag
                 # Strip both \r and \n (RFC 9110 HTTP CRLF fix verified by o3-mini & Gemini Pro)
                 goose_tag="$(
-                    curl -fsIL --max-time 4 https://github.com/aaif-goose/goose/releases/latest 2>/dev/null |
+                    curl -fsIL --connect-timeout 2 --max-time 4 https://github.com/aaif-goose/goose/releases/latest 2>/dev/null |
                     awk -F'/tag/v?' '/[Ll]ocation:.*\/tag\// {print $2}' |
                     tr -d '\r\n'
                 )" || true
@@ -8584,7 +8612,7 @@ run_software_updates() {
             if (( flatpak_count > 0 )); then
                 flatpak_installed=true
                 local fp_count
-                fp_count="$(flatpak remote-ls --updates 2>/dev/null | wc -l || echo 0)"
+                fp_count="$(timeout 5 flatpak remote-ls --updates 2>/dev/null | wc -l || echo 0)"
                 if (( fp_count > 0 )); then
                     flatpak_stat="UPDATE ⚠ (${fp_count} app updates available)"
                     flatpak_up_needed=true
@@ -8623,14 +8651,6 @@ run_software_updates() {
             steam_stat="PASS ✔ (Steam manages internal updates automatically)"
         fi
 
-        # 8. Local Custom CLI Tools (e.g. Agy, custom binaries - Silent-if-Absent)
-        local agy_installed=false agy_cur="not installed" agy_stat=""
-        if type -P agy &>/dev/null || [[ -x "$HOME/.local/bin/agy" ]]; then
-            agy_installed=true
-            agy_cur="$("$HOME/.local/bin/agy" --version 2>/dev/null | head -n1 || echo "unknown")"
-            agy_stat="PASS ✔ (v${agy_cur} - standalone CLI)"
-        fi
-
         # JSON output mode dispatch
         if [[ "$json_mode" -eq 1 ]]; then
             if command -v jq &>/dev/null; then
@@ -8649,8 +8669,6 @@ run_software_updates() {
                     --arg uv_v "$uv_cur" \
                     --arg uv_l "$uv_latest" \
                     --argjson uv_up "$uv_up_needed" \
-                    --argjson agy_inst "$agy_installed" \
-                    --arg agy_v "$agy_cur" \
                     --argjson pipx_inst "$pipx_installed" \
                     --argjson pipx_cnt "$pipx_count" \
                     --argjson rustup_inst "$rustup_installed" \
@@ -8667,8 +8685,7 @@ run_software_updates() {
                         uv: {installed: $uv_inst, version: $uv_v, latest: $uv_l, update_available: $uv_up},
                         pipx: {installed: $pipx_inst, package_count: $pipx_cnt},
                         rustup: {installed: $rustup_inst, update_available: $rustup_up},
-                        steam: {installed: $steam_inst, status: $steam_s},
-                        agy: {installed: $agy_inst, version: $agy_v}
+                        steam: {installed: $steam_inst, status: $steam_s}
                     }'
             else
                 echo '{"aur_helper": "'"$aur_helper"'", "aur_pending": '"$aur_pending_count"', "uv": "'"$uv_cur"'", "goose": "'"$goose_cur"'"}'
@@ -8740,10 +8757,6 @@ run_software_updates() {
 
         if $steam_installed; then
             up_to_date_list+=("Steam & Proton (self-managed)")
-        fi
-
-        if $agy_installed; then
-            up_to_date_list+=("Agy CLI (v${agy_cur})")
         fi
 
         local up_str=""
@@ -8919,7 +8932,15 @@ run_software_updates() {
                     pause_screen
                     continue
                 elif [[ "$uv_owner" == "shim" ]]; then
-                    fail "UV Python Toolchain is managed by a runtime shim (mise/asdf/cargo/pyenv). Please update via its manager."
+                    fail "UV Python Toolchain is managed by a runtime shim (mise/asdf/pyenv). Please update via its manager."
+                    pause_screen
+                    continue
+                elif [[ "$uv_owner" == "cargo" ]]; then
+                    fail "UV Python Toolchain is managed by cargo (~/.cargo/bin). Please update via 'cargo install --force uv' or 'cargo binstall'."
+                    pause_screen
+                    continue
+                elif [[ "$uv_owner" == "foreign" ]]; then
+                    fail "UV Python Toolchain is managed by a foreign package manager (Homebrew/Nix). Please update via brew/nix."
                     pause_screen
                     continue
                 elif ! can_self_update_binary uv; then
@@ -8947,7 +8968,15 @@ run_software_updates() {
                     pause_screen
                     continue
                 elif [[ "$goose_owner" == "shim" ]]; then
-                    fail "Goose AI Assistant is managed by a runtime shim (mise/asdf/cargo). Please update via its manager."
+                    fail "Goose AI Assistant is managed by a runtime shim (mise/asdf). Please update via its manager."
+                    pause_screen
+                    continue
+                elif [[ "$goose_owner" == "cargo" ]]; then
+                    fail "Goose AI Assistant is managed by cargo (~/.cargo/bin). Please update via 'cargo install --force goose-cli'."
+                    pause_screen
+                    continue
+                elif [[ "$goose_owner" == "foreign" ]]; then
+                    fail "Goose AI Assistant is managed by a foreign package manager (Homebrew/Nix). Please update via brew/nix."
                     pause_screen
                     continue
                 elif ! can_self_update_binary goose; then
@@ -9075,6 +9104,13 @@ run_software_updates() {
                     info "--- Updating Rust Toolchain ---"
                     if ! rustup update; then
                         fail "Rustup update failed."
+                        exit_summary=1
+                    fi
+                fi
+                if $pipx_installed && (( pipx_count > 0 )); then
+                    info "--- Updating Pipx Applications (pipx upgrade-all) ---"
+                    if ! pipx upgrade-all; then
+                        fail "Pipx applications update failed."
                         exit_summary=1
                     fi
                 fi
