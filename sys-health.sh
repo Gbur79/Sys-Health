@@ -4440,7 +4440,7 @@ check_gpu() {
     local current_block="" in_gpu=false
 
     while IFS= read -r line; do
-        if [[ "$line" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\. ]]; then
+        if [[ "$line" =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\. ]]; then
             if $in_gpu && [[ -n "$current_block" ]]; then
                 gpu_blocks+=("$current_block")
                 current_block=""
@@ -4533,7 +4533,7 @@ check_gpu() {
 check_gpu_errors() {
     local vga_info drivers_in_use
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -Ei 'VGA|3D|Display' || true)"
-    drivers_in_use="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' || true)"
+    drivers_in_use="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' || true)"
 
     local target_uid="${EUID}"
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
@@ -4543,9 +4543,9 @@ check_gpu_errors() {
     local is_wayland=false
     if [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]]; then
         is_wayland=true
-    elif pgrep -u "$target_uid" -x "kwin_wayland|gnome-shell|Hyprland|sway|wayfire|river|labwc|cosmic-comp" &>/dev/null; then
+    elif pgrep -u "$target_uid" -x "kwin_wayland|gnome-shell|Hyprland|hyprland|sway|wayfire|river|labwc|cosmic-comp|niri" &>/dev/null; then
         is_wayland=true
-    elif pgrep -x "kwin_wayland|gnome-shell|Hyprland|sway|wayfire|river|labwc|cosmic-comp" &>/dev/null; then
+    elif pgrep -x "kwin_wayland|gnome-shell|Hyprland|hyprland|sway|wayfire|river|labwc|cosmic-comp|niri" &>/dev/null; then
         is_wayland=true
     fi
 
@@ -4563,7 +4563,7 @@ check_gpu_errors() {
             detected_errors+=("NVIDIA Xid error in dmesg: $nv_xid")
         fi
 
-        if ! $is_wayland; then
+        if ! $is_wayland && pgrep -x "Xorg|X" &>/dev/null; then
             local xorg_log="/var/log/Xorg.0.log"
             local user_home="${HOME}"
             if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
@@ -4571,7 +4571,15 @@ check_gpu_errors() {
             fi
             [[ ! -f "$xorg_log" && -f "$user_home/.local/share/xorg/Xorg.0.log" ]] && xorg_log="$user_home/.local/share/xorg/Xorg.0.log"
 
+            # Verify whether Xorg log is fresh from the current boot session
+            local btime=0
+            btime="$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)"
+            local log_mtime=0
             if [[ -f "$xorg_log" ]]; then
+                log_mtime="$(stat -c %Y "$xorg_log" 2>/dev/null || echo 0)"
+            fi
+
+            if [[ -f "$xorg_log" ]] && (( log_mtime >= btime )); then
                 local fliplock_count
                 fliplock_count="$(grep -a -c "Failed to request fliplock" "$xorg_log" 2>/dev/null || true)"
                 fliplock_count="${fliplock_count:-0}"
@@ -4601,10 +4609,10 @@ check_gpu_errors() {
         fi
     fi
 
-    # --- Intel Graphics Diagnostics (Hardened against false matches) ---
+    # --- Intel Graphics Diagnostics (Hardened against false matches on normal GuC init) ---
     if [[ "$drivers_in_use" == *"i915"* || "$drivers_in_use" == *"xe"* ]]; then
         local intel_err
-        intel_err="$(printf '%s\n' "$klog" | grep -Ei "(i915.*GPU HANG|\bxe\b.*GPU HANG|i915_reset|\[drm\] \*ERROR\*.*xe|xe\s+[0-9a-fA-F:.]+\s*:\s*\[drm\])" | head -n 1 || true)"
+        intel_err="$(printf '%s\n' "$klog" | grep -Ei "(i915.*GPU HANG|\bxe\b.*GPU HANG|i915_reset|\[drm\] \*ERROR\*.*xe|xe\s+[0-9a-fA-F:.]+\s*:\s*\[drm\].*(error|failed|timeout|fault))" | head -n 1 || true)"
         if [[ -n "$intel_err" ]]; then
             detected_errors+=("Intel GPU error in kernel log: $intel_err")
         fi
@@ -4613,7 +4621,7 @@ check_gpu_errors() {
     # --- Status Evaluation ---
     local log_out="${LOG_FILE:-/tmp/sys-health.log}"
     if (( ${#detected_errors[@]} > 0 )); then
-        add_row "GPU errors & lockups" "WARN ⚠ (${detected_errors[0]})"
+        add_row "GPU errors & lockups" "WARN ⚠ (${detected_errors[0]})" "HW"
         ((WARNINGS++)) || true
         log "HEALTH gpu_errors=WARN count=${#detected_errors[@]}"
         {
@@ -4624,7 +4632,7 @@ check_gpu_errors() {
             echo ""
         } >> "$log_out" 2>/dev/null || true
     elif (( ${#detected_notes[@]} > 0 )); then
-        add_row "GPU errors & lockups" "PASS ✔"
+        add_row "GPU errors & lockups" "PASS ✔" "HW"
         log "HEALTH gpu_errors=PASS note='${detected_notes[0]}'"
         {
             echo "### GPU HARDWARE / DRIVER LOG NOTE"
@@ -4634,30 +4642,74 @@ check_gpu_errors() {
             echo ""
         } >> "$log_out" 2>/dev/null || true
     else
-        add_row "GPU errors & lockups" "PASS ✔"
+        add_row "GPU errors & lockups" "PASS ✔" "HW"
         log "HEALTH gpu_errors=PASS"
     fi
 }
 
 check_dkms() {
     if ! command -v dkms &>/dev/null; then
-        add_row "DKMS" "INFO ℹ (not installed)"
+        add_row "DKMS modules" "INFO ℹ (not installed)" "HW"
         ((INFO_COUNT++))
         log "HEALTH dkms=not_installed"
         return
     fi
 
+    local root="${SYS_HEALTH_ROOT:-}"
+    local raw_dir="${RUN_RAW:-/tmp}"
     DKMS_TEXT="$(dkms status 2>&1 || true)"
-    printf '%s\n' "$DKMS_TEXT" > "$RUN_RAW/dkms-status.txt"
+    [[ -d "$raw_dir" && -w "$raw_dir" ]] && printf '%s\n' "$DKMS_TEXT" > "$raw_dir/dkms-status.txt"
 
+    if [[ -z "$DKMS_TEXT" ]]; then
+        add_row "DKMS modules" "PASS ✔ (no DKMS modules configured)" "HW"
+        log "HEALTH dkms=PASS modules=none"
+        return
+    fi
+
+    # 1. Broken / error status check
     if printf '%s\n' "$DKMS_TEXT" | grep -qiE 'broken|error'; then
-        add_row "DKMS modules" "WARN ⚠ (review required)"
+        add_row "DKMS modules" "WARN ⚠ (review required)" "HW"
         ((WARNINGS++))
         log "HEALTH dkms=WARN status=broken_or_error"
-    else
-        add_row "DKMS modules" "PASS ✔"
-        log "HEALTH dkms=PASS"
+        return
     fi
+
+    # 2. Multi-kernel check: verify corresponding -headers package exists for all installed kernels
+    local -a missing_headers=()
+    local -a installed_kernels=()
+    local k_dir
+    for k_dir in "${root}"/usr/lib/modules/*/pkgbase; do
+        [[ -f "$k_dir" ]] || continue
+        local pkgb
+        pkgb="$(< "$k_dir")"
+        pkgb="${pkgb//[[:space:]]/}"
+        [[ -z "$pkgb" ]] && pkgb="linux"
+        installed_kernels+=("$pkgb")
+
+        if command -v pacman &>/dev/null; then
+            if ! pacman ${root:+--root "$root"} -Q "${pkgb}-headers" &>/dev/null; then
+                missing_headers+=("${pkgb}-headers")
+            fi
+        fi
+    done
+
+    if (( ${#missing_headers[@]} > 0 )); then
+        add_row "DKMS modules" "WARN ⚠ (missing headers: ${missing_headers[*]})" "HW"
+        ((WARNINGS++))
+        log "HEALTH dkms=WARN missing_headers='${missing_headers[*]}'"
+        return
+    fi
+
+    # 3. Detect uninstalled/unbuilt module states
+    if printf '%s\n' "$DKMS_TEXT" | grep -qiE 'added|built'; then
+        add_row "DKMS modules" "WARN ⚠ (uninstalled/unbuilt modules present)" "HW"
+        ((WARNINGS++))
+        log "HEALTH dkms=WARN status=uninstalled_modules"
+        return
+    fi
+
+    add_row "DKMS modules" "PASS ✔" "HW"
+    log "HEALTH dkms=PASS"
 }
 
 check_temperature() {
@@ -4778,14 +4830,16 @@ check_smart() {
     local failed=0 passed=0 no_perm=0 unsupported=0 total="${#disks[@]}"
     for dev in "${disks[@]}"; do
         local result
-        result="$(sudo -n smartctl -H "$dev" 2>&1 || smartctl -H "$dev" 2>&1 || true)"
-        if printf '%s\n' "$result" | grep -qiE 'PASSED|test result: ok'; then
+        result="$(sudo -n smartctl -n standby -H "$dev" 2>&1 || smartctl -n standby -H "$dev" 2>&1 || true)"
+        if printf '%s\n' "$result" | grep -qiE 'Device is in STANDBY mode'; then
+            (( passed++ ))
+        elif printf '%s\n' "$result" | grep -qiE 'PASSED|test result: ok'; then
             (( passed++ ))
         elif printf '%s\n' "$result" | grep -qiE 'FAILED!'; then
             (( failed++ ))
         elif printf '%s\n' "$result" | grep -qiE 'Permission denied|password is required'; then
             (( no_perm++ ))
-        elif printf '%s\n' "$result" | grep -qiE 'Device does not support SMART|Unavailable|Unknown USB bridge'; then
+        elif printf '%s\n' "$result" | grep -qiE 'Device does not support SMART|Unavailable|Unknown USB bridge|Unable to detect device type|NODEV|Device open failed'; then
             (( unsupported++ ))
         fi
     done
@@ -4816,34 +4870,54 @@ check_smart() {
 }
 
 check_power() {
-    local has_battery=false
-    local bat_capacity=""
-    local bat_status=""
-    local bat_name=""
+    local -a sys_batteries=()
+    local psu_dir
+    for psu_dir in /sys/class/power_supply/*; do
+        [[ -d "$psu_dir" ]] || continue
+        local psu_type="" psu_scope=""
+        [[ -r "$psu_dir/type" ]] && psu_type="$(< "$psu_dir/type")"
+        [[ -r "$psu_dir/scope" ]] && psu_scope="$(< "$psu_dir/scope")"
 
-    for bat in /sys/class/power_supply/BAT* /sys/class/power_supply/battery; do
-        if [[ -d "$bat" ]]; then
-            local scope
-            scope="$(cat "$bat/scope" 2>/dev/null || echo "System")"
-            if [[ "$scope" != "Device" ]]; then
-                has_battery=true
-                bat_name="${bat##*/}"
-                bat_capacity="$(cat "$bat/capacity" 2>/dev/null || echo "")"
-                bat_status="$(cat "$bat/status" 2>/dev/null || echo "Unknown")"
-                break
+        if [[ "$psu_type" == "Battery" && "$psu_scope" != "Device" ]]; then
+            local bname="${psu_dir##*/}"
+            if [[ "$bname" =~ ^(BAT[0-9]+|battery) || "$psu_scope" == "System" ]]; then
+                sys_batteries+=("$psu_dir")
             fi
         fi
     done
 
-    if $has_battery; then
-        local cap_num="${bat_capacity//[^0-9]/}"
-        if [[ -n "$cap_num" ]] && (( cap_num < 20 )) && [[ "$bat_status" != "Charging" && "$bat_status" != "Full" ]]; then
-            add_row "Power & Battery" "WARN ⚠ ($bat_name: ${cap_num}% [${bat_status}] - connect AC)" "HW"
+    if (( ${#sys_batteries[@]} > 0 )); then
+        local -a bat_summaries=()
+        local has_low_battery=false
+        local worst_cap=100
+        for bat in "${sys_batteries[@]}"; do
+            local b_name="${bat##*/}"
+            local b_cap="" b_stat="Unknown"
+            [[ -r "$bat/capacity" ]] && b_cap="$(< "$bat/capacity")"
+            [[ -r "$bat/status" ]] && b_stat="$(< "$bat/status")"
+            local cap_num="${b_cap//[^0-9]/}"
+            cap_num="${cap_num:-0}"
+            bat_summaries+=("${b_name}: ${cap_num}% [${b_stat}]")
+            if (( cap_num < worst_cap )); then
+                worst_cap=$cap_num
+            fi
+            if (( cap_num < 20 )) && [[ "$b_stat" != "Charging" && "$b_stat" != "Full" ]]; then
+                has_low_battery=true
+            fi
+        done
+
+        local old_ifs="$IFS"
+        IFS=', '
+        local combined_bats="${bat_summaries[*]}"
+        IFS="$old_ifs"
+
+        if $has_low_battery; then
+            add_row "Power & Battery" "WARN ⚠ ($combined_bats - connect AC)" "HW"
             ((WARNINGS++))
-            log "HEALTH power=WARN battery_low=$cap_num status=$bat_status"
+            log "HEALTH power=WARN battery_low=$worst_cap details='$combined_bats'"
         else
-            add_row "Power & Battery" "PASS ✔ ($bat_name: ${cap_num}% [${bat_status}])" "HW"
-            log "HEALTH power=PASS battery=$cap_num status=$bat_status"
+            add_row "Power & Battery" "PASS ✔ ($combined_bats)" "HW"
+            log "HEALTH power=PASS battery=$worst_cap details='$combined_bats'"
         fi
     else
         add_row "Power & Battery" "PASS ✔ (AC Desktop power)" "HW"
@@ -4882,8 +4956,16 @@ check_fstrim() {
     if command -v findmnt &>/dev/null; then
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            local mnt fstype opts
-            read -r mnt fstype opts <<< "$line"
+            local mnt fstype opts src
+            read -r mnt fstype opts src <<< "$line"
+
+            # Skip rotational HDD drives (they do not support discard/TRIM)
+            if [[ -n "$src" && -b "$src" ]]; then
+                local is_rota
+                is_rota="$(lsblk -dno ROTA "$src" 2>/dev/null | tr -d ' ' || echo "0")"
+                [[ "$is_rota" == "1" ]] && continue
+            fi
+
             case "$fstype" in
                 btrfs)
                     # Btrfs defaults to async discard on kernel >= 6.2 unless nodiscard is specified
@@ -4894,7 +4976,7 @@ check_fstrim() {
                     [[ ! "$opts" =~ (^|,)discard(,|$) ]] && unmanaged_ssd_mounts=true
                     ;;
             esac
-        done < <(findmnt -lno TARGET,FSTYPE,OPTIONS -t btrfs,ext4,xfs,f2fs 2>/dev/null || true)
+        done < <(findmnt -lno TARGET,FSTYPE,OPTIONS,SOURCE -t btrfs,ext4,xfs,f2fs 2>/dev/null || true)
     else
         unmanaged_ssd_mounts=true
     fi
@@ -5994,7 +6076,7 @@ check_gaming() {
 
     # 2. Vulkan & 32-bit driver stack
     local vga_info drivers="" driver_list="" gpu_name=""
-    driver_list="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+    driver_list="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
 
     local vulkan_64_ok=false vulkan_32_loader=false vulkan_32_driver=false
@@ -6335,7 +6417,7 @@ generate_summary_json() {
     local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
 
-    drivers="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+    drivers="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
 
     local status_str="ALL_CLEAR"
     if (( ERRORS > 0 )); then
@@ -9289,22 +9371,27 @@ run_guarded_upgrade() {
     # --------------------------------------------------------------------------
     # Gate 5: Kernel, DKMS & Hardware Guardrails
     # --------------------------------------------------------------------------
-    # 1. Maxwell hardware & legacy driver invariant
-    local has_maxwell=false
-    if lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' | grep -q "10de:13c2"; then
-        has_maxwell=true
-    elif lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qi "GTX 970"; then
-        has_maxwell=true
+    # 1. Maxwell / Legacy NVIDIA hardware & legacy driver invariant
+    local has_legacy_nvidia=false
+    local legacy_branch=""
+    if pacman -Qq 2>/dev/null | grep -qE '^nvidia-(580xx|470xx|390xx)'; then
+        legacy_branch="$(pacman -Qq 2>/dev/null | grep -oE '^nvidia-(580xx|470xx|390xx)' | head -n1 || true)"
+        has_legacy_nvidia=true
     fi
 
-    if $has_maxwell; then
-        if pacman -Qq 2>/dev/null | grep -qE '^nvidia-580xx'; then
-            if pacman -Qq 2>/dev/null | grep -qxE "(nvidia|nvidia-open|nvidia-open-dkms|nvidia-lts)"; then
-                fail "Pre-Flight Gate 5: Conflicting modern NVIDIA driver package detected! GTX 970 will fail with black screen."
-                preflight_passed=false
-            else
-                ok "Pre-Flight Gate 5: Hardware GPU & legacy driver branch validated (nvidia-580xx)."
-            fi
+    local has_legacy_gpu=false
+    if lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' | grep -qE "(10de:13c2|10de:13c0|10de:17c8|10de:1380|10de:1381|10de:1392)"; then
+        has_legacy_gpu=true
+    elif lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -qiE "(GTX 970|GTX 980|GTX 960|GTX 750)"; then
+        has_legacy_gpu=true
+    fi
+
+    if $has_legacy_nvidia || $has_legacy_gpu; then
+        if pacman -Qq 2>/dev/null | grep -qxE "(nvidia|nvidia-open|nvidia-open-dkms|nvidia-lts)"; then
+            fail "Pre-Flight Gate 5: Conflicting modern NVIDIA driver package detected! Legacy GPUs will fail with black screen."
+            preflight_passed=false
+        elif $has_legacy_nvidia; then
+            ok "Pre-Flight Gate 5: Hardware GPU & legacy driver branch validated (${legacy_branch:-legacy NVIDIA})."
         fi
     fi
 
