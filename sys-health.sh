@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.41"
+VERSION="2.42"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -1797,7 +1797,125 @@ run_maintenance() {
 # Hardened according to Terra EOS-SRE-Auditor Architectural Blueprint
 # ==============================================================================
 
-# [SRE-AUDIT: HARDENED / PARTIAL | Terra v2.28 | Blast-Radius: HIGH | Fixtures: NONE]
+# Helper: classify_orphan_tier <pkg_name> [is_strict] [opt_for]
+# Outputs: "<tier_number>:<tag>"
+# Tier 1: strict unreferenced
+# Tier 2: optional for other installed packages
+# Tier 3: heuristically sensitive (kernel, boot, drivers, audio, toolchain, desktop, storage, security, 32-bit)
+# [SRE-AUDIT: CERTIFIED | Sol v2.42 | PATCH-031 | Fixtures: test-suite.sh Part 11]
+classify_orphan_tier() {
+    local pkg="${1:-}"
+    local is_strict="${2:-0}"
+    local opt_for="${3:-None}"
+
+    [[ -z "$pkg" ]] && return 1
+
+    case "$pkg" in
+        linux*|*-headers|grub*|systemd*|dracut*|mkinitcpio*|booster*|limine*|refind*|efibootmgr*|syslinux*)
+            echo "3:kernel / bootloader"
+            return 0
+            ;;
+        *firmware*|*-ucode|*-dkms|nvidia*|mesa*|vulkan*|xf86-video*|intel-media-driver|libva*|libvdpau*|xorg-server*|xorg-xwayland*)
+            echo "3:driver / firmware / graphics"
+            return 0
+            ;;
+        pipewire*|wireplumber*|alsa-*|pulseaudio*|jack*)
+            echo "3:audio subsystem"
+            return 0
+            ;;
+        base-devel|rust|cargo|go|gcc*|clang*|llvm*|make|cmake|patch|git|fakeroot|binutils)
+            echo "3:development toolchain"
+            return 0
+            ;;
+        wayland*|hyprland*|kwin*|plasma-*|sway*|mutter*|weston*|sddm*|gdm*|lightdm*)
+            echo "3:desktop / compositor / display manager"
+            return 0
+            ;;
+        btrfs-progs*|dosfstools|e2fsprogs|xfsprogs*|zfs*|cryptsetup*|lvm2*|mdadm*|device-mapper*)
+            echo "3:storage / filesystem / crypto"
+            return 0
+            ;;
+        polkit*|shadow|sudo|pam|networkmanager*|iwd*|wpa_supplicant*)
+            echo "3:core security / auth / network"
+            return 0
+            ;;
+        lib32-*)
+            echo "3:multilib / 32-bit runtime"
+            return 0
+            ;;
+        *)
+            if [[ "$opt_for" != "None" && -n "$opt_for" ]]; then
+                echo "2:optional dependency"
+            elif [[ "$is_strict" == "1" || "$opt_for" == "None" ]]; then
+                echo "1:strict unreferenced"
+            else
+                echo "2:optional dependency"
+            fi
+            return 0
+            ;;
+    esac
+}
+
+# Helper: audit_orphan_cascade <targets_space_separated> <tx_space_separated>
+# Analyzes proposed pacman removal transaction for unselected cascaded dependencies.
+# Parameters:
+#   $1 - target packages selected by user (newline or space separated)
+#   $2 - full package list from pacman -Rs -p (newline or space separated)
+# Outputs to stdout:
+#   CASCADE_EXTRA|<pkg>|<tier>|<tag>|<optional_for>
+# Returns:
+#   0 - Clean (no cascade, or only Tier 1 unreferenced dependencies)
+#   1 - Tier 2 dependencies found in cascade (optional for other packages)
+#   2 - Tier 3 sensitive dependencies found in cascade (kernel, drivers, desktop, etc.)
+# [SRE-AUDIT: CERTIFIED | Sol v2.42 | PATCH-031 | Fixtures: test-suite.sh Part 11]
+audit_orphan_cascade() {
+    local raw_targets="${1:-}"
+    local raw_tx="${2:-}"
+    local pkg="" tier_info="" tier_num="" tier_tag="" opt_val="None"
+    local has_tier2=0 has_tier3=0
+    local -A target_map=()
+
+    for pkg in $raw_targets; do
+        [[ -n "$pkg" ]] && target_map["$pkg"]=1
+    done
+
+    for pkg in $raw_tx; do
+        [[ -z "$pkg" ]] && continue
+        if [[ -n "${target_map[$pkg]+present}" ]]; then
+            continue
+        fi
+
+        opt_val="None"
+        if command -v pacman >/dev/null 2>&1; then
+            local opt_line
+            opt_line="$(LC_ALL=C pacman -Qi "$pkg" 2>/dev/null | grep -E '^Optional For[[:space:]]*:' || true)"
+            if [[ "$opt_line" =~ ^Optional[[:space:]]For[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+                opt_val="${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        tier_info="$(classify_orphan_tier "$pkg" 0 "$opt_val")"
+        tier_num="${tier_info%%:*}"
+        tier_tag="${tier_info#*:}"
+
+        echo "CASCADE_EXTRA|${pkg}|${tier_num}|${tier_tag}|${opt_val}"
+
+        if [[ "$tier_num" == "3" ]]; then
+            has_tier3=1
+        elif [[ "$tier_num" == "2" ]]; then
+            has_tier2=1
+        fi
+    done
+
+    if (( has_tier3 )); then
+        return 2
+    elif (( has_tier2 )); then
+        return 1
+    fi
+    return 0
+}
+
+# [SRE-AUDIT: CERTIFIED | Sol v2.42 | PATCH-031 | Fixtures: test-suite.sh Part 11]
 triage_orphan_packages() {
     ui_screen "Orphan Package Triage & Safety Review"
 
@@ -1807,6 +1925,8 @@ triage_orphan_packages() {
     local cache_output="" choice="" selected="" manual_input="" response=""
     local current_pkg="" line="" target="" qrc=0
     local action="" auto_selection=0
+    local rem_strategy="target_only" rem_mode_flag="-R" rem_strategy_choice="" rem_strat_input=""
+    local cascade_tx_output="" cascade_audit_output="" cascade_rc=0
     local -a strict_orphans=() candidate_orphans=() current_orphans=()
     local -a current_strict_orphans=() tier1_strict=() tier2_optional=()
     local -a tier3_sensitive=() to_remove=() to_protect=() normalized=()
@@ -1916,32 +2036,19 @@ triage_orphan_packages() {
         fi
     done <"$metafile"
 
-    # Classify candidate packages into 3 tiers
+    # Classify candidate packages into 3 tiers using universal classifier
     for target in "${candidate_orphans[@]}"; do
-        case "$target" in
-            linux*|*-headers|grub*|systemd*|dracut*|mkinitcpio*|booster*|limine*|refind*|efibootmgr*)
-                pkg_tag["$target"]="kernel / bootloader"
-                tier3_sensitive+=("$target")
-                ;;
-            *firmware*|*-ucode|*-dkms|nvidia*|mesa*|vulkan*|xf86-video*)
-                pkg_tag["$target"]="driver / firmware / graphics"
-                tier3_sensitive+=("$target")
-                ;;
-            pipewire*|wireplumber*|alsa-*)
-                pkg_tag["$target"]="audio subsystem"
-                tier3_sensitive+=("$target")
-                ;;
-            base-devel|rust|cargo|go|gcc*|clang*|llvm*|make|cmake|patch|git|fakeroot|binutils)
-                pkg_tag["$target"]="development toolchain"
-                tier3_sensitive+=("$target")
-                ;;
-            *)
-                if [[ -n "${strict_set[$target]+present}" ]]; then
-                    tier1_strict+=("$target")
-                else
-                    tier2_optional+=("$target")
-                fi
-                ;;
+        local is_s=0
+        [[ -n "${strict_set[$target]+present}" ]] && is_s=1
+        local t_res="" t_num="" t_tag=""
+        t_res="$(classify_orphan_tier "$target" "$is_s" "${pkg_opt[$target]}")"
+        t_num="${t_res%%:*}"
+        t_tag="${t_res#*:}"
+        pkg_tag["$target"]="$t_tag"
+        case "$t_num" in
+            3) tier3_sensitive+=("$target") ;;
+            2) tier2_optional+=("$target") ;;
+            *) tier1_strict+=("$target") ;;
         esac
     done
 
@@ -1950,11 +2057,11 @@ triage_orphan_packages() {
     if command -v gum >/dev/null 2>&1; then
         gum style --foreground 82  "  ● 🟢 Tier 1 (Strict Unreferenced):  ${#tier1_strict[@]} package(s) - Neither required nor optionally used by installed apps"
         gum style --foreground 214 "  ● 🟡 Tier 2 (Optional for Apps):    ${#tier2_optional[@]} package(s) - Referenced ONLY as optional dependencies of existing apps"
-        gum style --foreground 196 "  ● 🔴 Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio or dev toolchains"
+        gum style --foreground 196 "  ● 🔴 Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio, desktop, crypto, dev toolchains"
     else
         echo "  ● [GREEN]  Tier 1 (Strict Unreferenced):  ${#tier1_strict[@]} package(s) - No installed reverse dependencies"
         echo "  ● [YELLOW] Tier 2 (Optional for Apps):    ${#tier2_optional[@]} package(s) - Reverse optional dependencies"
-        echo "  ● [RED]    Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio, dev tools"
+        echo "  ● [RED]    Tier 3 (Heuristically Sensitive): ${#tier3_sensitive[@]} package(s) - Kernel, boot, drivers, audio, desktop, crypto, dev tools"
     fi
     info "Note: Pacman models package dependencies only; it cannot detect external scripts, binaries, or manual builds."
     echo ""
@@ -2138,25 +2245,144 @@ triage_orphan_packages() {
         printf '  • %s\n' "${to_remove[@]}"
         echo ""
 
-        # Pre-transaction read-only preview via pacman -Rs --print
-        info "Calculating dependency transaction preview (pacman -Rs --print)..."
-        if ! pacman -Rs --print -- "${to_remove[@]}"; then
-            fail "Pacman could not prepare the removal preview (dependency conflict detected)."
-            rm -rf -- "$workdir"
-            return 1
+        # Removal Strategy Selection (Atomic Target-Only vs Recursive Cascade)
+        if command -v gum >/dev/null 2>&1; then
+            if ! rem_strategy_choice="$(
+                gum choose \
+                    --header="Select Removal Strategy:" \
+                    --cursor="› " \
+                    --cursor.foreground="81" \
+                    "1. Target-Only (pacman -R) [Recommended: Zero Cascade Blast-Radius]" \
+                    "2. Recursive Clean (pacman -Rs) [Removes unneeded dependencies with SRE Guard]" \
+                    "3. Cancel & Return"
+            )"; then
+                info "Orphan removal cancelled."
+                rm -rf -- "$workdir"
+                return 0
+            fi
+            case "$rem_strategy_choice" in
+                "1. Target-Only"*|"1")
+                    rem_strategy="target_only"
+                    rem_mode_flag="-R"
+                    ;;
+                "2. Recursive Clean"*|"2")
+                    rem_strategy="recursive"
+                    rem_mode_flag="-Rs"
+                    ;;
+                *)
+                    info "Orphan removal cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
+                    ;;
+            esac
+        else
+            echo "Select Removal Strategy:"
+            echo "1. Target-Only (pacman -R) [Recommended: Zero Cascade Blast-Radius]"
+            echo "2. Recursive Clean (pacman -Rs) [Removes unneeded dependencies with SRE Guard]"
+            echo "3. Cancel & Return"
+            if ! IFS= read -r -p "Select strategy [1-3, default 1]: " rem_strat_input; then
+                info "Input closed; orphan removal cancelled."
+                rm -rf -- "$workdir"
+                return 0
+            fi
+            case "$rem_strat_input" in
+                "2")
+                    rem_strategy="recursive"
+                    rem_mode_flag="-Rs"
+                    ;;
+                "3"|"q"|"Q")
+                    info "Orphan removal cancelled."
+                    rm -rf -- "$workdir"
+                    return 0
+                    ;;
+                *)
+                    rem_strategy="target_only"
+                    rem_mode_flag="-R"
+                    ;;
+            esac
         fi
-        echo ""
-        info "Note: pacman -Rs removes target packages and dependencies that become unneeded."
-        info "Modified configuration files will be preserved with .pacsave extension."
-        echo ""
+
+        if [[ "$rem_strategy" == "target_only" ]]; then
+            info "Validating Target-Only removal (pacman -R --print)..."
+            if ! pacman -R --print -- "${to_remove[@]}"; then
+                fail "Pacman could not prepare Target-Only removal (reverse dependency conflict detected)."
+                warn "Another installed package still requires one or more of your selected targets."
+                rm -rf -- "$workdir"
+                return 1
+            fi
+            echo ""
+            info "Target-Only mode: Exactly ${#to_remove[@]} package(s) will be removed; zero unselected dependencies touched."
+            info "Modified configuration files will be preserved with .pacsave extension."
+            echo ""
+        else
+            info "Running Pre-flight SRE Cascade Audit (pacman -Rs -p)..."
+            cascade_tx_output="$(LC_ALL=C pacman -Rs -p --print-format '%n' -- "${to_remove[@]}" 2>"$errfile")" || qrc=$?
+            if (( qrc != 0 )); then
+                fail "Pacman could not prepare recursive removal preview (dependency conflict detected)."
+                [[ -s "$errfile" ]] && sed 's/^/  /' "$errfile" >&2
+                rm -rf -- "$workdir"
+                return "$qrc"
+            fi
+
+            cascade_audit_output="$(audit_orphan_cascade "${to_remove[*]}" "$cascade_tx_output")"
+            cascade_rc=$?
+
+            if (( cascade_rc == 2 )); then
+                echo ""
+                warn "🚨 SRE CASCADE WARNING: Recursive removal would delete heuristically SENSITIVE system packages!"
+                while IFS= read -r cline; do
+                    [[ -z "$cline" ]] && continue
+                    IFS='|' read -r _cpfx cpkg ctier ctag copt <<< "$cline"
+                    if [[ "$ctier" == "3" ]]; then
+                        if command -v gum >/dev/null 2>&1; then
+                            gum style --foreground 196 "  ● 🔴 SENSITIVE CASCADE TARGET: $cpkg (Flagged as: $ctag)"
+                        else
+                            echo "  ● [RED] SENSITIVE CASCADE TARGET: $cpkg (Flagged as: $ctag)"
+                        fi
+                    fi
+                done <<< "$cascade_audit_output"
+                warn "Deleting these packages may impair system booting, audio, graphics, or system security."
+                echo ""
+            elif (( cascade_rc == 1 )); then
+                echo ""
+                info "⚠️ SRE CASCADE NOTICE: Recursive removal pulls in dependencies optionally used by other apps:"
+                while IFS= read -r cline; do
+                    [[ -z "$cline" ]] && continue
+                    IFS='|' read -r _cpfx cpkg ctier ctag copt <<< "$cline"
+                    if [[ "$ctier" == "2" ]]; then
+                        if command -v gum >/dev/null 2>&1; then
+                            gum style --foreground 214 "  ● 🟡 OPTIONAL CASCADE TARGET: $cpkg (Optional For: $copt)"
+                        else
+                            echo "  ● [YELLOW] OPTIONAL CASCADE TARGET: $cpkg (Optional For: $copt)"
+                        fi
+                    fi
+                done <<< "$cascade_audit_output"
+                echo ""
+            else
+                ok "Cascade Audit: Clean! No sensitive or optionally referenced packages detected in removal tree."
+                echo ""
+            fi
+
+            info "Calculating full dependency transaction preview (pacman -Rs --print)..."
+            pacman -Rs --print -- "${to_remove[@]}"
+            echo ""
+            info "Note: pacman -Rs removes target packages and unneeded dependencies."
+            info "Modified configuration files will be preserved with .pacsave extension."
+            echo ""
+        fi
 
         local confirm_removal=false
+        local prompt_msg="Are you sure you want to remove these packages via ${rem_mode_flag}?"
+        if (( cascade_rc == 2 )); then
+            prompt_msg="CRITICAL: Sensitive packages detected in cascade! Really proceed with ${rem_mode_flag}?"
+        fi
+
         if command -v gum >/dev/null 2>&1; then
-            if gum confirm "Are you sure you want to remove these packages?"; then
+            if gum confirm "$prompt_msg"; then
                 confirm_removal=true
             fi
         else
-            if IFS= read -r -p "Are you sure you want to remove these packages? [y/N] " response &&
+            if IFS= read -r -p "$prompt_msg [y/N] " response &&
                 [[ "$response" =~ ^[Yy]$ ]]; then
                 confirm_removal=true
             fi
@@ -2266,16 +2492,16 @@ triage_orphan_packages() {
 
     # Execute removal
     echo ""
-    info "Executing package removal: pacman -Rs ${to_remove[*]}"
-    rem_cmd=(pacman -Rs "${to_remove[@]}")
+    info "Executing package removal: pacman ${rem_mode_flag} ${to_remove[*]}"
+    rem_cmd=(pacman "$rem_mode_flag" "${to_remove[@]}")
     (( EUID != 0 )) && rem_cmd=(sudo "${rem_cmd[@]}")
     if ! "${rem_cmd[@]}"; then
         fail "Pacman package removal failed!"
         rm -rf -- "$workdir"
         return 1
     fi
-    ok "Selected candidate packages and unneeded dependencies successfully removed."
-    log "MAINTENANCE orphans_removed count=${#to_remove[@]} pkgs=${to_remove[*]}"
+    ok "Selected candidate packages successfully removed (${rem_mode_flag})."
+    log "MAINTENANCE orphans_removed count=${#to_remove[@]} mode=${rem_mode_flag} pkgs=${to_remove[*]}"
 
     # Optional Separately Confirmed Uninstalled Cache Purge
     if command -v paccache >/dev/null 2>&1; then
