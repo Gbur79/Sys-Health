@@ -1,7 +1,8 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.39](https://img.shields.io/badge/Version-2.39-orange.svg)](CHANGELOG.md)
+[![Version: 2.42](https://img.shields.io/badge/Version-2.42-orange.svg)](CHANGELOG.md)
+[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-49%2F49%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -33,7 +34,7 @@ A quick scan of community support forums reveals recurring pain points:
   1. `pacman -Qtd` flags all unrequired dependencies—including critical **optional dependencies** (`Optional For:`) that provide features in everyday applications (e.g., Dolphin losing video thumbnails, GIMP losing RAW plugins).
   2. It flags build toolchains (`rust`, `cargo`, `go`, `base-devel`, kernel headers) pulled during AUR compilations. Blindly removing them turns the next update into a 2-hour rebuild or breaks DKMS driver compilation.
   3. Purists overlook that `pacman -Rns` **does not purge downloaded package archives from the cache** (`/var/cache/pacman/pkg`)! The uninstalled software leaves dead `.pkg.tar.zst` files rotting on disk indefinitely.
-  `sys-health` eliminates this guesswork with an offline 3-tier safety classifier, solver-calculated cascade previews, safe `.pacsave` preservation (`pacman -Rs`), 1-click explicit dependency protection (`pacman -D --asexplicit`), and separately confirmed cache maintenance.
+  `sys-health` eliminates this guesswork with an offline 3-tier safety classifier (`classify_orphan_tier`), pre-flight SRE cascade inspection (`audit_orphan_cascade`), dual removal strategies (Target-Only `pacman -R` with zero cascade blast-radius vs. SRE-guarded `pacman -Rs`), safe `.pacsave` preservation, 1-click explicit dependency protection (`pacman -D --asexplicit`), and separately confirmed cache maintenance.
 * **The dead laptop mid-upgrade disaster:** A kernel update interrupted by a dying battery is one of the quickest ways to corrupt an initramfs or filesystem. `sys-health` probes hardware ACPI power supplies and refuses heavy upgrades on battery power when charge is critically low (< 25%).
 
 ---
@@ -146,14 +147,19 @@ Bridges the gap for software installed outside distribution repositories:
   * **Steam & Flatpak:** Differentiates self-managed game client runtimes and containerized apps.
 
 ### 6. Dynamic Orphan Triage & Package Safety Engine (`--orphans`, `-o`)
-Designed to demystify package maintenance and eliminate the operational hazards of blind orphan cleaning:
-* **3-Tier ALPM Safety Classification:** Interrogates local package metadata (`LC_ALL=C pacman -Qi`) in a single offline batch query (< 50ms):
-  * 🟢 **Tier 1 (Strict Leaf Orphans):** Truly unreferenced packages (`pacman -Qdtq` set difference, `Optional For: None`). Selectable for removal.
-  * 🟡 **Tier 2 (Optional-Only Dependencies):** Packages actively utilized as optional dependencies by installed software (`pacman -Qdttq` set difference). Surfaces exact reverse dependencies (e.g. `dolphin`, `vlc`, `gimp`) so you never lose desktop features unexpectedly. Excluded from default batch removal.
-  * 🔴 **Tier 3 (Heuristically Sensitive Packages):** Flags critical system components (kernel headers, firmware, GPU drivers, audio servers, fonts, build toolchains). Excluded from automatic removal and tagged with cautionary warnings.
-* **Cascading Impact Preview & Safe Deletion (`pacman -Rs`):** Uses non-destructive `-Rs` (preserving user configs with `.pacsave`) and previews exact solver removal cascades (`pacman -Rs --print`) before prompting for confirmation.
-* **Separately Confirmed Cache Maintenance:** Cleanly decouples pacman package uninstallation from archive cache purging, offering an optional, explicitly previewed `paccache --uninstalled --keep 0` clean.
+Designed to demystify package maintenance and eliminate the operational hazards of blind orphan cleaning (Fully SRE Certified in v2.42 / PATCH-031):
+* **3-Tier ALPM Safety Classification (`classify_orphan_tier`):** Interrogates local package metadata (`LC_ALL=C pacman -Qi`) in a single offline batch query (< 50ms):
+  * 🟢 **Tier 1 (Strict Leaf Orphans):** Truly unreferenced packages (`pacman -Qdtq` set difference, `Optional For: None`). Selectable for safe removal.
+  * 🟡 **Tier 2 (Optional-Only Dependencies):** Packages actively utilized as optional dependencies by installed software (`pacman -Qdttq` set difference). Surfaces exact reverse dependencies (e.g. `dolphin`, `vlc`, `xterm`) so you never lose desktop features unexpectedly. Excluded from default batch removal.
+  * 🔴 **Tier 3 (Heuristically Sensitive Packages):** Flags critical system components across the entire Arch ecosystem (kernels, bootloaders, firmware, GPU drivers, PipeWire/ALSA audio, Wayland/KWin/Hyprland compositors, SDDM/GDM display managers, Btrfs/LVM/cryptsetup tools, polkit/PAM security, compiler toolchains, and multilib `lib32-*` gaming runtimes). Excluded from automatic removal and protected with caution warnings.
+* **Pre-Flight SRE Cascade Audit (`audit_orphan_cascade`):** Interrogates transaction previews (`pacman -Rs -p --print-format '%n'`) to intercept unselected cascaded dependencies. Issues critical alerts if sensitive Tier 3 packages or reverse optional dependencies are pulled into the deletion tree.
+* **Dual Removal Strategy Selection:**
+  * **Target-Only (`pacman -R`) [Default / Recommended]:** Zero cascade blast radius — removes only explicitly chosen packages without touching any shared dependencies.
+  * **Recursive Clean (`pacman -Rs`):** Removes target packages and unneeded dependencies, fully safeguarded by the pre-flight SRE cascade auditor.
+  * *Note:* Modified configuration files are safely preserved with `.pacsave` extensions in both modes.
+* **Separately Confirmed Cache Maintenance:** Cleanly decouples pacman package uninstallation from archive cache purging, offering an optional, explicitly previewed `paccache --uninstalled --keep 0` clean across all configured `CacheDir` paths.
 * **1-Click Explicit Protection (`--asexplicit`):** Users frequently use unrequired tools directly (e.g., `git`, `htop`, `rust`). Rather than deleting and reinstalling, `sys-health` allows marking them as explicitly installed (`sudo pacman -D --asexplicit`), permanently resolving recurring orphan alerts.
+* **Non-Interactive Batch Contract:** Safe read-only reporting with zero ALPM mutations and clean `exit 0` execution when running without an interactive terminal (TTY) or via `--batch` mode.
 * **Pre-Flight Gate 2 Integration:** Non-intrusively notifies users during Guarded Upgrades if unrequired orphans are pending, preventing wasted download bandwidth and obsolete AUR rebuilds.
 
 ### 7. SRE Safe Maintenance & Deep Clean (`--maintenance`, `--deep-clean`)
@@ -272,7 +278,16 @@ SKIP_INTEGRITY=0
 ## Change Tracking & Roadmap
 
 * Detailed release history and version migration notes are maintained in [CHANGELOG.md](CHANGELOG.md).
+* Authoritative SRE subsystem certifications, vulnerability hit-lists, and testing matrices are tracked in [AUDIT_MATRIX.md](AUDIT_MATRIX.md).
 * Upcoming proposals, community backlog, and architectural discussions are tracked in [DEVELOPMENT_PROPOSALS.md](DEVELOPMENT_PROPOSALS.md) (also available as [pending-patches.md](pending-patches.md)).
+
+### Hermetic SRE Regression Suite (`dev-tools/test-suite.sh`)
+Every release, bugfix, and patch blueprint must pass the hermetic test suite before merge:
+```bash
+./dev-tools/test-suite.sh
+```
+* **100% Mocked Roots:** Executes in isolated sandboxes (`SYS_HEALTH_ROOT`) without host mutations.
+* **Coverage:** 49 deterministic assertions covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, and ALPM Orphan Cascade Protection.
 
 ---
 
