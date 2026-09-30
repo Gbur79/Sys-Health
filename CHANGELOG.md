@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.42] - 2026-09-30
+
+### Fixed & Hardened (SRE Architectural Audit - Orphan Package Triage Resiliency & Cascade Protection / PATCH-031)
+- **MOD-10 SRE Full Certification (`triage_orphan_packages`)**:
+  - Promoted Orphan Package Triage (Option 5) to `🟢 CERTIFIED [Sol]`, closing architectural weak point #2 in `AUDIT_MATRIX.md`.
+  - Replaced legacy unverified `pacman -Rs` cascade execution with an audited, dual-strategy removal architecture.
+- **Universal Multi-Tier Package Classifier (`classify_orphan_tier`)**:
+  - Implemented single-source-of-truth classification logic categorizing candidate dependencies across 3 deterministic tiers:
+    - **Tier 1 (Strict Unreferenced)**: Packages installed as dependencies without any direct or optional reverse references (`Optional For: None`).
+    - **Tier 2 (Optional for Apps)**: Packages referenced solely as `optdepends` by other installed applications.
+    - **Tier 3 (Heuristically Sensitive)**: Expanded whitelist protecting critical system infrastructure across the entire Arch ecosystem (kernels, bootloaders, GPU drivers/firmware, PipeWire/ALSA audio, compiler toolchains, Wayland/KWin/Hyprland compositors, SDDM/GDM display managers, Btrfs/LVM/cryptsetup filesystems, polkit/PAM security, and multilib `lib32-*` gaming runtimes).
+- **Pre-flight SRE Cascade Audit Engine (`audit_orphan_cascade`)**:
+  - Interrogates dry-run ALPM transaction output (`pacman -Rs -p --print-format '%n'`) to intercept unselected cascaded dependencies.
+  - Automatically flags cascaded packages matching Tier 3 with high-visibility warnings (`warn 🚨 SRE CASCADE WARNING`) and requires explicit affirmative user confirmation before proceeding.
+  - Transparently identifies Tier 2 reverse optional dependencies in the removal tree, displaying the exact parent applications affected.
+- **Dual Removal Strategy Selection (Atomic Target-Only vs Recursive Clean)**:
+  - Added interactive strategy prompt offering:
+    - **Target-Only (`pacman -R`) [Default / Recommended]**: Zero cascade blast radius — removes only explicitly chosen packages without touching any shared dependencies.
+    - **Recursive Clean (`pacman -Rs`)**: Cleans unneeded dependencies protected by pre-flight SRE cascade inspection.
+  - Enforces `pacman -R --print` transaction pre-checks in Target-Only mode to safely abort if a target has active reverse dependencies.
+  - Preserves modified configuration files with `.pacsave` extensions across both modes.
+- **Non-Interactive Batch Contract Hardening**:
+  - Guaranteed zero mutations and safe `exit 0` execution when running without an interactive terminal (TTY) or via `--batch` mode, providing safe read-only dependency triage telemetry.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh` / Part 11)**:
+  - Added Fixture 11.1: Multi-tier orphan classification logic across standard, optdepend, and 7 sensitive categories.
+  - Added Fixture 11.2: Sensitive cascade detection intercepting critical packages (rc=2).
+  - Added Fixture 11.3: Reverse optional dependency (`optdepends`) cascade detection (rc=1).
+  - Added Fixture 11.4: Non-interactive batch execution contract asserting zero ALPM mutations under closed stdin.
+  - Total hermetic regression test suite expanded from 45 to 49 tests (100% PASS).
+
+
 ## [2.41] - 2026-09-29
 
 ### Fixed & Hardened (SRE Architectural Audit - Bootloader Sync DAC Boundaries & systemd-boot Entry Matching / PATCH-030)
