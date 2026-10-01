@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.43] - 2026-10-01
+
+### Fixed & Hardened (SRE Architectural Audit - check_updates & AUR/Core Parity / PATCH-034)
+- **MOD-11 SRE Full Certification (`check_updates`)**:
+  - Promoted Package Update Audit to `🟢 CERTIFIED [Sol]`, closing architectural weak point #6 in `AUDIT_MATRIX.md`.
+  - Added hermetic regression coverage in `dev-tools/test-suite.sh` Part 12 (4 new fixtures, expanding total suite to 53/53 tests passing).
+- **Elimination of Silent False-PASS on Check Failure**:
+  - Hardened `check_updates()` to strictly honor `checkupdates` exit code semantics:
+    - Exit `0`: Updates pending (logged & formatted).
+    - Exit `2`: Normal execution, system completely up to date (`PASS ✔ (none)`).
+    - Exit `1` or other non-zero: Failure state (network offline, mirror unreachable, or locked DB). Emits `WARN ⚠ (check failed: network or mirror error)` instead of masking failure and falsely claiming `none`.
+- **Auto-Heal Stale Checkup-DB Lock**:
+  - Implemented automatic stale lock recovery: if `checkupdates` fails due to a locked temporary database (`/tmp/checkup-db-$UID/db.lck`) without an active `checkupdates` process, the lockfile is safely pruned and the check retries once.
+- **Cross-Module Core Package Detection Parity**:
+  - Defined single source of truth `SYS_HEALTH_CORE_PKG_REGEX` shared identically across `check_updates()` and `run_guarded_upgrade()`.
+  - Core system packages such as `wireplumber`, `pipewire`, bootloaders (`grub`, `systemd-boot`, `limine`, `refind`), kernels, `systemd`, `glibc`, and GPU drivers now deterministically trigger `WARN ⚠ (core components included)` in Audit & Diagnostics as they do in Guarded System Upgrade.
+- **AUR Update Visibility in Audit & Diagnostics**:
+  - Integrated fast, non-blocking check (`timeout 3`) for pending AUR packages via active helper (`yay`, `paru`, `pikaur`).
+  - Formats update status dynamically (e.g. `INFO ℹ (1 repo + 1 AUR)` or `INFO ℹ (1 AUR)`), eliminating visual discrepancies between Audit & Diagnostics and Guarded System Upgrade.
+- **Audit Table Reconstruction & AI Context Telemetry**:
+  - Synchronized `reconstruct_tables_from_log()` to handle `repo=X aur=Y` and `checkupdates_failed` telemetry without truncation.
+  - Added dedicated remediation code `PKG_CHECKUPDATES_FAILED` in the AI Agent Context generator.
+
 ## [2.42] - 2026-09-30
 
 ### Fixed & Hardened (SRE Architectural Audit - Orphan Package Triage Resiliency & Cascade Protection / PATCH-031)
