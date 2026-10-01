@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.42
+# Arch System Health & Diagnostics v2.43
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.42"
+VERSION="2.43"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -16,6 +16,11 @@ STATE_SNAPSHOT="$STATE_DIR/software-state.txt"
 RAW_DIR="$STATE_DIR/runs"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
+
+# SRE Standard: Unified core system packages subject to elevated upgrade precautions
+if [[ -z "${SYS_HEALTH_CORE_PKG_REGEX:-}" ]]; then
+    readonly SYS_HEALTH_CORE_PKG_REGEX='^(linux([-_].*)?|systemd([-_].*)?|glibc|dracut([-_].*)?|mkinitcpio([-_].*)?|booster([-_].*)?|grub([-_].*)?|systemd-boot|limine([-_].*)?|refind([-_].*)?|nvidia([-_].*)?|amdgpu([-_].*)?|mesa([-_].*)?|vulkan([-_].*)?|wayland([-_].*)?|xorg([-_].*)?|pipewire([-_].*)?|wireplumber([-_].*)?|dkms([-_].*)?)'
+fi
 
 # ------------------------------------------------------------------------------
 # User configuration (optional)
@@ -6345,50 +6350,140 @@ check_dns() {
     fi
 }
 
+# Dynamic AUR helper detection (paru -> yay -> pikaur)
+detect_aur_helper() {
+    if type -P paru &>/dev/null; then
+        echo "paru"
+    elif type -P yay &>/dev/null; then
+        echo "yay"
+    elif type -P pikaur &>/dev/null; then
+        echo "pikaur"
+    else
+        echo ""
+    fi
+}
+
+# [SRE-AUDIT: CERTIFIED | Sol v2.43 | PATCH-034 | Fixtures: test-suite.sh Part 12]
 check_updates() {
-    if ! command -v checkupdates &>/dev/null; then
-        add_row "Available updates" "INFO ℹ (pacman-contrib not installed)"
-        ((INFO_COUNT++))
+    local raw_dir="${RUN_RAW:-/tmp}"
+    local update_file="$raw_dir/checkupdates.txt"
+    local aur_file="$raw_dir/checkupdates-aur.txt"
+    local chk_err="$raw_dir/checkupdates.err"
+    local rc=0 repo_count=0 aur_count=0
+    local aur_helper="" used_checkupdates=false
+
+    aur_helper="$(detect_aur_helper)"
+
+    if command -v checkupdates &>/dev/null; then
+        used_checkupdates=true
+        spinner "Checking for available updates..." \
+            bash -c 'timeout 25 checkupdates > "$1" 2>"$2"' _ "$update_file" "$chk_err" || rc=$?
+
+        # Stale lockfile recovery attempt: if failed with lock, clear stale checkup-db lock and retry once
+        if (( rc == 1 )) && grep -qi "database is locked" "$chk_err" 2>/dev/null; then
+            local chk_db="${CHECKUPDATES_DB:-${TMPDIR:-/tmp}/checkup-db-${UID}}"
+            if [[ -f "$chk_db/db.lck" ]] && ! pgrep -x checkupdates &>/dev/null; then
+                rm -f "$chk_db/db.lck" 2>/dev/null || true
+                timeout 25 checkupdates > "$update_file" 2>"$chk_err" || rc=$?
+            fi
+        fi
+
+        # checkupdates semantics: 0 = updates pending, 2 = up to date, 1/other = failure
+        if (( rc != 0 && rc != 2 )); then
+            add_row "Available updates" "WARN ⚠ (check failed: network or mirror error)" "NET"
+            ((WARNINGS++)) || true
+            log "HEALTH updates=WARN checkupdates_failed rc=$rc"
+            return
+        fi
+
+        if (( rc == 0 )); then
+            local repo_raw
+            repo_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$update_file" 2>/dev/null || true)"
+            [[ -n "$repo_raw" ]] && repo_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$repo_raw")"
+        fi
+    elif command -v pacman &>/dev/null; then
+        # Fallback to pacman -Qu if pacman-contrib is missing
+        pacman -Qu > "$update_file" 2>/dev/null || rc=$?
+        # pacman -Qu semantics: 0 = updates pending, 1 = up to date, other = failure
+        if (( rc != 0 && rc != 1 )); then
+            add_row "Available updates" "WARN ⚠ (pacman -Qu failed)" "NET"
+            ((WARNINGS++)) || true
+            log "HEALTH updates=WARN pacman_qu_failed rc=$rc"
+            return
+        fi
+
+        if (( rc == 0 )); then
+            local repo_raw
+            repo_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$update_file" 2>/dev/null || true)"
+            [[ -n "$repo_raw" ]] && repo_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$repo_raw")"
+        fi
+    else
+        add_row "Available updates" "INFO ℹ (check tool unavailable)" "NET"
+        ((INFO_COUNT++)) || true
         log "HEALTH updates=missing_pacman-contrib"
         return
     fi
 
-    local update_file="$RUN_RAW/checkupdates.txt"
+    # Non-blocking probe for AUR updates (3s timeout)
+    if [[ -n "$aur_helper" ]]; then
+        timeout 3 "$aur_helper" -Qua > "$aur_file" 2>/dev/null || true
+        local aur_raw
+        aur_raw="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$aur_file" 2>/dev/null || true)"
+        if [[ -n "$aur_raw" ]]; then
+            aur_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$aur_raw")"
+        fi
+    fi
 
-    spinner "Checking for available updates..." \
-        bash -c 'checkupdates > "$1" 2>/dev/null || true' _ "$update_file"
-
-    UPDATES_TEXT="$(cat "$update_file" 2>/dev/null || true)"
+    local repo_content aur_content
+    repo_content="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$update_file" 2>/dev/null || true)"
+    aur_content="$(grep -E '^[a-zA-Z0-9@._+-]+ [0-9]' "$aur_file" 2>/dev/null || true)"
+    UPDATES_TEXT="$repo_content"
 
     {
         echo "### AVAILABLE UPDATES"
-        if [[ -n "$UPDATES_TEXT" ]]; then
-            printf '%s\n' "$UPDATES_TEXT"
+        if (( repo_count > 0 )); then
+            printf '%s\n' "$repo_content"
         else
-            echo "No updates reported by checkupdates."
+            echo "No repository updates reported."
+        fi
+        if (( aur_count > 0 )); then
+            echo ""
+            echo "### AVAILABLE AUR UPDATES ($aur_helper)"
+            printf '%s\n' "$aur_content"
         fi
     } >> "$LOG_FILE"
 
-    local count
-    count="$(printf '%s\n' "$UPDATES_TEXT" | sed '/^$/d' | wc -l)"
+    local total_count=$(( repo_count + aur_count ))
 
-    if (( count == 0 )); then
-        add_row "Available updates" "PASS ✔ (none)"
+    if (( total_count == 0 )); then
+        add_row "Available updates" "PASS ✔ (none)" "NET"
         log "HEALTH updates=0"
-    else
-        local sensitive
-        sensitive="$(printf '%s\n' "$UPDATES_TEXT" |
-            grep -iE '^(linux|nvidia|amdgpu|mesa|dkms|systemd|glibc|dracut|xorg)' || true)"
+        return
+    fi
 
-        if [[ -n "$sensitive" ]]; then
-            add_row "Available updates" "WARN ⚠ ($count; core components included)"
-            ((WARNINGS++))
-            log "HEALTH updates=WARN count=$count sensitive_core_updates=YES"
-        else
-            add_row "Available updates" "INFO ℹ ($count)"
-            ((INFO_COUNT++))
-            log "HEALTH updates=$count sensitive_core_updates=NO"
-        fi
+    local sensitive=""
+    sensitive="$(grep -iE "$SYS_HEALTH_CORE_PKG_REGEX" <<< "$repo_content" || true)"
+    if [[ -z "$sensitive" && -n "$aur_content" ]]; then
+        sensitive="$(grep -iE "$SYS_HEALTH_CORE_PKG_REGEX" <<< "$aur_content" || true)"
+    fi
+
+    local badge_details=""
+    if (( repo_count > 0 && aur_count > 0 )); then
+        badge_details="${repo_count} repo + ${aur_count} AUR"
+    elif (( aur_count > 0 )); then
+        badge_details="${aur_count} AUR"
+    else
+        badge_details="${repo_count}"
+    fi
+
+    if [[ -n "$sensitive" ]]; then
+        add_row "Available updates" "WARN ⚠ ($badge_details; core components included)" "NET"
+        ((WARNINGS++)) || true
+        log "HEALTH updates=WARN count=$total_count repo=$repo_count aur=$aur_count sensitive_core_updates=YES"
+    else
+        add_row "Available updates" "INFO ℹ ($badge_details)" "NET"
+        ((INFO_COUNT++)) || true
+        log "HEALTH updates=$total_count repo=$repo_count aur=$aur_count sensitive_core_updates=NO"
     fi
 }
 
@@ -7290,10 +7385,17 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 updates)
-                    code="PKG_CORE_UPDATES_PENDING"
-                    summary="Core updates pending (kernel/display/systemd)"
-                    fix="Run Guarded Upgrade (Pre-Flight -> Update -> Post-Audit)"
-                    risk="MEDIUM"
+                    if [[ "$rest" =~ checkupdates_failed ]]; then
+                        code="PKG_CHECKUPDATES_FAILED"
+                        summary="Update check failed due to network timeout or locked temporary database"
+                        fix="Check network connectivity or remove stale /tmp/checkup-db-$UID/db.lck"
+                        risk="MEDIUM"
+                    else
+                        code="PKG_CORE_UPDATES_PENDING"
+                        summary="Core updates pending (kernel/display/systemd)"
+                        fix="Run Guarded Upgrade (Pre-Flight -> Update -> Post-Audit)"
+                        risk="MEDIUM"
+                    fi
                     ;;
                 mirrorlist_age)
                     code="PKG_MIRRORLIST_STALE"
@@ -7890,8 +7992,40 @@ reconstruct_tables_from_log() {
             updates)
                 if [[ "$val" == "0" ]]; then
                     AUDIT_TABLE_NET+="Available updates | PASS ✔ (none)\n"
+                elif [[ "$val" == "WARN" ]]; then
+                    if [[ "$details" =~ checkupdates_failed ]]; then
+                        AUDIT_TABLE_NET+="Available updates | WARN ⚠ (check failed: network or mirror error)\n"
+                    elif [[ "$details" =~ sensitive_core_updates=YES ]]; then
+                        local c_txt=""
+                        if [[ "$details" =~ repo=([0-9]+)\ aur=([0-9]+) ]]; then
+                            local r_cnt="${BASH_REMATCH[1]}" a_cnt="${BASH_REMATCH[2]}"
+                            if (( r_cnt > 0 && a_cnt > 0 )); then
+                                c_txt="${r_cnt} repo + ${a_cnt} AUR"
+                            elif (( a_cnt > 0 )); then
+                                c_txt="${a_cnt} AUR"
+                            else
+                                c_txt="${r_cnt}"
+                            fi
+                        elif [[ "$details" =~ count=([0-9]+) ]]; then
+                            c_txt="${BASH_REMATCH[1]}"
+                        fi
+                        AUDIT_TABLE_NET+="Available updates | WARN ⚠ (${c_txt:-pending}; core components included)\n"
+                    else
+                        AUDIT_TABLE_NET+="$(_format_audit_row "Available updates" "$val" "$details")\n"
+                    fi
+                elif [[ "$val" == "missing_pacman-contrib" ]]; then
+                    AUDIT_TABLE_NET+="Available updates | INFO ℹ (check tool unavailable)\n"
                 else
-                    AUDIT_TABLE_NET+="Available updates | UPDATE ⚠ ($val pending)\n"
+                    local c_txt="$val"
+                    if [[ "$details" =~ repo=([0-9]+)\ aur=([0-9]+) ]]; then
+                        local r_cnt="${BASH_REMATCH[1]}" a_cnt="${BASH_REMATCH[2]}"
+                        if (( r_cnt > 0 && a_cnt > 0 )); then
+                            c_txt="${r_cnt} repo + ${a_cnt} AUR"
+                        elif (( a_cnt > 0 )); then
+                            c_txt="${a_cnt} AUR"
+                        fi
+                    fi
+                    AUDIT_TABLE_NET+="Available updates | INFO ℹ ($c_txt)\n"
                 fi
                 ;;
             mirrorlist_age)
@@ -10399,7 +10533,7 @@ run_guarded_upgrade() {
     fi
 
     # Categorize and format package manifest
-    local core_regex='^(linux([-_].*)?|systemd([-_].*)?|glibc|dracut([-_].*)?|mkinitcpio([-_].*)?|booster([-_].*)?|grub([-_].*)?|systemd-boot|limine([-_].*)?|refind([-_].*)?|nvidia([-_].*)?|mesa([-_].*)?|vulkan([-_].*)?|wayland([-_].*)?|xorg([-_].*)?|pipewire([-_].*)?|wireplumber([-_].*)?)'
+    local core_regex="${SYS_HEALTH_CORE_PKG_REGEX}"
     local -a core_detected=()
     local repo_table="" aur_table=""
     local max_display=25
