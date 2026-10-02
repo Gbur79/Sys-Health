@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.44] - 2026-10-02
+
+### Fixed & Hardened (SRE Architectural Audit - Gaming & Proton Universality / PATCH-032)
+- **MOD-12 SRE Full Certification (`check_gaming` & `detect_gaming_system`)**:
+  - Promoted Gaming & Steam Readiness Suite to `🟢 CERTIFIED [Sol]`, closing architectural weak point #3 in `AUDIT_MATRIX.md`.
+  - Added hermetic regression coverage in `dev-tools/test-suite.sh` Part 13 (5 new fixtures, expanding total suite to 58/58 tests passing).
+- **Universal Multi-GPU & Hybrid Driver 32-bit Architecture**:
+  - Replaced rigid single-driver `if ... elif` logic with dynamic PCI and sysfs driver iteration.
+  - Implemented full support for AMD Radeon (RADV/AMDVLK), Intel Arc/Xe (ANV), open-source NVIDIA (NVK/Nouveau), and proprietary NVIDIA.
+  - Correctly validates 32-bit stacks on hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) and identifies exact missing packages (`lib32-vulkan-radeon`, `lib32-vulkan-intel`, `lib32-nvidia-utils`, `lib32-vulkan-nouveau`).
+- **Physical Testbed Preservation & Universal VRAM Telemetry**:
+  - Preserved Karol's physical Maxwell GTX 970 hardware segment quirk (3.5 GB fast allocation threshold) with zero regressions.
+  - Added universal GPU VRAM telemetry for modern NVIDIA GPUs via `nvidia-smi` and AMD Radeon GPUs via DRM sysfs (`mem_info_vram_used`).
+- **Hermetic Mock-Root Support (`SYS_HEALTH_ROOT`)**:
+  - Abstracted all filesystem checks (`/proc/sys/vm/max_map_count`, `/proc/sys/kernel/split_lock_mitigate`, `/etc/pacman.conf`, `/usr/lib32/`, `/usr/share/vulkan/icd.d/`) to respect `${SYS_HEALTH_ROOT:-}`.
+- **Flatpak, Heroic, Lutris & AUR Runner Discovery**:
+  - Expanded compatibility tool discovery to include Flatpak Steam (`~/.var/app/com.valvesoftware.Steam`), Flatpak Heroic, Lutris wine runners, and system-wide AUR runners in `/usr/share/steam/compatibilitytools.d`.
+  - Hardened `detect_gaming_system()` to recognize Flatpak applications and ALPM packages in a single optimized pass.
+- **Audit Table Reconstruction & AI Context Telemetry**:
+  - Added `gpu_vram` reconstruction to `reconstruct_tables_from_log()` and actionable remediation codes `GAME_GTX970_VRAM_HIGH` and `GAME_GPU_VRAM_HIGH` to AI Agent Context generator.
+
 ## [2.43] - 2026-10-01
 
 ### Fixed & Hardened (SRE Architectural Audit - check_updates & AUR/Core Parity / PATCH-034)
