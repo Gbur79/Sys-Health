@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implemented full support for AMD Radeon (RADV/AMDVLK), Intel Arc/Xe (ANV), open-source NVIDIA (NVK/Nouveau), and proprietary NVIDIA.
   - Correctly validates 32-bit stacks on hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) and identifies exact missing packages (`lib32-vulkan-radeon`, `lib32-vulkan-intel`, `lib32-nvidia-utils`, `lib32-vulkan-nouveau`).
 - **Physical Testbed Preservation & Universal VRAM Telemetry**:
-  - Preserved Karol's physical Maxwell GTX 970 hardware segment quirk (3.5 GB fast allocation threshold) with zero regressions.
+  - Preserved physical Maxwell GTX 970 hardware segment quirk (3.5 GB fast allocation threshold) with zero regressions.
   - Added universal GPU VRAM telemetry for modern NVIDIA GPUs via `nvidia-smi` and AMD Radeon GPUs via DRM sysfs (`mem_info_vram_used`).
 - **Hermetic Mock-Root Support (`SYS_HEALTH_ROOT`)**:
   - Abstracted all filesystem checks (`/proc/sys/vm/max_map_count`, `/proc/sys/kernel/split_lock_mitigate`, `/etc/pacman.conf`, `/usr/lib32/`, `/usr/share/vulkan/icd.d/`) to respect `${SYS_HEALTH_ROOT:-}`.
