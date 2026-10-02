@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.43
+# Arch System Health & Diagnostics v2.44
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.43"
+VERSION="2.44"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -6788,38 +6788,49 @@ check_arch_audit() {
 # Gaming & Steam readiness
 # ------------------------------------------------------------------------------
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.44 | PATCH-032 | Fixtures: test-suite.sh Part 13]
 detect_gaming_system() {
-    local user_home="${HOME}"
+    local target_home="${HOME}"
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
-        user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
+        target_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
     fi
+    local root="${SYS_HEALTH_ROOT:-}"
 
-    # Check for gaming client binaries
+    # 1. Check for gaming client binaries
     if command -v steam &>/dev/null || command -v wine &>/dev/null || command -v lutris &>/dev/null || \
-       command -v heroic &>/dev/null || command -v bottles &>/dev/null; then
+       command -v heroic &>/dev/null || command -v bottles &>/dev/null || command -v gamescope &>/dev/null; then
         return 0
     fi
 
-    # Check for gaming data directories in user home
-    if [[ -d "$user_home/.local/share/Steam" || -d "$user_home/.steam" || -d "$user_home/.wine" || \
-          -d "$user_home/.local/share/lutris" || -d "$user_home/.config/heroic" || \
-          -d "$user_home/.var/app/com.usebottles.bottles" || -d "$user_home/.var/app/com.valvesoftware.Steam" ]]; then
+    # 2. Check for Flatpak gaming applications
+    if command -v flatpak &>/dev/null; then
+        if flatpak list --app 2>/dev/null | grep -qE 'com\.valvesoftware\.Steam|com\.heroicgameslauncher\.hgl|net\.lutris\.Lutris|com\.usebottles\.bottles'; then
+            return 0
+        fi
+    fi
+
+    # 3. Check for gaming data directories in user home (Native & Flatpak)
+    if [[ -d "$target_home/.local/share/Steam" || -d "$target_home/.steam" || -d "$target_home/.wine" || \
+          -d "$target_home/.local/share/lutris" || -d "$target_home/.config/heroic" || \
+          -d "$target_home/.var/app/com.valvesoftware.Steam" || \
+          -d "$target_home/.var/app/com.heroicgameslauncher.hgl" || \
+          -d "$target_home/.var/app/net.lutris.Lutris" || \
+          -d "$target_home/.var/app/com.usebottles.bottles" ]]; then
         return 0
     fi
 
-    # Check for gaming helper packages or 32-bit graphics
-    if pacman -Q protonup-qt &>/dev/null 2>&1 || pacman -Q gamemode &>/dev/null 2>&1 || \
-       pacman -Q mangohud &>/dev/null 2>&1 || pacman -Q gamescope &>/dev/null 2>&1 || \
-       pacman -Q lib32-vulkan-icd-loader &>/dev/null 2>&1 || pacman -Q wine &>/dev/null 2>&1; then
+    # 4. Check for gaming helper packages or 32-bit graphics stack via ALPM
+    if pacman -Qq 2>/dev/null | grep -qE '^(steam|lutris|heroic-games-launcher-bin|bottles|wine|wine-staging|protonup-qt|gamemode|mangohud|gamescope|lib32-vulkan-icd-loader)$'; then
         return 0
     fi
 
     return 1
 }
 
-# [SRE-AUDIT: LEGACY / UNVERIFIED | Luna v2.25 | Blast-Radius: LOW | Fixtures: NONE]
+# [SRE-AUDIT: CERTIFIED | Sol v2.44 | PATCH-032 | Fixtures: test-suite.sh Part 13]
 check_gaming() {
     local on_demand="${1:-0}"
+    local root="${SYS_HEALTH_ROOT:-}"
     log "--- [GAMING] Checking Steam, Vulkan 32-bit & Gaming Readiness ---"
 
     local is_gamer=false
@@ -6836,9 +6847,21 @@ check_gaming() {
         return 0
     fi
 
-    # 1. Multilib repository in /etc/pacman.conf
+    # 1. Multilib repository in pacman configuration
     GAMING_MULTILIB=false
-    if grep -q -E '^\s*\[multilib\]' /etc/pacman.conf 2>/dev/null; then
+    local multilib_enabled=false
+    if command -v pacman-conf &>/dev/null && [[ -z "$root" ]]; then
+        if pacman-conf -l 2>/dev/null | grep -qx "multilib"; then
+            multilib_enabled=true
+        fi
+    fi
+    if ! $multilib_enabled; then
+        if grep -q -E '^\s*\[multilib\]' "${root}/etc/pacman.conf" 2>/dev/null; then
+            multilib_enabled=true
+        fi
+    fi
+
+    if $multilib_enabled; then
         GAMING_MULTILIB=true
         add_row "Multilib repository" "PASS ✔ (Enabled in /etc/pacman.conf)" "GAME"
         log "HEALTH multilib=PASS"
@@ -6851,102 +6874,146 @@ check_gaming() {
         log "HEALTH multilib=INFO multilib_disabled"
     fi
 
-    # 2. Vulkan & 32-bit driver stack
-    local vga_info drivers="" driver_list="" gpu_name=""
-    driver_list="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
-    vga_info="$(lspci -k 2>/dev/null | grep -A 4 -iE 'VGA|3D|Display' || true)"
+    # 2. Universal GPU Driver & Vulkan 64/32-bit Discovery
+    local lspci_out vga_info gpu_name=""
+    lspci_out="$(lspci -k 2>/dev/null || true)"
+    vga_info="$(printf '%s\n' "$lspci_out" | grep -A 4 -iE 'VGA|3D|Display' || true)"
 
-    local vulkan_64_ok=false vulkan_32_loader=false vulkan_32_driver=false
-    if command -v vulkaninfo &>/dev/null; then
+    local -a active_drivers=()
+    while IFS= read -r drv; do
+        [[ -n "$drv" ]] && active_drivers+=("$drv")
+    done < <(printf '%s\n' "$lspci_out" | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u || true)
+
+    # Sysfs fallback if lspci is missing or stripped
+    if (( ${#active_drivers[@]} == 0 )); then
+        for d_path in "${root}/sys/bus/pci/drivers/"{nvidia,amdgpu,radeon,i915,xe,nouveau}; do
+            if [[ -d "$d_path" ]]; then
+                active_drivers+=("$(basename "$d_path")")
+            fi
+        done
+    fi
+
+    # Vulkan 64-bit validation
+    local vulkan_64_ok=false
+    if [[ -z "$root" ]] && command -v vulkaninfo &>/dev/null; then
         local v_dev
-        v_dev="$(vulkaninfo --summary 2>/dev/null | grep 'deviceName' | head -n1 | awk -F'=' '{print $2}' | sed 's/^[ 	]*//' || true)"
+        v_dev="$(vulkaninfo --summary 2>/dev/null | grep 'deviceName' | head -n1 | awk -F'=' '{print $2}' | sed 's/^[ \t]*//' || true)"
         [[ -n "$v_dev" ]] && gpu_name="$v_dev"
         [[ -n "$gpu_name" ]] && vulkan_64_ok=true
-    elif [[ -f /usr/share/vulkan/icd.d/nvidia_icd.json || -f /usr/share/vulkan/icd.d/radeon_icd.json || -f /usr/share/vulkan/icd.d/intel_icd.json ]]; then
-        vulkan_64_ok=true
     fi
+    if ! $vulkan_64_ok; then
+        # Inspect standard ICD manifests (supporting .json and .x86_64.json)
+        if compgen -G "${root}/usr/share/vulkan/icd.d/*.json" >/dev/null 2>&1 || \
+           compgen -G "${root}/etc/vulkan/icd.d/*.json" >/dev/null 2>&1; then
+            vulkan_64_ok=true
+        fi
+    fi
+
     if [[ -z "$gpu_name" && -n "$vga_info" ]]; then
         local raw_g
         raw_g="$(printf '%s\n' "$vga_info" | grep -iE 'VGA|3D|Display' | head -n1 || true)"
-        if [[ "$raw_g" =~ \[([^\]]+)\] ]]; then
+        if [[ "$raw_g" =~ \[([^\]]*(GeForce|Radeon|Arc|Graphics|Iris|GTX|RTX)[^\]]*)\] ]]; then
+            gpu_name="${BASH_REMATCH[1]}"
+        elif [[ "$raw_g" =~ \[([^\]]+)\] ]]; then
             gpu_name="${BASH_REMATCH[1]}"
         else
             gpu_name="$(echo "$raw_g" | sed -E 's/^[^:]+: //; s/ \(rev [0-9a-f]+\)$//')"
         fi
     fi
 
-    [[ -f /usr/lib32/libvulkan.so.1 ]] && vulkan_32_loader=true
-
     local short_gpu=""
     if [[ -n "$gpu_name" ]]; then
         short_gpu="$(echo "$gpu_name" | sed -E 's/NVIDIA (GeForce )?//g; s/AMD (Radeon )?//g; s/Intel (R)?//g')"
     fi
 
-    # Driver-specific 32-bit checks
-    GAMING_VULKAN_32BIT=false
-    if [[ "$driver_list" == *"nvidia"* ]]; then
-        if [[ -f /usr/lib32/libGLX_nvidia.so.0 || -f /usr/lib32/libnvidia-glcore.so ]]; then
-            vulkan_32_driver=true
-        fi
+    # 32-bit loader check
+    local vulkan_32_loader=false
+    if [[ -f "${root}/usr/lib32/libvulkan.so.1" || -f "${root}/usr/lib32/libvulkan.so" ]]; then
+        vulkan_32_loader=true
+    fi
 
-        if $vulkan_64_ok && $vulkan_32_loader && $vulkan_32_driver; then
+    # Multi-GPU / Driver-specific 32-bit checks
+    GAMING_VULKAN_32BIT=false
+    local -a missing_32bit_pkgs=()
+    local -a verified_32bit_stacks=()
+    local has_known_gpu=false
+
+    for drv in "${active_drivers[@]}"; do
+        case "$drv" in
+            nvidia)
+                has_known_gpu=true
+                if [[ -f "${root}/usr/lib32/libGLX_nvidia.so.0" || -f "${root}/usr/lib32/libnvidia-glcore.so" ]]; then
+                    verified_32bit_stacks+=("NVIDIA")
+                else
+                    missing_32bit_pkgs+=("lib32-nvidia-utils")
+                fi
+                ;;
+            nouveau)
+                has_known_gpu=true
+                if [[ -f "${root}/usr/lib32/libvulkan_nouveau.so" ]]; then
+                    verified_32bit_stacks+=("NVK/Nouveau")
+                else
+                    missing_32bit_pkgs+=("lib32-vulkan-nouveau")
+                fi
+                ;;
+            amdgpu|radeon)
+                has_known_gpu=true
+                if [[ -f "${root}/usr/lib32/libvulkan_radeon.so" || -f "${root}/usr/lib32/amdvlk32.so" ]]; then
+                    verified_32bit_stacks+=("AMD RADV")
+                else
+                    missing_32bit_pkgs+=("lib32-vulkan-radeon")
+                fi
+                ;;
+            i915|xe)
+                has_known_gpu=true
+                if [[ -f "${root}/usr/lib32/libvulkan_intel.so" || -f "${root}/usr/lib32/libvulkan_intel_hasvk.so" ]]; then
+                    verified_32bit_stacks+=("Intel ANV")
+                else
+                    missing_32bit_pkgs+=("lib32-vulkan-intel")
+                fi
+                ;;
+        esac
+    done
+
+    if ! $vulkan_32_loader; then
+        missing_32bit_pkgs+=("lib32-vulkan-icd-loader")
+    fi
+
+    # Deduplicate missing packages
+    local -a unique_missing=()
+    if (( ${#missing_32bit_pkgs[@]} > 0 )); then
+        mapfile -t unique_missing < <(printf '%s\n' "${missing_32bit_pkgs[@]}" | sort -u)
+    fi
+
+    if $has_known_gpu; then
+        if $vulkan_64_ok && $vulkan_32_loader && (( ${#unique_missing[@]} == 0 )); then
             GAMING_VULKAN_32BIT=true
-            add_row "Vulkan & 32-bit graphics" "PASS ✔ (${short_gpu:-NVIDIA} | 64+32-bit Vulkan OK)" "GAME"
-            log "HEALTH vulkan_32bit=PASS driver=nvidia"
+            local stack_desc
+            stack_desc="$(printf '%s, ' "${verified_32bit_stacks[@]}")"
+            stack_desc="${stack_desc%, }"
+            add_row "Vulkan & 32-bit graphics" "PASS ✔ (${short_gpu:-GPU} | 64+32-bit ${stack_desc:-Vulkan} OK)" "GAME"
+            log "HEALTH vulkan_32bit=PASS drivers='${active_drivers[*]}'"
         elif ! $is_gamer; then
-            add_row "Vulkan & 32-bit graphics" "INFO ℹ (${short_gpu:-NVIDIA} 64-bit | 32-bit multilib not installed)" "GAME"
-            log "HEALTH vulkan_32bit=INFO pure_64bit"
-        elif ! $vulkan_32_loader || ! $vulkan_32_driver; then
-            local missing_parts=""
-            ! $vulkan_32_loader && missing_parts+="lib32-vulkan-icd-loader "
-            ! $vulkan_32_driver && missing_parts+="lib32-nvidia-utils "
-            add_row "Vulkan & 32-bit graphics" "WARN ⚠ (Missing 32-bit stack: ${missing_parts% })" "GAME"
-            ((WARNINGS++))
-            log "HEALTH vulkan_32bit=WARN missing=${missing_parts% }"
-        else
-            add_row "Vulkan & 32-bit graphics" "WARN ⚠ (Vulkan ICD not fully reported)" "GAME"
-            ((WARNINGS++))
-            log "HEALTH vulkan_32bit=WARN"
-        fi
-    elif [[ "$driver_list" == *"amdgpu"* || "$driver_list" == *"radeon"* ]]; then
-        [[ -f /usr/lib32/libvulkan_radeon.so ]] && vulkan_32_driver=true
-        if $vulkan_64_ok && $vulkan_32_loader && $vulkan_32_driver; then
-            GAMING_VULKAN_32BIT=true
-            add_row "Vulkan & 32-bit graphics" "PASS ✔ (${short_gpu:-AMD} | 64+32-bit RADV OK)" "GAME"
-            log "HEALTH vulkan_32bit=PASS driver=amdgpu"
-        elif ! $is_gamer; then
-            add_row "Vulkan & 32-bit graphics" "INFO ℹ (${short_gpu:-AMD} 64-bit | 32-bit multilib not installed)" "GAME"
-            log "HEALTH vulkan_32bit=INFO pure_64bit"
-        elif ! $vulkan_32_loader || ! $vulkan_32_driver; then
-            add_row "Vulkan & 32-bit graphics" "WARN ⚠ (Missing lib32-vulkan-radeon or 32-bit loader)" "GAME"
-            ((WARNINGS++))
-            log "HEALTH vulkan_32bit=WARN"
-        else
-            add_row "Vulkan & 32-bit graphics" "PASS ✔ (AMD Vulkan stack detected)" "GAME"
-            log "HEALTH vulkan_32bit=PASS"
-        fi
-    elif [[ "$driver_list" == *"i915"* || "$driver_list" == *"xe"* ]]; then
-        [[ -f /usr/lib32/libvulkan_intel.so ]] && vulkan_32_driver=true
-        if $vulkan_64_ok && $vulkan_32_loader && $vulkan_32_driver; then
-            GAMING_VULKAN_32BIT=true
-            add_row "Vulkan & 32-bit graphics" "PASS ✔ (${short_gpu:-Intel} | 64+32-bit ANV OK)" "GAME"
-            log "HEALTH vulkan_32bit=PASS driver=intel"
-        elif ! $is_gamer; then
-            add_row "Vulkan & 32-bit graphics" "INFO ℹ (${short_gpu:-Intel} 64-bit | 32-bit multilib not installed)" "GAME"
+            add_row "Vulkan & 32-bit graphics" "INFO ℹ (${short_gpu:-GPU} 64-bit | 32-bit multilib not installed)" "GAME"
             log "HEALTH vulkan_32bit=INFO pure_64bit"
         else
-            add_row "Vulkan & 32-bit graphics" "WARN ⚠ (Incomplete Intel 32-bit Vulkan stack)" "GAME"
+            local missing_str="${unique_missing[*]}"
+            add_row "Vulkan & 32-bit graphics" "WARN ⚠ (Missing 32-bit stack: ${missing_str})" "GAME"
             ((WARNINGS++))
-            log "HEALTH vulkan_32bit=WARN"
+            log "HEALTH vulkan_32bit=WARN missing='${missing_str}'"
         fi
     else
-        add_row "Vulkan & 32-bit graphics" "INFO ℹ (No dedicated Vulkan driver identified)" "GAME"
+        if $vulkan_64_ok; then
+            add_row "Vulkan & 32-bit graphics" "INFO ℹ (${short_gpu:-GPU} | 64-bit Vulkan ICD detected)" "GAME"
+        else
+            add_row "Vulkan & 32-bit graphics" "INFO ℹ (No dedicated Vulkan driver identified)" "GAME"
+        fi
         log "HEALTH vulkan_32bit=INFO"
     fi
 
     # 3. Proton memory limits (vm.max_map_count & soft file descriptor headroom)
     local map_count soft_nofile
-    map_count="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
+    map_count="$(cat "${root}/proc/sys/vm/max_map_count" 2>/dev/null || cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
     soft_nofile="$(ulimit -Sn 2>/dev/null || echo 0)"
     GAMING_MAX_MAP_COUNT="$map_count"
 
@@ -6965,7 +7032,7 @@ check_gaming() {
     # 4. Kernel Synchronization Primitives (fsync / futex_waitv syscall probe)
     local futex_ok=false
     local futex_method="syscall probe"
-    if command -v python3 &>/dev/null; then
+    if [[ -z "$root" ]] && command -v python3 &>/dev/null; then
         local py_res
         py_res="$(python3 -c '
 import ctypes, errno
@@ -6984,7 +7051,7 @@ except Exception as e:
         fi
     fi
 
-    # Native kernel version fallback if python3 is unavailable or ctypes restricted
+    # Native kernel version fallback if python3 is unavailable or in mock root
     if ! $futex_ok; then
         local k_rel k_major k_minor
         k_rel="$(uname -r 2>/dev/null || echo "")"
@@ -7012,11 +7079,13 @@ except Exception as e:
         log "HEALTH futex_waitv=INFO"
     fi
 
-    # 5. Kernel Split-Lock Mitigation & Event Correlation (SRE Hardened)
+    # 5. Kernel Split-Lock Mitigation & Event Correlation
     local split_lock=""
-    split_lock="$(cat /proc/sys/kernel/split_lock_mitigate 2>/dev/null || echo "not_found")"
+    split_lock="$(cat "${root}/proc/sys/kernel/split_lock_mitigate" 2>/dev/null || cat /proc/sys/kernel/split_lock_mitigate 2>/dev/null || echo "not_found")"
     local split_hits=""
-    split_hits="$(journalctl -k -b --no-pager 2>/dev/null | grep -Ei 'split lock|split_lock' | tail -n 3 || true)"
+    if [[ -z "$root" ]]; then
+        split_hits="$(journalctl -k -b --no-pager 2>/dev/null | grep -Ei 'split lock|split_lock' | tail -n 3 || true)"
+    fi
 
     if [[ "$split_lock" == "0" ]]; then
         add_row "Kernel split-lock" "PASS ✔ (Mitigation disabled - optimal for Proton)" "GAME"
@@ -7037,9 +7106,9 @@ except Exception as e:
 
     # 6. CPU governor & GameMode (Client/Daemon Active Validation)
     local gov="" gamemode_status="MISSING"
-    gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
+    gov="$(cat "${root}/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" 2>/dev/null || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
     
-    if command -v gamemoded &>/dev/null; then
+    if command -v gamemoded &>/dev/null && [[ -z "$root" ]]; then
         if gamemoded -s &>/dev/null; then
             gamemode_status="PASS"
         else
@@ -7062,9 +7131,17 @@ except Exception as e:
         log "HEALTH cpu_governor=INFO governor=$gov gamemode=none"
     fi
 
-    # 7. Desktop session & GPU match (Quirk awareness for Maxwell / 580xx)
+    # 7. Desktop Session & Compositor Sync
     local session_type="${XDG_SESSION_TYPE:-unknown}"
-    if [[ "$driver_list" == *"nvidia"* && ( "$gpu_name" =~ 9[0-9]{2} || "$gpu_name" =~ Maxwell || "$vga_info" =~ GM204 ) ]]; then
+    if [[ "$session_type" == "unknown" ]]; then
+        if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+            session_type="wayland"
+        elif [[ -n "${DISPLAY:-}" ]]; then
+            session_type="x11"
+        fi
+    fi
+
+    if [[ "${active_drivers[*]}" == *"nvidia"* && ( "$gpu_name" =~ 9[0-9]{2} || "$gpu_name" =~ Maxwell || "$vga_info" =~ GM204 ) ]]; then
         if [[ "$session_type" == "x11" ]]; then
             add_row "Desktop session & GPU" "PASS ✔ (X11 optimal for Maxwell | KWin bypass OK)" "GAME"
             log "HEALTH desktop_session=PASS session=x11 gpu=maxwell"
@@ -7075,33 +7152,81 @@ except Exception as e:
             add_row "Desktop session & GPU" "INFO ℹ (Session: $session_type)" "GAME"
             log "HEALTH desktop_session=INFO session=$session_type"
         fi
+    elif [[ "$session_type" == "wayland" ]]; then
+        add_row "Desktop session & GPU" "PASS ✔ (Wayland session | native gaming compositor)" "GAME"
+        log "HEALTH desktop_session=PASS session=wayland"
+    elif [[ "$session_type" == "x11" ]]; then
+        add_row "Desktop session & GPU" "PASS ✔ (X11 session | direct compositor unredirect)" "GAME"
+        log "HEALTH desktop_session=PASS session=x11"
+    else
+        add_row "Desktop session & GPU" "INFO ℹ (Session: $session_type)" "GAME"
+        log "HEALTH desktop_session=INFO session=$session_type"
+    fi
 
-        # 8. GTX 970 VRAM Runtime Telemetry (3.5GB fast segment tracking)
-        if command -v nvidia-smi &>/dev/null; then
-            local vram_row gpu_n tot_m usd_m
-            vram_row="$(nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-            if [[ -n "$vram_row" ]]; then
-                gpu_n="$(awk -F', ' '{print $1}' <<< "$vram_row")"
-                tot_m="$(awk -F', ' '{print $2}' <<< "$vram_row")"
-                usd_m="$(awk -F', ' '{print $3}' <<< "$vram_row")"
-                if [[ "$gpu_n" == *"GTX 970"* ]]; then
-                    if (( usd_m >= 3584 )); then
-                        add_row "GTX 970 VRAM allocation" "WARN ⚠ (${usd_m}/${tot_m} MB used | above 3.5GB fast segment)" "GAME"
-                        ((WARNINGS++))
-                        log "HEALTH gtx970_vram=WARN used=$usd_m total=$tot_m"
-                    else
-                        add_row "GTX 970 VRAM allocation" "PASS ✔ (${usd_m}/${tot_m} MB used | 3.5GB fast segment OK)" "GAME"
-                        log "HEALTH gtx970_vram=PASS used=$usd_m total=$tot_m"
-                    fi
+    # 8. Universal GPU VRAM & Maxwell GTX 970 Hardware Segment Telemetry
+    if command -v nvidia-smi &>/dev/null && [[ -z "$root" ]]; then
+        local vram_row gpu_n tot_m usd_m
+        vram_row="$(nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
+        if [[ -n "$vram_row" ]]; then
+            gpu_n="$(awk -F', ' '{print $1}' <<< "$vram_row")"
+            tot_m="$(awk -F', ' '{print $2}' <<< "$vram_row")"
+            usd_m="$(awk -F', ' '{print $3}' <<< "$vram_row")"
+            tot_m="${tot_m//[^0-9]/}"
+            usd_m="${usd_m//[^0-9]/}"
+            tot_m="${tot_m:-0}"
+            usd_m="${usd_m:-0}"
+            
+            # Karol's Physical Rig Preservation: Maxwell GTX 970 3.5GB fast segment
+            if [[ "$gpu_n" == *"GTX 970"* ]]; then
+                if (( usd_m >= 3584 )); then
+                    add_row "GTX 970 VRAM allocation" "WARN ⚠ (${usd_m}/${tot_m} MB used | above 3.5GB fast segment)" "GAME"
+                    ((WARNINGS++))
+                    log "HEALTH gtx970_vram=WARN used=$usd_m total=$tot_m"
+                else
+                    add_row "GTX 970 VRAM allocation" "PASS ✔ (${usd_m}/${tot_m} MB used | 3.5GB fast segment OK)" "GAME"
+                    log "HEALTH gtx970_vram=PASS used=$usd_m total=$tot_m"
+                fi
+            else
+                # Universal NVIDIA Modern GPU VRAM telemetry
+                if (( tot_m > 0 && (usd_m * 100 / tot_m) >= 90 )); then
+                    add_row "GPU VRAM allocation" "WARN ⚠ (${usd_m}/${tot_m} MB used [${gpu_n}] - high memory pressure)" "GAME"
+                    ((WARNINGS++))
+                    log "HEALTH gpu_vram=WARN used=$usd_m total=$tot_m model='$gpu_n'"
+                elif (( tot_m > 0 )); then
+                    add_row "GPU VRAM allocation" "PASS ✔ (${usd_m}/${tot_m} MB used [${gpu_n}])" "GAME"
+                    log "HEALTH gpu_vram=PASS used=$usd_m total=$tot_m model='$gpu_n'"
                 fi
             fi
         fi
     else
-        add_row "Desktop session & GPU" "PASS ✔ (Session: $session_type)" "GAME"
-        log "HEALTH desktop_session=PASS session=$session_type"
+        # AMD Radeon sysfs VRAM Discovery
+        local amd_vram_used amd_vram_total
+        amd_vram_used="$(compgen -G "${root}/sys/class/drm/card*/device/mem_info_vram_used" 2>/dev/null | head -n1 || true)"
+        amd_vram_total="$(compgen -G "${root}/sys/class/drm/card*/device/mem_info_vram_total" 2>/dev/null | head -n1 || true)"
+        if [[ -f "$amd_vram_used" && -f "$amd_vram_total" ]]; then
+            local b_usd b_tot m_usd m_tot
+            b_usd="$(cat "$amd_vram_used" 2>/dev/null || echo 0)"
+            b_tot="$(cat "$amd_vram_total" 2>/dev/null || echo 0)"
+            b_usd="${b_usd//[^0-9]/}"
+            b_tot="${b_tot//[^0-9]/}"
+            b_usd="${b_usd:-0}"
+            b_tot="${b_tot:-0}"
+            if (( b_tot > 0 )); then
+                m_usd=$(( b_usd / 1048576 ))
+                m_tot=$(( b_tot / 1048576 ))
+                if (( (m_usd * 100 / m_tot) >= 90 )); then
+                    add_row "GPU VRAM allocation" "WARN ⚠ (${m_usd}/${m_tot} MB used [AMD RADV] - high memory pressure)" "GAME"
+                    ((WARNINGS++))
+                    log "HEALTH gpu_vram=WARN used=$m_usd total=$m_tot driver=amdgpu"
+                else
+                    add_row "GPU VRAM allocation" "PASS ✔ (${m_usd}/${m_tot} MB used [AMD RADV])" "GAME"
+                    log "HEALTH gpu_vram=PASS used=$m_usd total=$m_tot driver=amdgpu"
+                fi
+            fi
+        fi
     fi
 
-    # 9. Steam & Custom Proton runtime (GE-Proton detection across native, Flatpak & Heroic)
+    # 9. Steam & Custom Proton runtime (Native, Flatpak, Heroic, Lutris & AUR tools)
     local target_home="${HOME}"
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
         target_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")"
@@ -7118,6 +7243,11 @@ except Exception as e:
         "$target_home/.steam/steam/compatibilitytools.d"
         "$target_home/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
         "$target_home/.config/heroic/tools/proton"
+        "$target_home/.config/heroic/tools/wine"
+        "$target_home/.var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton"
+        "$target_home/.var/app/com.heroicgameslauncher.hgl/data/heroic/tools/proton"
+        "$target_home/.local/share/lutris/runners/wine"
+        "${root}/usr/share/steam/compatibilitytools.d"
     )
     local -a found_protons=()
     for pdir in "${proton_scan_dirs[@]}"; do
@@ -7431,6 +7561,18 @@ generate_summary_json() {
                     code="GAME_MAX_MAP_COUNT_LOW"
                     summary="vm.max_map_count is too low for UE5/DirectX 12 Proton games"
                     fix="echo 'vm.max_map_count = 1048576' | sudo tee /etc/sysctl.d/80-game-compatibility.conf"
+                    risk="LOW"
+                    ;;
+                gtx970_vram)
+                    code="GAME_GTX970_VRAM_HIGH"
+                    summary="GTX 970 VRAM allocation exceeds 3.5GB fast segment"
+                    fix="Reduce texture quality or close background GPU-intensive applications"
+                    risk="LOW"
+                    ;;
+                gpu_vram)
+                    code="GAME_GPU_VRAM_HIGH"
+                    summary="GPU VRAM allocation exceeds 90% capacity"
+                    fix="Reduce graphics settings or close background applications consuming VRAM"
                     risk="LOW"
                     ;;
             esac
@@ -8088,6 +8230,12 @@ reconstruct_tables_from_log() {
                 [[ "$details" =~ used=([0-9]+) ]] && usd="${BASH_REMATCH[1]}"
                 [[ "$details" =~ total=([0-9]+) ]] && tot="${BASH_REMATCH[1]}"
                 AUDIT_TABLE_GAME+="$(_format_audit_row "GTX 970 VRAM allocation" "$val" "${usd}/${tot} MB used - 3.5GB fast segment OK")\n"
+                ;;
+            gpu_vram)
+                local usd="" tot="" mdl=""
+                [[ "$details" =~ used=([0-9]+) ]] && usd="${BASH_REMATCH[1]}"
+                [[ "$details" =~ total=([0-9]+) ]] && tot="${BASH_REMATCH[1]}"
+                AUDIT_TABLE_GAME+="$(_format_audit_row "GPU VRAM allocation" "$val" "${usd}/${tot} MB used")\n"
                 ;;
 
             # --- UNMAPPED CHECKS ---
