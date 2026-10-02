@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.45] - 2026-10-02
+
+### Fixed & Hardened (SRE Architectural Audit - Phantom Driver, GPU DRM & ALPM Conflict Assistant / PATCH-037)
+- **MOD-05 GPU Runtime & Phantom Driver Detection (`check_gpu`)**:
+  - Eliminated silent False-PASS when GPU kernel driver is bound at PCI level (`lspci -k`), but KMS/NVML is unresponsive or dead.
+  - Added dynamic sysfs `runtime_status` awareness (`/sys/bus/pci/devices/*/power/runtime_status`) to distinguish broken desktop drivers from normal D3cold powersave on hybrid laptops (PRIME / Optimus).
+  - Added software rendering detection (`llvmpipe` / `swrast` fallback via OpenGL query) to warn when graphical desktop sessions lose hardware acceleration on physical GPU systems.
+- **MOD-05 Kernel Log GPU Hardware & DRM Initialization Errors (`check_gpu_errors`)**:
+  - Expanded NVIDIA kernel log diagnostics beyond `NVRM: Xid` to intercept early DRM/KMS module initialization failures (`NvKmsKapiDevice`, `NVRM: API mismatch`, `[nvidia-drm] *ERROR*`, and UCSI/i2c timeouts).
+  - Added early init and VRAM initialization failure signatures for AMD Radeon (`amdgpu_init *ERROR*`, `Fatal error during GPU init`, `VRAM initialization failed`) and Intel (`i915/xe probe failed`, `Failed to load DSP firmware`).
+- **MOD-03 Guarded Upgrade ALPM Conflict Assistant (`run_guarded_upgrade`)**:
+  - Added real-time transaction output capture via tee into `$RUN_RAW/upgrade-transaction.log` to retain diagnostic traces across cancelled or aborted transactions.
+  - Implemented automated triage for ALPM file conflict errors (`exists in filesystem` / `istnieje w systemie plików`): non-destructively inspects conflicting file ownership via `pacman -Qo`.
+  - Automatically identifies unowned files and generates exact, safe backup instructions (`sudo mv <file> <file>.bak`) to immediately unblock upgrades.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh`)**:
+  - Added Fixture 5.5: Interception of kernel log `NvKmsKapiDevice` DRM initialization failures (`WARN ⚠`).
+  - Added Fixture 5.6: Detection of Phantom NVIDIA Drivers when KMS/NVML is unresponsive (`WARN ⚠`).
+  - Added Fixture 5.7: Graceful handling of hybrid laptop dGPUs in D3cold runtime-suspended state (`PASS ✔`).
+  - Added Fixture 9.5: Automated ALPM unowned file conflict parsing and isolation.
+  - Expanded total hermetic regression suite from 58/58 to 62/62 passing tests (100% PASS).
+
 ## [2.44] - 2026-10-02
 
 ### Fixed & Hardened (SRE Architectural Audit - Gaming & Proton Universality / PATCH-032)
