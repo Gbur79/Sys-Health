@@ -1,8 +1,8 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.42](https://img.shields.io/badge/Version-2.42-orange.svg)](CHANGELOG.md)
-[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-49%2F49%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
+[![Version: 2.44](https://img.shields.io/badge/Version-2.44-orange.svg)](CHANGELOG.md)
+[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-58%2F58%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -129,12 +129,13 @@ A zero-dependency, live performance sampling flight recorder designed to run **w
 
 ### 4. Gaming & Steam Readiness Suite (`--gaming`)
 * **Multilib Repository Validation:** Verifies `[multilib]` is active in `/etc/pacman.conf` (required for 32-bit Wine/Proton games).
-* **32-bit Vulkan & Driver Stack:** Validates 64-bit and 32-bit Vulkan ICD loaders and driver stacks (`lib32-vulkan-icd-loader`, `lib32-nvidia-utils` / `lib32-vulkan-radeon`), preventing silent game launch crashes.
+* **Universal Multi-GPU & 32-bit Driver Stack:** Validates 64-bit and 32-bit Vulkan ICD loaders and driver stacks dynamically across AMD Radeon (RADV/AMDVLK), Intel Arc/Xe (ANV), open-source NVIDIA (NVK/Nouveau), and proprietary NVIDIA (`lib32-vulkan-icd-loader`, `lib32-nvidia-utils`, `lib32-vulkan-radeon`, `lib32-vulkan-intel`, `lib32-vulkan-nouveau`). Seamlessly inspects hybrid laptop dual-GPU setups without false alarms.
 * **Proton Memory Pools & Descriptors:** Verifies `vm.max_map_count >= 1048576` (crucial for Unreal Engine 5 and modern Proton titles) and soft file descriptor headroom (`ulimit -Sn`).
 * **Kernel Synchronization Primitives (`fsync` / `futex2`):** Live userspace syscall probe testing `futex_waitv` (syscall 449) availability for direct kernel synchronization without Wineserver IPC bottlenecks.
 * **Kernel Split-Lock Mitigation:** Audits `/proc/sys/kernel/split_lock_mitigate` and correlates live kernel log events (`journalctl -k`) to detect 10ms execution penalties causing in-game micro-stutter.
-* **GameMode & Compositor Readiness:** Verifies Feral GameMode daemon lifecycle (`gamemoded -t`), D-Bus activation, CPU frequency governors, and X11/Wayland compositor unredirection.
-* **Steam Runtimes:** Detects custom Proton compatibility tools (e.g. `GE-Proton`).
+* **GameMode & Compositor Readiness:** Verifies Feral GameMode daemon lifecycle (`gamemoded -s`), D-Bus activation, CPU frequency governors, and X11/Wayland compositor unredirection.
+* **GPU VRAM Telemetry:** Live hardware segment tracking (including Maxwell GTX 970 3.5GB fast segment preservation and universal modern NVIDIA/AMD VRAM pressure warnings).
+* **Multi-Client Steam & Proton Runtimes:** Comprehensive discovery of custom Proton tools (e.g. `GE-Proton`, `Proton-TKG`) across native Steam, Flatpak Steam, Flatpak Heroic, Lutris wine runners, and system-wide AUR installations.
 
 ### 5. Standalone & Third-Party Software Updates Hub (`--software`)
 Bridges the gap for software installed outside distribution repositories:
@@ -288,7 +289,7 @@ Every release, bugfix, and patch blueprint must pass the hermetic test suite bef
 ./dev-tools/test-suite.sh
 ```
 * **100% Mocked Roots:** Executes in isolated sandboxes (`SYS_HEALTH_ROOT`) without host mutations.
-* **Coverage:** 49 deterministic assertions covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, and ALPM Orphan Cascade Protection.
+* **Coverage:** 58 deterministic assertions across 13 test suites covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, ALPM Orphan Cascade Protection, checkupdates error resilience & core package parity, and Universal Multi-GPU Gaming Readiness.
 
 ---
 
