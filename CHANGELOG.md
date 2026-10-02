@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed & Hardened (SRE Architectural Audit - Gaming & Proton Universality / PATCH-032)
 - **MOD-12 SRE Full Certification (`check_gaming` & `detect_gaming_system`)**:
-  - Promoted Gaming & Steam Readiness Suite to `🟢 CERTIFIED [Sol]`, closing architectural weak point #3 in `AUDIT_MATRIX.md`.
   - Added hermetic regression coverage in `dev-tools/test-suite.sh` Part 13 (5 new fixtures, expanding total suite to 58/58 tests passing).
 - **Universal Multi-GPU & Hybrid Driver 32-bit Architecture**:
   - Replaced rigid single-driver `if ... elif` logic with dynamic PCI and sysfs driver iteration.
@@ -32,7 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed & Hardened (SRE Architectural Audit - check_updates & AUR/Core Parity / PATCH-034)
 - **MOD-11 SRE Full Certification (`check_updates`)**:
-  - Promoted Package Update Audit to `🟢 CERTIFIED [Sol]`, closing architectural weak point #6 in `AUDIT_MATRIX.md`.
   - Added hermetic regression coverage in `dev-tools/test-suite.sh` Part 12 (4 new fixtures, expanding total suite to 53/53 tests passing).
 - **Elimination of Silent False-PASS on Check Failure**:
   - Hardened `check_updates()` to strictly honor `checkupdates` exit code semantics:
