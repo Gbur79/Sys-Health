@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.46] - 2026-10-03
+
+### Fixed & Hardened (SRE Architectural Audit - Dynamic Flight Recorder & TUI Report Engine / PATCH-038 & PATCH-039)
+- **MOD-13 Dynamic Flight Recorder Hardening (`run_dynamic_sample` / PATCH-038)**:
+  - Added hermetic mock filesystem support (`${SYS_HEALTH_ROOT:-}`) across all pressure stall and hardware sysfs paths, enabling 100% sandboxed regression testing.
+  - Eliminated process leakage and orphan trap retention with a leakproof `_cleanup_sample` routine across `RETURN`, `INT`, `TERM`, `HUP`, terminating background `ping` with SIGTERM followed by SIGKILL escalation.
+  - Resolved false-positive PASS on systems without kernel PSI (`CONFIG_PSI=n` or boot parameter `psi=0`), replacing it with explicit `INFO ℹ (kernel PSI unsupported or disabled: psi=0)`.
+  - Added native Intel Graphics (`xe`/`i915`) and AMD Radeon sysfs GPU load, memory, and thermal discovery without requiring `nvidia-smi`.
+  - Enforced `LC_ALL=C` across all awk float calculations to prevent arithmetic syntax errors under comma-decimal locales (`pl_PL.UTF-8`).
+  - Integrated and exposed Dynamic Flight Recorder directly as Option 6 in the interactive TUI menu (`gum choose`).
+- **MOD-14 TUI, ANSI & Report Engine Hardening (`render_audit_section` & `reconstruct_tables_from_log` / PATCH-039)**:
+  - Fixed `sys-health --report` (`-r`) CLI behavior to execute `show_report()` instead of raw `cat "$LOG_FILE"`.
+  - Resolved unmapped check bleeding in `reconstruct_tables_from_log()` by mapping `gaming=SKIPPED` cleanly into `AUDIT_TABLE_GAME`.
+  - Added dynamic terminal geometry detection via `tput cols` with 80-column downscaling to eliminate box border line-wrapping on Linux virtual consoles (`/dev/tty1`-`/dev/tty6`).
+  - Implemented clean ASCII box fallbacks (`+`, `-`, `|`) for `TERM=dumb` and `LANG=C` environments.
+  - Hardened unprivileged `check_smart` execution against sudo timeout hangs when `sudo -v` credentials expire.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh`)**:
+  - Added Part 14: Dynamic Flight Recorder & Process Isolation (3 fixtures: synthetic high PSI stall, unsupported PSI fallback, and sysfs non-NVIDIA GPU telemetry).
+  - Added Part 15: TUI, ANSI & Report Reconstitution Engine (2 fixtures: clean `gaming=SKIPPED` table placement and non-interactive plain-text table formatting).
+  - Expanded total hermetic regression suite from 62/62 to 67/67 passing tests (100% PASS).
+ 
 ## [2.45] - 2026-10-02
 
 ### Fixed & Hardened (SRE Architectural Audit - Phantom Driver, GPU DRM & ALPM Conflict Assistant / PATCH-037)
