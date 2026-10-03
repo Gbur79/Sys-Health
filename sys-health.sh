@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.46
+# Arch System Health & Diagnostics v2.47
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.46"
+VERSION="2.47"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -517,7 +517,7 @@ audit_wrap_text() {
     [[ -n "$line" ]] && printf '%s\n' "$line"
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.46 | PATCH-039 | Fixtures: test-suite.sh Part 15]
+# [SRE-AUDIT: CERTIFIED | Sol v2.47 | PATCH-040 | Fixtures: test-suite.sh Part 15]
 render_audit_section() {
     local title="$1"
     local data="$2"
@@ -661,10 +661,10 @@ render_audit_section() {
                 st_disp="${c_dim}${s_line}${c_reset}"
             fi
 
-            printf "%s%s %s%s %s%s %s%s %s%s\n" \
+            printf "%s%s %s%s %s%s %s%s %s%s%s\n" \
                 "$c_border" "$b_v" "$comp_disp" "$pad_c" \
-                "$b_v" "$st_disp" "$pad_s" \
-                "$b_v" "$c_reset"
+                "$c_border" "$b_v" "$st_disp" "$pad_s" \
+                "$c_border" "$b_v" "$c_reset"
         done
     done < <(printf '%b' "$data")
 
