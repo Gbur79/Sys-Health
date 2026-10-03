@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.45"
+VERSION="2.46"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -77,7 +77,7 @@ Exit codes (in --audit/--batch mode):
 EOF
 }
 
-ACTION="interactive"
+ACTION="${ACTION:-interactive}"
 SAMPLE_SECS=3
 OUTPUT_JSON=0
 
@@ -176,16 +176,6 @@ if [[ "$ACTION" == "snapshot" ]]; then
     exit 0
 fi
 
-if [[ "$ACTION" == "report" ]]; then
-    if [[ -f "$LOG_FILE" ]]; then
-        cat "$LOG_FILE"
-    else
-        echo "No audit log report found. Run with --audit to generate." >&2
-        exit 1
-    fi
-    exit 0
-fi
-
 # ------------------------------------------------------------------------------
 # Safety / environment
 # ------------------------------------------------------------------------------
@@ -220,7 +210,7 @@ fi
 
 # Sudo credentials management (interactive prompts vs batch best-effort)
 HAVE_SUDO=0
-if [[ "$ACTION" != "sample" && "$ACTION" != "software" ]]; then
+if [[ "$ACTION" != "sample" && "$ACTION" != "software" && "$ACTION" != "report" && "$ACTION" != "test" ]]; then
     if sudo -n true 2>/dev/null; then
         HAVE_SUDO=1
     elif [[ "$ACTION" == "interactive" ]]; then
@@ -230,7 +220,7 @@ if [[ "$ACTION" != "sample" && "$ACTION" != "software" ]]; then
             echo "Authentication failed or aborted." >&2
             exit 1
         fi
-    elif [[ -t 0 ]] && sudo -v 2>/dev/null; then
+    elif [[ -t 0 ]] && [[ -t 1 ]] && sudo -v 2>/dev/null; then
         HAVE_SUDO=1
     fi
 
@@ -527,6 +517,7 @@ audit_wrap_text() {
     [[ -n "$line" ]] && printf '%s\n' "$line"
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.46 | PATCH-039 | Fixtures: test-suite.sh Part 15]
 render_audit_section() {
     local title="$1"
     local data="$2"
@@ -559,17 +550,30 @@ render_audit_section() {
     fi
 
     # Strict compact card geometry: Exactly 89 columns to match UI_CARD_WIDTH & banners
+    # Dynamic column width discovery (accommodates 80-column TTY consoles)
+    local cols="${COLUMNS:-}"
+    if [[ -z "$cols" || "$cols" -eq 0 ]] && command -v tput &>/dev/null; then
+        cols="$(tput cols 2>/dev/null || echo 89)"
+    fi
+    cols="${cols:-89}"
+
     local comp_w=28
     local stat_w=54
 
-    # Responsive scale down ONLY for tiny terminals < 89 columns
-    local cols="${COLUMNS:-89}"
+    # Responsive scale down for terminals < 89 columns (e.g. 80-column Linux virtual console)
     if (( cols < 89 )); then
         local available=$((cols - 7))
         if (( available > 35 )); then
             comp_w=22
             stat_w=$((available - comp_w))
+            (( stat_w < 20 )) && stat_w=20
         fi
+    fi
+
+    # ASCII boundary fallback for dumb / non-UTF-8 terminals
+    local b_tl="╭" b_tr="╮" b_bl="╰" b_br="╯" b_h="─" b_v="│" b_tj="┬" b_bj="┴"
+    if [[ "${TERM:-}" == "dumb" || "${LANG:-}" == "C" || "${LC_ALL:-}" == "C" ]]; then
+        b_tl="+" b_tr="+" b_bl="+" b_br="+" b_h="-" b_v="|" b_tj="+" b_bj="+"
     fi
 
     local c_reset=$'\033[0m'
@@ -588,12 +592,12 @@ render_audit_section() {
     local h1 h2
     printf -v h1 '%*s' "$((comp_w + 2))" ""
     printf -v h2 '%*s' "$((stat_w + 2))" ""
-    h1="${h1// /─}"
-    h2="${h2// /─}"
+    h1="${h1// /${b_h}}"
+    h2="${h2// /${b_h}}"
 
     echo ""
     printf "%s%s%s\n" "$hdr_color" "${title}${badge}" "$c_reset"
-    printf "%s╭%s┬%s╮%s\n" "$c_border" "$h1" "$h2" "$c_reset"
+    printf "%s%s%s%s%s%s%s\n" "$c_border" "$b_tl" "$h1" "$b_tj" "$h2" "$b_tr" "$c_reset"
 
     local line comp st
     while IFS= read -r line; do
@@ -657,14 +661,14 @@ render_audit_section() {
                 st_disp="${c_dim}${s_line}${c_reset}"
             fi
 
-            printf "%s│ %s%s %s│ %s%s %s│%s\n" \
-                "$c_border" "$comp_disp" "$pad_c" \
-                "$c_border" "$st_disp" "$pad_s" \
-                "$c_border" "$c_reset"
+            printf "%s%s %s%s %s%s %s%s %s%s\n" \
+                "$c_border" "$b_v" "$comp_disp" "$pad_c" \
+                "$b_v" "$st_disp" "$pad_s" \
+                "$b_v" "$c_reset"
         done
     done < <(printf '%b' "$data")
 
-    printf "%s╰%s┴%s╯%s\n" "$c_border" "$h1" "$h2" "$c_reset"
+    printf "%s%s%s%s%s%s%s\n" "$c_border" "$b_bl" "$h1" "$b_bj" "$h2" "$b_br" "$c_reset"
 }
 
 
@@ -5439,7 +5443,11 @@ check_smart() {
     local failed=0 passed=0 no_perm=0 unsupported=0 total="${#disks[@]}"
     for dev in "${disks[@]}"; do
         local result
-        result="$(sudo -n smartctl -n standby -H "$dev" 2>&1 || smartctl -n standby -H "$dev" 2>&1 || true)"
+        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            result="$(sudo -n smartctl -n standby -H "$dev" 2>&1 || true)"
+        else
+            result="$(smartctl -n standby -H "$dev" 2>&1 || true)"
+        fi
         if printf '%s\n' "$result" | grep -qiE 'Device is in STANDBY mode'; then
             (( passed++ ))
         elif printf '%s\n' "$result" | grep -qiE 'PASSED|test result: ok'; then
@@ -7908,6 +7916,7 @@ _format_audit_row() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.46 | PATCH-039 | Fixtures: test-suite.sh Part 15]
 reconstruct_tables_from_log() {
     [[ ! -s "$LOG_FILE" ]] && return 0
 
@@ -8309,6 +8318,13 @@ reconstruct_tables_from_log() {
                 [[ "$details" =~ total=([0-9]+) ]] && tot="${BASH_REMATCH[1]}"
                 AUDIT_TABLE_GAME+="$(_format_audit_row "GPU VRAM allocation" "$val" "${usd}/${tot} MB used")\n"
                 ;;
+            gaming)
+                if [[ "$val" == "SKIPPED" ]]; then
+                    AUDIT_TABLE_GAME+="Gaming & Steam Suite | INFO ℹ (skipped: non-gaming workstation)\n"
+                else
+                    AUDIT_TABLE_GAME+="$(_format_audit_row "Gaming & Steam Suite" "$val" "$details")\n"
+                fi
+                ;;
 
             # --- UNMAPPED CHECKS ---
             *)
@@ -8632,7 +8648,7 @@ Analyze the report conservatively. Prioritize system boot stability and core Arc
 EOF
 }
 
-# [SRE-AUDIT: LEGACY / UNVERIFIED | ChatGPT v2.11 | Blast-Radius: MEDIUM | Fixtures: NONE]
+# [SRE-AUDIT: CERTIFIED | Sol v2.46 | PATCH-038 | Fixtures: test-suite.sh Part 14]
 run_dynamic_sample() {
     local dur="${1:-3}"
     local json_out="${2:-0}"
@@ -8643,6 +8659,8 @@ run_dynamic_sample() {
     if (( dur > 60 )); then
         dur=60
     fi
+
+    local sys_root="${SYS_HEALTH_ROOT:-}"
 
     # Network targets (Metric-aware default route with p2p & IPv6 support)
     local dev="" gw=""
@@ -8666,44 +8684,49 @@ run_dynamic_sample() {
     # Initial PSI read
     local psi_supported=false
     local t0_cpu_total=0 t0_mem_some=0 t0_mem_full=0 t0_io_some=0 t0_io_full=0
-    if [[ -d /proc/pressure ]]; then
+    if [[ -d "$sys_root/proc/pressure" ]]; then
         psi_supported=true
-        t0_cpu_total="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/cpu 2>/dev/null || echo 0)"
-        t0_mem_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo 0)"
-        t0_mem_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo 0)"
-        t0_io_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo 0)"
-        t0_io_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo 0)"
+        t0_cpu_total="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/cpu" 2>/dev/null || echo 0)"
+        t0_mem_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo 0)"
+        t0_mem_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo 0)"
+        t0_io_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo 0)"
+        t0_io_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo 0)"
     fi
 
     # Initial NIC counters
     local t0_rx_err=0 t0_tx_err=0 t0_rx_drop=0 t0_tx_drop=0
-    if [[ -n "$dev" && -d "/sys/class/net/$dev/statistics" ]]; then
-        t0_rx_err="$(cat "/sys/class/net/$dev/statistics/rx_errors" 2>/dev/null || echo 0)"
-        t0_tx_err="$(cat "/sys/class/net/$dev/statistics/tx_errors" 2>/dev/null || echo 0)"
-        t0_rx_drop="$(cat "/sys/class/net/$dev/statistics/rx_dropped" 2>/dev/null || echo 0)"
-        t0_tx_drop="$(cat "/sys/class/net/$dev/statistics/tx_dropped" 2>/dev/null || echo 0)"
+    if [[ -n "$dev" && -d "$sys_root/sys/class/net/$dev/statistics" ]]; then
+        t0_rx_err="$(cat "$sys_root/sys/class/net/$dev/statistics/rx_errors" 2>/dev/null || echo 0)"
+        t0_tx_err="$(cat "$sys_root/sys/class/net/$dev/statistics/tx_errors" 2>/dev/null || echo 0)"
+        t0_rx_drop="$(cat "$sys_root/sys/class/net/$dev/statistics/rx_dropped" 2>/dev/null || echo 0)"
+        t0_tx_drop="$(cat "$sys_root/sys/class/net/$dev/statistics/tx_dropped" 2>/dev/null || echo 0)"
     fi
 
-    # Background ping during the sample window with lifecycle cleanup trap
-    local ping_file
+    # Background ping during sample window with leakproof signal trap
+    local ping_file ping_pid=""
     ping_file="$(mktemp -t syshealth-ping.XXXXXX 2>/dev/null || echo "/tmp/syshealth-ping.$$")"
     local pings_count=$(( dur * 3 ))
     (( pings_count < 4 )) && pings_count=4
     (( pings_count > 25 )) && pings_count=25
 
-    local ping_pid=""
     _cleanup_sample() {
-        [[ -n "${ping_pid:-}" ]] && kill "$ping_pid" 2>/dev/null || true
+        if [[ -n "${ping_pid:-}" ]]; then
+            kill -TERM "$ping_pid" 2>/dev/null || true
+            ( sleep 0.05; kill -KILL "$ping_pid" 2>/dev/null || true ) &
+            wait "$ping_pid" 2>/dev/null || true
+            ping_pid=""
+        fi
         [[ -n "${ping_file:-}" && -f "$ping_file" ]] && rm -f "$ping_file" 2>/dev/null || true
+        trap - RETURN INT TERM HUP
     }
-    trap '_cleanup_sample' RETURN INT TERM
+    trap '_cleanup_sample' RETURN INT TERM HUP
 
     if [[ -n "$gw" ]] && command -v ping &>/dev/null; then
         ping -c "$pings_count" -i 0.25 -q -W 1 "$gw" > "$ping_file" 2>&1 &
         ping_pid=$!
     fi
 
-    # Feedback if in interactive TUI mode
+    # Interactive spinner feedback
     if [[ "$json_out" -eq 0 && -t 1 ]] && command -v gum &>/dev/null; then
         gum spin --spinner dot --title "Sampling live system performance (${dur}s)..." -- sleep "$dur"
     else
@@ -8712,6 +8735,7 @@ run_dynamic_sample() {
 
     if [[ -n "$ping_pid" ]]; then
         wait "$ping_pid" 2>/dev/null || true
+        ping_pid=""
     fi
 
     # Final PSI read & delta calculation
@@ -8720,41 +8744,47 @@ run_dynamic_sample() {
     local cpu_avg10="0.00" mem_some_avg10="0.00" mem_full_avg10="0.00" io_some_avg10="0.00" io_full_avg10="0.00"
 
     if $psi_supported; then
-        t1_cpu_total="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/cpu 2>/dev/null || echo 0)"
-        cpu_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' /proc/pressure/cpu 2>/dev/null || echo "0.00")"
+        t1_cpu_total="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/cpu" 2>/dev/null || echo 0)"
+        cpu_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' "$sys_root/proc/pressure/cpu" 2>/dev/null || echo "0.00")"
 
-        t1_mem_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo 0)"
-        mem_some_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo "0.00")"
+        t1_mem_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo 0)"
+        mem_some_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo "0.00")"
 
-        t1_mem_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo 0)"
-        mem_full_avg10="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo "0.00")"
+        t1_mem_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo 0)"
+        mem_full_avg10="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' "$sys_root/proc/pressure/memory" 2>/dev/null || echo "0.00")"
 
-        t1_io_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo 0)"
-        io_some_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo "0.00")"
+        t1_io_some="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo 0)"
+        io_some_avg10="$(awk '/^some / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo "0.00")"
 
-        t1_io_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo 0)"
-        io_full_avg10="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' /proc/pressure/io 2>/dev/null || echo "0.00")"
+        t1_io_full="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^total=/) {sub(/total=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo 0)"
+        io_full_avg10="$(awk '/^full / {for(i=1;i<=NF;i++) if($i ~ /^avg10=/) {sub(/avg10=/,"",$i); print $i}}' "$sys_root/proc/pressure/io" 2>/dev/null || echo "0.00")"
 
         local dur_usec=$(( dur * 1000000 ))
-        cpu_stall_pct="$(awk -v d="$(( t1_cpu_total - t0_cpu_total ))" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
-        mem_some_pct="$(awk -v d="$(( t1_mem_some - t0_mem_some ))" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
-        mem_full_pct="$(awk -v d="$(( t1_mem_full - t0_mem_full ))" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
-        io_some_pct="$(awk -v d="$(( t1_io_some - t0_io_some ))" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
-        io_full_pct="$(awk -v d="$(( t1_io_full - t0_io_full ))" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
+        local d_cpu=$(( t1_cpu_total >= t0_cpu_total ? t1_cpu_total - t0_cpu_total : 0 ))
+        local d_msome=$(( t1_mem_some >= t0_mem_some ? t1_mem_some - t0_mem_some : 0 ))
+        local d_mfull=$(( t1_mem_full >= t0_mem_full ? t1_mem_full - t0_mem_full : 0 ))
+        local d_iosome=$(( t1_io_some >= t0_io_some ? t1_io_some - t0_io_some : 0 ))
+        local d_iofull=$(( t1_io_full >= t0_io_full ? t1_io_full - t0_io_full : 0 ))
+
+        cpu_stall_pct="$(LC_ALL=C awk -v d="$d_cpu" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
+        mem_some_pct="$(LC_ALL=C awk -v d="$d_msome" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
+        mem_full_pct="$(LC_ALL=C awk -v d="$d_mfull" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
+        io_some_pct="$(LC_ALL=C awk -v d="$d_iosome" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
+        io_full_pct="$(LC_ALL=C awk -v d="$d_iofull" -v total="$dur_usec" 'BEGIN {printf "%.1f", (d*100)/total}')"
     fi
 
     # Final NIC counters & delta
     local t1_rx_err=0 t1_tx_err=0 t1_rx_drop=0 t1_tx_drop=0
     local delta_rx_err=0 delta_tx_err=0 delta_rx_drop=0 delta_tx_drop=0
-    if [[ -n "$dev" && -d "/sys/class/net/$dev/statistics" ]]; then
-        t1_rx_err="$(cat "/sys/class/net/$dev/statistics/rx_errors" 2>/dev/null || echo 0)"
-        t1_tx_err="$(cat "/sys/class/net/$dev/statistics/tx_errors" 2>/dev/null || echo 0)"
-        t1_rx_drop="$(cat "/sys/class/net/$dev/statistics/rx_dropped" 2>/dev/null || echo 0)"
-        t1_tx_drop="$(cat "/sys/class/net/$dev/statistics/tx_dropped" 2>/dev/null || echo 0)"
-        delta_rx_err=$(( t1_rx_err - t0_rx_err ))
-        delta_tx_err=$(( t1_tx_err - t0_tx_err ))
-        delta_rx_drop=$(( t1_rx_drop - t0_rx_drop ))
-        delta_tx_drop=$(( t1_tx_drop - t0_tx_drop ))
+    if [[ -n "$dev" && -d "$sys_root/sys/class/net/$dev/statistics" ]]; then
+        t1_rx_err="$(cat "$sys_root/sys/class/net/$dev/statistics/rx_errors" 2>/dev/null || echo 0)"
+        t1_tx_err="$(cat "$sys_root/sys/class/net/$dev/statistics/tx_errors" 2>/dev/null || echo 0)"
+        t1_rx_drop="$(cat "$sys_root/sys/class/net/$dev/statistics/rx_dropped" 2>/dev/null || echo 0)"
+        t1_tx_drop="$(cat "$sys_root/sys/class/net/$dev/statistics/tx_dropped" 2>/dev/null || echo 0)"
+        delta_rx_err=$(( t1_rx_err >= t0_rx_err ? t1_rx_err - t0_rx_err : 0 ))
+        delta_tx_err=$(( t1_tx_err >= t0_tx_err ? t1_tx_err - t0_tx_err : 0 ))
+        delta_rx_drop=$(( t1_rx_drop >= t0_rx_drop ? t1_rx_drop - t0_rx_drop : 0 ))
+        delta_tx_drop=$(( t1_tx_drop >= t0_tx_drop ? t1_tx_drop - t0_tx_drop : 0 ))
     fi
     local total_nic_delta=$(( delta_rx_err + delta_tx_err + delta_rx_drop + delta_tx_drop ))
 
@@ -8774,10 +8804,10 @@ run_dynamic_sample() {
         rm -f "$ping_file" 2>/dev/null || true
     fi
 
-    # GPU telemetry (NVIDIA smi + AMD /sys/class/drm fallback)
+    # GPU telemetry (NVIDIA smi + AMD & Intel sysfs discovery)
     local gpu_avail=false gpu_name="" gpu_util=0 gpu_mem_util=0 vram_used=0 vram_total=0
     local gpu_temp=0 gpu_pstate="" gpu_pcie_gen="" gpu_pcie_width="" maxwell_vram_warn=false
-    if command -v nvidia-smi &>/dev/null; then
+    if [[ -z "$sys_root" ]] && command -v nvidia-smi &>/dev/null; then
         local smi_raw
         smi_raw="$(nvidia-smi --query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,pstate,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
         if [[ -n "$smi_raw" ]]; then
@@ -8798,10 +8828,14 @@ run_dynamic_sample() {
         fi
     fi
 
+    # Non-NVIDIA / Sysfs Fallback (AMD Radeon & Intel Xe/Arc/i915)
     if ! $gpu_avail; then
-        for card_dev in /sys/class/drm/card*/device; do
+        local card_dev
+        for card_dev in "$sys_root"/sys/class/drm/card*/device; do
             [[ -d "$card_dev" ]] || continue
-            if [[ -f "$card_dev/gpu_busy_percent" ]]; then
+
+            # AMD Radeon sysfs discovery
+            if [[ -f "$card_dev/mem_info_vram_total" || -f "$card_dev/gpu_busy_percent" ]]; then
                 gpu_avail=true
                 gpu_util="$(cat "$card_dev/gpu_busy_percent" 2>/dev/null || echo 0)"
                 local v_used_b v_tot_b
@@ -8812,13 +8846,15 @@ run_dynamic_sample() {
                     vram_total=$(( v_tot_b / 1048576 ))
                     gpu_mem_util=$(( (vram_used * 100) / vram_total ))
                 fi
-                local raw_card
-                raw_card="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D' | grep -iE 'AMD|Radeon' | head -n1 || true)"
-                if [[ "$raw_card" =~ \[([^\]]+)\] ]]; then
-                    gpu_name="${BASH_REMATCH[1]}"
-                else
-                    gpu_name="AMD Radeon GPU"
+                gpu_name="AMD Radeon GPU"
+                if [[ -z "$sys_root" ]] && command -v lspci &>/dev/null; then
+                    local raw_card
+                    raw_card="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D' | grep -iE 'AMD|Radeon' | head -n1 || true)"
+                    if [[ "$raw_card" =~ \[([^\]]+)\] ]]; then
+                        gpu_name="${BASH_REMATCH[1]}"
+                    fi
                 fi
+                local h_hw
                 for h_hw in "$card_dev"/hwmon/hwmon*; do
                     if [[ -f "$h_hw/temp1_input" ]]; then
                         local t_raw
@@ -8828,18 +8864,35 @@ run_dynamic_sample() {
                     fi
                 done
                 break
+
+            # Intel Arc / Xe / i915 sysfs discovery
+            elif [[ -f "$card_dev/gt/gt0/rps_act_freq_mhz" || -f "$card_dev/gt_act_freq_mhz" ]]; then
+                gpu_avail=true
+                local act_f
+                act_f="$(cat "$card_dev/gt/gt0/rps_act_freq_mhz" 2>/dev/null || cat "$card_dev/gt_act_freq_mhz" 2>/dev/null || echo 0)"
+                gpu_pstate="${act_f}MHz"
+                gpu_name="Intel Graphics (Xe/Arc/i915)"
+                if [[ -z "$sys_root" ]] && command -v lspci &>/dev/null; then
+                    local raw_intel
+                    raw_intel="$(lspci -k 2>/dev/null | grep -A 2 -iE 'VGA|3D' | grep -iE 'Intel' | head -n1 || true)"
+                    if [[ "$raw_intel" =~ \[([^\]]+)\] ]]; then
+                        gpu_name="${BASH_REMATCH[1]}"
+                    fi
+                fi
+                break
             fi
         done
     fi
 
     # System metrics
-    local sys_gov sys_temp sys_load
-    sys_gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
-    if command -v sensors &>/dev/null; then
+    local sys_gov="" sys_temp="" sys_load=""
+    sys_gov="$(cat "$sys_root/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" 2>/dev/null || echo "unknown")"
+    if [[ -z "$sys_root" ]] && command -v sensors &>/dev/null; then
         sys_temp="$(sensors 2>/dev/null | grep -iE 'Package id 0|Tctl|Tdie|Core 0|CPU Temperature' | grep -oE '[+-]?[0-9]+([.][0-9]+)?°C' | head -n1 || true)"
     fi
     if [[ -z "$sys_temp" ]]; then
-        for h in /sys/class/hwmon/hwmon*; do
+        local h
+        for h in "$sys_root"/sys/class/hwmon/hwmon*; do
             [[ -d "$h" ]] || continue
             local hname
             hname="$(cat "$h/name" 2>/dev/null || echo "")"
@@ -8854,26 +8907,31 @@ run_dynamic_sample() {
         done
     fi
     sys_temp="${sys_temp:-unknown}"
-    sys_load="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")"
+    sys_load="$(awk '{print $1}' "$sys_root/proc/loadavg" 2>/dev/null || echo "0.0")"
 
-    # Status evaluation
+    # Status evaluation (Guarded float parsing with LC_ALL=C)
     local sample_status="ALL_CLEAR"
     local sample_warns=0 sample_errs=0
 
     if [[ -n "$gw" ]] && (( loss_pct >= 100 )); then
         sample_status="ACTION_REQUIRED"
         ((sample_errs++))
-    elif (( loss_pct > 0 )) || (( $(awk -v j="$rtt_mdev" 'BEGIN {print (j > 5.0) ? 1 : 0}') )); then
+    elif (( loss_pct > 0 )) || (( $(LC_ALL=C awk -v j="${rtt_mdev:-0}" 'BEGIN {print (j+0 > 5.0) ? 1 : 0}') )); then
         ((sample_warns++))
         [[ "$sample_status" != "ACTION_REQUIRED" ]] && sample_status="REVIEW_WARNINGS"
     fi
 
-    if (( $(awk -v p="$cpu_stall_pct" 'BEGIN {print (p > 25.0) ? 1 : 0}') )) || (( $(awk -v p="$mem_full_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-        sample_status="ACTION_REQUIRED"
-        ((sample_errs++))
-    elif (( $(awk -v p="$cpu_stall_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )) || (( $(awk -v p="$mem_some_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )) || (( $(awk -v p="$io_full_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-        ((sample_warns++))
-        [[ "$sample_status" != "ACTION_REQUIRED" ]] && sample_status="REVIEW_WARNINGS"
+    if $psi_supported; then
+        if (( $(LC_ALL=C awk -v p="${cpu_stall_pct:-0}" 'BEGIN {print (p+0 > 25.0) ? 1 : 0}') )) || \
+           (( $(LC_ALL=C awk -v p="${mem_full_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+            sample_status="ACTION_REQUIRED"
+            ((sample_errs++))
+        elif (( $(LC_ALL=C awk -v p="${cpu_stall_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )) || \
+             (( $(LC_ALL=C awk -v p="${mem_some_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )) || \
+             (( $(LC_ALL=C awk -v p="${io_full_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+            ((sample_warns++))
+            [[ "$sample_status" != "ACTION_REQUIRED" ]] && sample_status="REVIEW_WARNINGS"
+        fi
     fi
 
     if $maxwell_vram_warn; then
@@ -8893,7 +8951,7 @@ run_dynamic_sample() {
     local sample_json=""
     if command -v jq &>/dev/null; then
         sample_json="$(jq -n \
-            --arg ts "$(date --iso-8601=seconds)" \
+            --arg ts "$(date --iso-8601=seconds 2>/dev/null || date)" \
             --argjson dur "$dur" \
             --arg status "$sample_status" \
             --argjson warns "$sample_warns" \
@@ -8984,14 +9042,20 @@ run_dynamic_sample() {
     fi
 
     # Save to state files
-    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    local active_state_dir="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/system-health}"
+    local active_summary_file="${SUMMARY_FILE:-$active_state_dir/summary.json}"
+    if [[ -n "$sys_root" ]]; then
+        active_state_dir="${sys_root}${active_state_dir}"
+        active_summary_file="${sys_root}${active_summary_file}"
+    fi
+    mkdir -p "$active_state_dir" 2>/dev/null || true
     if [[ -n "$sample_json" ]]; then
-        echo "$sample_json" > "$STATE_DIR/sample.json" 2>/dev/null || true
-        if [[ -f "$SUMMARY_FILE" ]] && command -v jq &>/dev/null; then
+        echo "$sample_json" > "$active_state_dir/sample.json" 2>/dev/null || true
+        if [[ -f "$active_summary_file" ]] && command -v jq &>/dev/null; then
             local updated_summary
-            updated_summary="$(jq --argjson sample "$sample_json" '.dynamic_sample = $sample' "$SUMMARY_FILE" 2>/dev/null || true)"
+            updated_summary="$(jq --argjson sample "$sample_json" '.dynamic_sample = $sample' "$active_summary_file" 2>/dev/null || true)"
             if [[ -n "$updated_summary" ]]; then
-                echo "$updated_summary" > "$SUMMARY_FILE" 2>/dev/null || true
+                echo "$updated_summary" > "$active_summary_file" 2>/dev/null || true
             fi
         fi
     fi
@@ -9006,29 +9070,35 @@ run_dynamic_sample() {
     else
         local dynamic_table=""
 
-        local psi_cpu_status="PASS ✔ (${cpu_stall_pct}% stall, avg10: ${cpu_avg10})"
-        if (( $(awk -v p="$cpu_stall_pct" 'BEGIN {print (p > 25.0) ? 1 : 0}') )); then
-            psi_cpu_status="FAIL ✖ (${cpu_stall_pct}% stall - extreme CPU pressure)"
-        elif (( $(awk -v p="$cpu_stall_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-            psi_cpu_status="WARN ⚠ (${cpu_stall_pct}% stall - elevated CPU pressure)"
-        fi
-        dynamic_table+="CPU Pressure (PSI) | $psi_cpu_status\n"
+        if $psi_supported; then
+            local psi_cpu_status="PASS ✔ (${cpu_stall_pct}% stall, avg10: ${cpu_avg10})"
+            if (( $(LC_ALL=C awk -v p="${cpu_stall_pct:-0}" 'BEGIN {print (p+0 > 25.0) ? 1 : 0}') )); then
+                psi_cpu_status="FAIL ✖ (${cpu_stall_pct}% stall - extreme CPU pressure)"
+            elif (( $(LC_ALL=C awk -v p="${cpu_stall_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+                psi_cpu_status="WARN ⚠ (${cpu_stall_pct}% stall - elevated CPU pressure)"
+            fi
+            dynamic_table+="CPU Pressure (PSI) | $psi_cpu_status\n"
 
-        local psi_mem_status="PASS ✔ (some: ${mem_some_pct}%, full: ${mem_full_pct}%)"
-        if (( $(awk -v p="$mem_full_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-            psi_mem_status="FAIL ✖ (full: ${mem_full_pct}% - OOM thrashing detected)"
-        elif (( $(awk -v p="$mem_some_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-            psi_mem_status="WARN ⚠ (some: ${mem_some_pct}% - memory reclaim pressure)"
-        fi
-        dynamic_table+="Memory Pressure (PSI) | $psi_mem_status\n"
+            local psi_mem_status="PASS ✔ (some: ${mem_some_pct}%, full: ${mem_full_pct}%)"
+            if (( $(LC_ALL=C awk -v p="${mem_full_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+                psi_mem_status="FAIL ✖ (full: ${mem_full_pct}% - OOM thrashing detected)"
+            elif (( $(LC_ALL=C awk -v p="${mem_some_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+                psi_mem_status="WARN ⚠ (some: ${mem_some_pct}% - memory reclaim pressure)"
+            fi
+            dynamic_table+="Memory Pressure (PSI) | $psi_mem_status\n"
 
-        local psi_io_status="PASS ✔ (some: ${io_some_pct}%, full: ${io_full_pct}%)"
-        if (( $(awk -v p="$io_full_pct" 'BEGIN {print (p > 10.0) ? 1 : 0}') )); then
-            psi_io_status="FAIL ✖ (full: ${io_full_pct}% - severe disk I/O bottleneck)"
-        elif (( $(awk -v p="$io_some_pct" 'BEGIN {print (p > 5.0) ? 1 : 0}') )); then
-            psi_io_status="WARN ⚠ (some: ${io_some_pct}% - elevated disk I/O wait)"
+            local psi_io_status="PASS ✔ (some: ${io_some_pct}%, full: ${io_full_pct}%)"
+            if (( $(LC_ALL=C awk -v p="${io_full_pct:-0}" 'BEGIN {print (p+0 > 10.0) ? 1 : 0}') )); then
+                psi_io_status="FAIL ✖ (full: ${io_full_pct}% - severe disk I/O bottleneck)"
+            elif (( $(LC_ALL=C awk -v p="${io_some_pct:-0}" 'BEGIN {print (p+0 > 5.0) ? 1 : 0}') )); then
+                psi_io_status="WARN ⚠ (some: ${io_some_pct}% - elevated disk I/O wait)"
+            fi
+            dynamic_table+="Disk I/O Pressure (PSI) | $psi_io_status\n"
+        else
+            dynamic_table+="CPU Pressure (PSI) | INFO ℹ (kernel PSI unsupported or disabled: psi=0)\n"
+            dynamic_table+="Memory Pressure (PSI) | INFO ℹ (kernel PSI unsupported or disabled: psi=0)\n"
+            dynamic_table+="Disk I/O Pressure (PSI) | INFO ℹ (kernel PSI unsupported or disabled: psi=0)\n"
         fi
-        dynamic_table+="Disk I/O Pressure (PSI) | $psi_io_status\n"
 
         if $gpu_avail; then
             local gpu_stat="PASS ✔ (${vram_used}/${vram_total} MB [${gpu_pstate}], ${gpu_temp}°C)"
@@ -9047,7 +9117,7 @@ run_dynamic_sample() {
                 net_stat="FAIL ✖ (100% loss - gateway unreachable)"
             elif (( loss_pct > 0 )); then
                 net_stat="WARN ⚠ (${loss_pct}% loss, avg ${rtt_avg}ms, jitter ${rtt_mdev}ms)"
-            elif (( $(awk -v j="$rtt_mdev" 'BEGIN {print (j > 5.0) ? 1 : 0}') )); then
+            elif (( $(LC_ALL=C awk -v j="${rtt_mdev:-0}" 'BEGIN {print (j+0 > 5.0) ? 1 : 0}') )); then
                 net_stat="WARN ⚠ (jitter ${rtt_mdev}ms - high network variability)"
             fi
             dynamic_table+="Gateway Ping & Jitter | $net_stat\n"
@@ -11267,6 +11337,11 @@ fi
 
 if [[ "$ACTION" == "sample" ]]; then
     run_dynamic_sample "$SAMPLE_SECS" "$OUTPUT_JSON"
+    exit $?
+fi
+
+if [[ "$ACTION" == "report" ]]; then
+    show_report
     exit $?
 fi
 
