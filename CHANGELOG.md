@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.47] - 2026-10-03
+
+### Fixed & Hardened (SRE Architectural Audit - TUI ANSI Table Alignment Hotfix / PATCH-040)
+- **MOD-14 TUI, ANSI & Report Engine Alignment Hotfix (`render_audit_section` / PATCH-040)**:
+  - Eliminated format string argument desynchronization (`10 specifiers : 9 arguments`) in row rendering `printf`.
+  - Restored uniform `$c_border` styling (`\033[38;5;240m`) across all middle dividers and outer right borders, eliminating color bleeding where line 1 rendered bright white dividers while wrapped continuation rows rendered dark gray.
+  - Restored column padding space (`\033[38;5;240m│ `) to eliminate unpadded text collisions (`│PASS`).
+  - Added Fixture 15.3 in `dev-tools/test-suite.sh` simulating interactive PTY table rendering with continuation row boundary checks.
+  - Expanded hermetic regression test suite to 68/68 passing tests (100% PASS).
+
 ## [2.46] - 2026-10-03
 
 ### Fixed & Hardened (SRE Architectural Audit - Dynamic Flight Recorder & TUI Report Engine / PATCH-038 & PATCH-039)
