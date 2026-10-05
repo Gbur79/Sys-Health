@@ -2164,13 +2164,38 @@ triage_orphan_packages() {
                     printf '%s\n' "${options[@]}" | gum choose --no-limit \
                         --cursor="› " \
                         --cursor.foreground="81" \
-                        --header="Select packages to REMOVE (Space to toggle, Enter to confirm):"
+                        --cursor-prefix="[ ] " \
+                        --unselected-prefix="[ ] " \
+                        --selected-prefix="[✔] " \
+                        --selected.foreground="82" \
+                        --header="SELECT PACKAGES TO REMOVE (Press [SPACE] to mark [✔], [ENTER] to confirm):"
                 )"; then
                     info "Package selection cancelled."
                     rm -rf -- "$workdir"
                     return 0
                 fi
-                [[ -z "$selected" ]] && { info "No packages selected. Aborted."; rm -rf -- "$workdir"; return 0; }
+                if [[ -z "$selected" ]]; then
+                    if (( ${#options[@]} == 1 )); then
+                        local single_item="${options[0]}"
+                        local single_pkg="${single_item%% *}"
+                        echo ""
+                        warn "No package was marked with [Space]."
+                        if gum confirm --default=true "Did you want to remove '$single_pkg'?"; then
+                            to_remove+=("$single_pkg")
+                        else
+                            info "No packages selected. Aborted."
+                            rm -rf -- "$workdir"
+                            return 0
+                        fi
+                    else
+                        echo ""
+                        warn "No packages were marked with [Space]!"
+                        info "Tip: In interactive selection, press SPACEBAR to check [✔] each package, then press ENTER."
+                        echo ""
+                        rm -rf -- "$workdir"
+                        return 0
+                    fi
+                fi
 
                 while IFS= read -r item; do
                     [[ -z "$item" ]] && continue
@@ -2198,13 +2223,38 @@ triage_orphan_packages() {
                     printf '%s\n' "${protect_options[@]}" | gum choose --no-limit \
                         --cursor="› " \
                         --cursor.foreground="81" \
-                        --header="Select packages to PROTECT as explicitly installed (Space to toggle, Enter):"
+                        --cursor-prefix="[ ] " \
+                        --unselected-prefix="[ ] " \
+                        --selected-prefix="[✔] " \
+                        --selected.foreground="82" \
+                        --header="SELECT PACKAGES TO PROTECT (Press [SPACE] to mark [✔], [ENTER] to confirm):"
                 )"; then
                     info "Protection selection cancelled."
                     rm -rf -- "$workdir"
                     return 0
                 fi
-                [[ -z "$selected" ]] && { info "No packages chosen for protection."; rm -rf -- "$workdir"; return 0; }
+                if [[ -z "$selected" ]]; then
+                    if (( ${#protect_options[@]} == 1 )); then
+                        local single_item="${protect_options[0]}"
+                        local single_pkg="${single_item%% *}"
+                        echo ""
+                        warn "No package was marked with [Space]."
+                        if gum confirm --default=true "Did you want to mark '$single_pkg' as explicitly installed?"; then
+                            to_protect+=("$single_pkg")
+                        else
+                            info "No packages chosen for protection."
+                            rm -rf -- "$workdir"
+                            return 0
+                        fi
+                    else
+                        echo ""
+                        warn "No packages were marked with [Space]!"
+                        info "Tip: In interactive selection, press SPACEBAR to check [✔] each package, then press ENTER."
+                        echo ""
+                        rm -rf -- "$workdir"
+                        return 0
+                    fi
+                fi
 
                 while IFS= read -r item; do
                     [[ -z "$item" ]] && continue
