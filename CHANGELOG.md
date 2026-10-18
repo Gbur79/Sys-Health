@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.48] - 2026-10-18
+
+### Fixed & Hardened (SRE Architectural Audit - Desktop Indexers & Journal Rate Limit / PATCH-041)
+- **MOD-07 System Services & Indexer Triage (`check_desktop_indexers` & `check_journal_flood` / PATCH-041)**:
+  - Added multi-user KDE Baloo (Plasma 5 & 6), GNOME LocalSearch (`localsearch-3.service`), and legacy Tracker (`tracker-miner-fs-3.service`) health discovery via active systemd user managers (`user@*.service`), eliminating caller/root privilege bias.
+  - Implemented non-failing evaluation for intentional disablement/inactivity (e.g. `Indexing-Enabled=false`), asserting `PASS ✔` without machine-specific branding or false-alarm warnings.
+  - Added bounded, unit-scoped journal inspection during detected restart/activation spikes, capturing LMDB corruption signatures (`MDB_CORRUPTED`, `mdb_put`, `segmentation fault`) into actionable `WARN ⚠` states without destructive disk mutations.
+  - Added structured journald rate-limit and log throttling discovery using the native `SD_MESSAGE_JOURNAL_DROPPED` message ID (`fc2e22bc6ee647b6b90729ab34a250b1`) over a 15-minute sliding window with typed dropped counts and bounded source-group hints.
+  - Hardened journal disk-usage parser against systemd numeric outputs lacking explicit 'B' suffixes (e.g. `158.8M`).
+- **MOD-08 AI Telemetry & JSON Contract (`generate_summary_json` / PATCH-041)**:
+  - Added schema-2.0 additive checks for `desktop_indexers` (multi-user observations array with integer database bytes and boolean flags) and `journal_rate_limit` (disk bytes, dropped messages, and access coverage).
+  - Prepared structured JSON contracts for zero-cost SysPilot desktop tray and triage decoupling without background process thrashing.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh`)**:
+  - Added Part 16: Desktop Indexers & Journal Rate Limit (5 hermetic fixtures: Baloo disabled-by-policy, corruption loop, GNOME LocalSearch discovery, journal throttling event, and disk usage byte parsing).
+  - Expanded test suite coverage from 68/68 to 73/73 tests passing (100% PASS).
+
 ## [2.47] - 2026-10-03
 
 ### Fixed & Hardened (SRE Architectural Audit - TUI ANSI Table Alignment Hotfix / PATCH-040)
