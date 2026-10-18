@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.47
+# Arch System Health & Diagnostics v2.48
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.47"
+VERSION="2.48"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2168,7 +2168,7 @@ triage_orphan_packages() {
                         --unselected-prefix="[ ] " \
                         --selected-prefix="[✔] " \
                         --selected.foreground="82" \
-                        --header="SELECT PACKAGES TO REMOVE (Press [SPACE] to mark [✔], [ENTER] to confirm):"
+                        --header="SELECT PACKAGES TO REMOVE (Press [x] / [TAB] to mark [✔], [ENTER] to confirm):"
                 )"; then
                     info "Package selection cancelled."
                     rm -rf -- "$workdir"
@@ -2179,7 +2179,7 @@ triage_orphan_packages() {
                         local single_item="${options[0]}"
                         local single_pkg="${single_item%% *}"
                         echo ""
-                        warn "No package was marked with [Space]."
+                        warn "No package was marked with [x] / [TAB]."
                         if gum confirm --default=true "Did you want to remove '$single_pkg'?"; then
                             to_remove+=("$single_pkg")
                         else
@@ -2189,8 +2189,8 @@ triage_orphan_packages() {
                         fi
                     else
                         echo ""
-                        warn "No packages were marked with [Space]!"
-                        info "Tip: In interactive selection, press SPACEBAR to check [✔] each package, then press ENTER."
+                        warn "No packages were marked with [x] / [TAB]!"
+                        info "Tip: In interactive selection, press [x] / [TAB] to check [✔] each package, then press ENTER."
                         echo ""
                         rm -rf -- "$workdir"
                         return 0
@@ -2227,7 +2227,7 @@ triage_orphan_packages() {
                         --unselected-prefix="[ ] " \
                         --selected-prefix="[✔] " \
                         --selected.foreground="82" \
-                        --header="SELECT PACKAGES TO PROTECT (Press [SPACE] to mark [✔], [ENTER] to confirm):"
+                        --header="SELECT PACKAGES TO PROTECT (Press [x] / [TAB] to mark [✔], [ENTER] to confirm):"
                 )"; then
                     info "Protection selection cancelled."
                     rm -rf -- "$workdir"
@@ -2238,7 +2238,7 @@ triage_orphan_packages() {
                         local single_item="${protect_options[0]}"
                         local single_pkg="${single_item%% *}"
                         echo ""
-                        warn "No package was marked with [Space]."
+                        warn "No package was marked with [x] / [TAB]."
                         if gum confirm --default=true "Did you want to mark '$single_pkg' as explicitly installed?"; then
                             to_protect+=("$single_pkg")
                         else
@@ -2248,8 +2248,8 @@ triage_orphan_packages() {
                         fi
                     else
                         echo ""
-                        warn "No packages were marked with [Space]!"
-                        info "Tip: In interactive selection, press SPACEBAR to check [✔] each package, then press ENTER."
+                        warn "No packages were marked with [x] / [TAB]!"
+                        info "Tip: In interactive selection, press [x] / [TAB] to check [✔] each package, then press ENTER."
                         echo ""
                         rm -rf -- "$workdir"
                         return 0
@@ -5967,6 +5967,314 @@ check_failed_services() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.48 | PATCH-041 | Fixtures: test-suite.sh Part 16]
+
+_patch041_user_contexts() {
+    local sys_root="${SYS_HEALTH_ROOT:-}"
+    local unit uid passwd_entry uname home
+
+    if (( EUID == 0 )); then
+        while read -r unit; do
+            [[ -n "$unit" ]] || continue
+            uid="${unit#user@}"
+            uid="${uid%.service}"
+            [[ "$uid" =~ ^[0-9]+$ ]] || continue
+
+            passwd_entry="$(getent passwd "$uid" 2>/dev/null || true)"
+            [[ -n "$passwd_entry" ]] || continue
+            IFS=: read -r uname _ _ _ _ home _ <<< "$passwd_entry"
+            [[ -n "$home" ]] || continue
+            if [[ -n "$sys_root" && "$home" == /* ]]; then
+                home="${sys_root%/}${home}"
+            fi
+            printf '%s\t%s\t%s\n' "$uid" "$uname" "$home"
+        done < <(
+            systemctl list-units 'user@*.service' --state=active \
+                --no-legend --plain --no-pager 2>/dev/null |
+                awk '{print $1}'
+        )
+    else
+        passwd_entry="$(getent passwd "$EUID" 2>/dev/null || true)"
+        if [[ -n "$passwd_entry" ]]; then
+            IFS=: read -r uname _ _ _ _ home _ <<< "$passwd_entry"
+        else
+            uname="$(id -un 2>/dev/null || printf 'UID-%s' "$EUID")"
+            home="${HOME:-}"
+        fi
+        if [[ -n "$sys_root" && "$home" == /* && "$home" != "$sys_root"* ]]; then
+            home="${sys_root%/}${home}"
+        fi
+        [[ -n "$home" ]] && printf '%s\t%s\t%s\n' "$EUID" "$uname" "$home"
+    fi
+}
+
+_patch041_user_systemctl() {
+    local uid="$1"
+    shift
+
+    if (( EUID == 0 )); then
+        systemctl --user -M "${uid}@" "$@"
+    else
+        systemctl --user "$@"
+    fi
+}
+
+_patch041_recent_user_unit_logs() {
+    local uid="$1" unit="$2"
+
+    if (( EUID == 0 )); then
+        timeout 4s journalctl -q -b 0 --since '-15 min' -n 200 \
+            --no-pager -o cat "_UID=$uid" "_SYSTEMD_USER_UNIT=$unit" 2>/dev/null || true
+    else
+        timeout 4s journalctl -q --user -b 0 --since '-15 min' -n 200 \
+            --no-pager -o cat -u "$unit" 2>/dev/null || true
+    fi
+}
+
+_patch041_tree_bytes() {
+    local path="$1" bytes
+    [[ -d "$path" ]] || return 1
+    bytes="$(du -s -B1 -- "$path" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$bytes"
+}
+
+check_desktop_indexers() {
+    # MOD-08 consumes these globals in its existing one-shot JSON serializer.
+    DESKTOP_INDEXER_STATUS="info"
+    DESKTOP_INDEXER_COVERAGE="active_user_managers"
+    DESKTOP_INDEXER_OBSERVATIONS_TSV=""
+
+    local baloo_hint=0 localsearch_hint=0 tracker_hint=0 installed_any=0
+    command -v balooctl6 >/dev/null 2>&1 && baloo_hint=1
+    command -v balooctl  >/dev/null 2>&1 && baloo_hint=1
+    command -v localsearch >/dev/null 2>&1 && localsearch_hint=1
+    command -v tracker3 >/dev/null 2>&1 && tracker_hint=1
+    (( baloo_hint || localsearch_hint || tracker_hint )) && installed_any=1
+
+    local contexts=0 found=0 active_count=0 disabled_count=0 warn_count=0
+    local uid uname home env_raw xdg_config xdg_data spec engine unit hint
+    local props load active sub restarts recent errors activity state enabled
+    local db_bytes line
+
+    while IFS=$'\t' read -r uid uname home; do
+        [[ "$uid" =~ ^[0-9]+$ && -n "$home" ]] || continue
+        ((contexts++)) || true
+
+        env_raw="$(_patch041_user_systemctl "$uid" show-environment 2>/dev/null || true)"
+        xdg_config="$(awk -F= '$1 == "XDG_CONFIG_HOME" {sub(/^[^=]*=/, ""); print; exit}' <<< "$env_raw")"
+        xdg_data="$(awk -F= '$1 == "XDG_DATA_HOME" {sub(/^[^=]*=/, ""); print; exit}' <<< "$env_raw")"
+        [[ "$xdg_config" == /* ]] || xdg_config="${XDG_CONFIG_HOME:-$home/.config}"
+        [[ "$xdg_data" == /* ]] || xdg_data="${XDG_DATA_HOME:-$home/.local/share}"
+
+        for spec in \
+            "baloo|kde-baloo.service|$baloo_hint" \
+            "localsearch|localsearch-3.service|$localsearch_hint" \
+            "tracker3|tracker-miner-fs-3.service|$tracker_hint"
+        do
+            IFS='|' read -r engine unit hint <<< "$spec"
+            props="$(_patch041_user_systemctl "$uid" --no-pager show "$unit" \
+                --property=LoadState --property=ActiveState --property=SubState \
+                --property=NRestarts 2>/dev/null || true)"
+            load="$(awk -F= '$1 == "LoadState" {print $2}' <<< "$props")"
+            active="$(awk -F= '$1 == "ActiveState" {print $2}' <<< "$props")"
+            sub="$(awk -F= '$1 == "SubState" {print $2}' <<< "$props")"
+            restarts="$(awk -F= '$1 == "NRestarts" {print $2}' <<< "$props")"
+            [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+
+            [[ "$hint" == 1 || ( -n "$load" && "$load" != "not-found" ) ]] || continue
+            ((found++)) || true
+
+            state="${active:-unknown}"
+            [[ -n "$sub" && "$sub" != "dead" ]] && state+="/$sub"
+            enabled="unknown"
+            db_bytes=-1
+            errors=0
+            activity=0
+
+            if [[ "$engine" == "baloo" ]]; then
+                if grep -Eiq '^[[:space:]]*Indexing-Enabled[[:space:]]*=[[:space:]]*false[[:space:]]*$' \
+                    "$xdg_config/baloofilerc" 2>/dev/null; then
+                    state="disabled"
+                    enabled="false"
+                    ((disabled_count++)) || true
+                elif grep -Eiq '^[[:space:]]*Indexing-Enabled[[:space:]]*=[[:space:]]*true[[:space:]]*$' \
+                    "$xdg_config/baloofilerc" 2>/dev/null; then
+                    enabled="true"
+                fi
+
+                if db_bytes="$(_patch041_tree_bytes "$xdg_data/baloo" 2>/dev/null)"; then
+                    :
+                else
+                    db_bytes=-1
+                fi
+            fi
+
+            if [[ "$active" == "active" || "$active" == "activating" ]]; then
+                ((active_count++)) || true
+                [[ "$enabled" == "unknown" ]] && enabled="true"
+            fi
+
+            # Expensive log probe is conditional, bounded, and unit-scoped.
+            if (( restarts >= 2 )) || [[ "$active" == "activating" || "$active" == "failed" ]]; then
+                recent="$(_patch041_recent_user_unit_logs "$uid" "$unit")"
+                errors="$(grep -Eic \
+                    'MDB_(CORRUPTED|PAGE_NOTFOUND|PANIC|INVALID)|LMDB.*(error|corrupt)|database.*corrupt|mdb_(assert|put)|segmentation fault|core dump|KCrash' \
+                    <<< "$recent" || true)"
+                activity="$(grep -Eic \
+                    'Starting |Started |Main process exited|Scheduled restart job|Failed with result' \
+                    <<< "$recent" || true)"
+                [[ "$errors" =~ ^[0-9]+$ ]] || errors=0
+                [[ "$activity" =~ ^[0-9]+$ ]] || activity=0
+            fi
+
+            if (( errors >= 2 || (restarts >= 3 && activity >= 3) )); then
+                state="restart_or_corruption_loop"
+                ((warn_count++)) || true
+            fi
+
+            printf -v line '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$engine" "$uid" "$uname" "$state" "$enabled" "$unit" \
+                "$db_bytes" "$restarts" "$errors" "900"
+            DESKTOP_INDEXER_OBSERVATIONS_TSV+="$line"$'\n'
+        done
+    done < <(_patch041_user_contexts)
+
+    if (( warn_count > 0 )); then
+        DESKTOP_INDEXER_STATUS="warn"
+        add_row "Desktop Indexers" "WARN ⚠ ($warn_count restart/corruption loop)" "SYS"
+        ((WARNINGS++)) || true
+    elif (( contexts == 0 )); then
+        DESKTOP_INDEXER_STATUS="info"
+        if (( installed_any )); then
+            add_row "Desktop Indexers" "INFO ℹ (installed; no active user manager)" "SYS"
+        else
+            add_row "Desktop Indexers" "INFO ℹ (none detected)" "SYS"
+        fi
+    elif (( active_count > 0 || disabled_count > 0 )); then
+        DESKTOP_INDEXER_STATUS="pass"
+        add_row "Desktop Indexers" \
+            "PASS ✔ ($active_count active, $disabled_count disabled by policy)" "SYS"
+    elif (( found > 0 )); then
+        DESKTOP_INDEXER_STATUS="info"
+        add_row "Desktop Indexers" "INFO ℹ (installed, inactive/not requested)" "SYS"
+    else
+        DESKTOP_INDEXER_STATUS="info"
+        add_row "Desktop Indexers" "INFO ℹ (none detected)" "SYS"
+    fi
+
+    log "HEALTH desktop_indexers=${DESKTOP_INDEXER_STATUS^^} contexts=$contexts engines=$found active=$active_count disabled=$disabled_count loops=$warn_count"
+}
+
+_patch041_journal_usage() {
+    local raw number suffix factor bytes human
+    raw="$(LC_ALL=C journalctl --disk-usage 2>/dev/null)" || return 1
+
+    if [[ "$raw" =~ ([0-9]+([.][0-9]+)?)[[:space:]]*([KMGTPE]?)(i?B)?([[:space:]]|$) ]]; then
+        number="${BASH_REMATCH[1]}"
+        suffix="${BASH_REMATCH[3]}"
+        human="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+        case "$suffix" in
+            K) factor=1024 ;;
+            M) factor=1048576 ;;
+            G) factor=1073741824 ;;
+            T) factor=1099511627776 ;;
+            P) factor=1125899906842624 ;;
+            E) factor=1152921504606846976 ;;
+            *) factor=1 ;;
+        esac
+        bytes="$(awk -v n="$number" -v f="$factor" 'BEGIN {printf "%.0f", n * f}')"
+        printf '%s\t%s\n' "$bytes" "$human"
+        return 0
+    fi
+    return 1
+}
+
+check_journal_flood() {
+    local readonly dropped_message_id="fc2e22bc6ee647b6b90729ab34a250b1"
+    local usage record query_ok=1 line message="" dropped="" culprit="unknown"
+    local groups
+
+    JOURNAL_RATE_STATUS="unknown"
+    JOURNAL_RATE_COVERAGE="user"
+    JOURNAL_RATE_WINDOW_SECONDS=900
+    JOURNAL_RATE_LIMITED="false"
+    JOURNAL_RATE_LATEST_DROPPED=0
+    JOURNAL_RATE_SOURCE_GROUP=""
+    JOURNAL_DISK_USAGE_BYTES=-1
+    JOURNAL_DISK_USAGE_HUMAN="unknown"
+
+    if usage="$(_patch041_journal_usage)"; then
+        IFS=$'\t' read -r JOURNAL_DISK_USAGE_BYTES JOURNAL_DISK_USAGE_HUMAN <<< "$usage"
+    fi
+
+    groups=" $(id -nG 2>/dev/null || true) "
+    if (( EUID == 0 )) || [[ "$groups" == *" systemd-journal "* || "$groups" == *" adm "* || "$groups" == *" wheel "* ]]; then
+        JOURNAL_RATE_COVERAGE="system"
+    fi
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        query_ok=0
+        record=""
+    elif ! record="$(LC_ALL=C timeout 4s journalctl -q -b 0 --since '-15 min' \
+        -r -n 1 "MESSAGE_ID=$dropped_message_id" --no-pager -o export \
+        --output-fields=MESSAGE,N_DROPPED 2>/dev/null)"; then
+        query_ok=0
+        record=""
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            MESSAGE=*) message="${line#MESSAGE=}" ;;
+            N_DROPPED=*) dropped="${line#N_DROPPED=}" ;;
+        esac
+    done <<< "$record"
+
+    if [[ ! "$dropped" =~ ^[0-9]+$ ]] && \
+       [[ "$message" =~ ^Suppressed[[:space:]]+([0-9]+)[[:space:]]+messages[[:space:]]+from[[:space:]]+(.+)$ ]]; then
+        dropped="${BASH_REMATCH[1]}"
+    fi
+    [[ "$dropped" =~ ^[0-9]+$ ]] || dropped=0
+
+    if [[ "$message" =~ ^Suppressed[[:space:]]+[0-9]+[[:space:]]+messages[[:space:]]+from[[:space:]]+(.+)$ ]]; then
+        culprit="${BASH_REMATCH[1]}"
+    fi
+    culprit="${culprit//$'\n'/ }"
+    culprit="${culprit//$'\r'/ }"
+    culprit="${culprit:0:96}"
+
+    if (( dropped > 0 )); then
+        JOURNAL_RATE_STATUS="warn"
+        JOURNAL_RATE_LIMITED="true"
+        JOURNAL_RATE_LATEST_DROPPED="$dropped"
+        JOURNAL_RATE_SOURCE_GROUP="$culprit"
+        add_row "Journal Rate Limit" \
+            "WARN ⚠ ($dropped dropped; source group: $culprit)" "SYS"
+        ((WARNINGS++)) || true
+        log "HEALTH journal_rate_limit=WARN dropped=$dropped source_group='$culprit' window_s=900 disk_bytes=$JOURNAL_DISK_USAGE_BYTES coverage=$JOURNAL_RATE_COVERAGE"
+        if [[ -n "${LOG_FILE:-}" ]]; then
+            {
+                echo "### JOURNAL RATE-LIMIT EVENT (LAST 15 MINUTES)"
+                printf 'N_DROPPED=%s SOURCE_GROUP=%s\n' "$dropped" "$culprit"
+            } >> "$LOG_FILE"
+        fi
+    elif (( query_ok == 0 )); then
+        JOURNAL_RATE_STATUS="unknown"
+        add_row "Journal Rate Limit" "INFO ℹ (journal query unavailable)" "SYS"
+        log "HEALTH journal_rate_limit=UNKNOWN disk_bytes=$JOURNAL_DISK_USAGE_BYTES coverage=$JOURNAL_RATE_COVERAGE"
+    elif [[ "$JOURNAL_RATE_COVERAGE" != "system" ]]; then
+        JOURNAL_RATE_STATUS="info"
+        add_row "Journal Rate Limit" \
+            "INFO ℹ (no visible event; partial journal access, disk: $JOURNAL_DISK_USAGE_HUMAN)" "SYS"
+        log "HEALTH journal_rate_limit=INFO visible_event=0 window_s=900 disk_bytes=$JOURNAL_DISK_USAGE_BYTES coverage=user"
+    else
+        JOURNAL_RATE_STATUS="pass"
+        add_row "Journal Rate Limit" \
+            "PASS ✔ (no rate-limit event in 15m; disk: $JOURNAL_DISK_USAGE_HUMAN)" "SYS"
+        log "HEALTH journal_rate_limit=PASS window_s=900 disk_bytes=$JOURNAL_DISK_USAGE_BYTES coverage=system"
+    fi
+}
+
 check_sysrq() {
     local sysrq_val="?"
     if [[ -f /proc/sys/kernel/sysrq ]]; then
@@ -7596,6 +7904,18 @@ generate_summary_json() {
                     fix="Inspect failed units: systemctl --failed (or systemctl --user --failed)"
                     risk="LOW"
                     ;;
+                desktop_indexers)
+                    code="SYS_DESKTOP_INDEXER_LOOP"
+                    summary="Desktop file indexer (Baloo/LocalSearch/Tracker) restart or corruption loop detected"
+                    fix="Inspect unit status with systemctl --user status kde-baloo.service (or localsearch-3.service) and check logs"
+                    risk="HIGH"
+                    ;;
+                journal_rate_limit)
+                    code="SYS_JOURNAL_RATE_LIMITED"
+                    summary="Systemd-journald is dropping messages due to runaway log producer"
+                    fix="Identify and address runaway logging service: journalctl -u systemd-journald -e"
+                    risk="MEDIUM"
+                    ;;
                 sysrq)
                     code="SYS_SYSRQ_RESTRICTED"
                     summary="Emergency Magic SysRq recovery keys are disabled"
@@ -7750,6 +8070,56 @@ generate_summary_json() {
     chassis_detected="$(detect_chassis)"
     local session_type_detected="${XDG_SESSION_TYPE:-unknown}"
 
+    # Build observations array for desktop_indexers
+    local indexer_obs_json="[]"
+    if [[ -n "${DESKTOP_INDEXER_OBSERVATIONS_TSV:-}" ]] && command -v jq &>/dev/null; then
+        local obs_items=()
+        while IFS=$'\t' read -r eng u_id u_name st en un d_bytes r_cnt err_cnt w_sec; do
+            [[ -n "$eng" ]] || continue
+            local d_bytes_json="null" en_json="null"
+            [[ "$d_bytes" =~ ^[0-9]+$ ]] && (( d_bytes >= 0 )) && d_bytes_json="$d_bytes"
+            [[ "$en" == "true" ]] && en_json="true"
+            [[ "$en" == "false" ]] && en_json="false"
+            local obs_item
+            obs_item="$(jq -nc \
+                --arg engine "$eng" \
+                --argjson uid "${u_id:-0}" \
+                --arg username "$u_name" \
+                --arg state "$st" \
+                --argjson enabled "$en_json" \
+                --arg unit "$un" \
+                --argjson database_bytes "$d_bytes_json" \
+                --argjson restart_count "${r_cnt:-0}" \
+                --argjson recent_error_count "${err_cnt:-0}" \
+                --argjson window_seconds "${w_sec:-900}" \
+                '{
+                    engine: $engine,
+                    uid: $uid,
+                    username: $username,
+                    state: $state,
+                    enabled: $enabled,
+                    unit: $unit,
+                    database_bytes: $database_bytes,
+                    restart_count: $restart_count,
+                    recent_error_count: $recent_error_count,
+                    window_seconds: $window_seconds
+                }')"
+            obs_items+=("$obs_item")
+        done <<< "$DESKTOP_INDEXER_OBSERVATIONS_TSV"
+        if (( ${#obs_items[@]} > 0 )); then
+            indexer_obs_json="$(printf '%s\n' "${obs_items[@]}" | jq -s . 2>/dev/null || echo '[]')"
+        fi
+    fi
+
+    local j_limited_json=false
+    [[ "${JOURNAL_RATE_LIMITED:-}" == "true" ]] && j_limited_json=true
+    local j_disk_bytes_json="null"
+    [[ "${JOURNAL_DISK_USAGE_BYTES:-}" =~ ^[0-9]+$ ]] && (( JOURNAL_DISK_USAGE_BYTES >= 0 )) && j_disk_bytes_json="$JOURNAL_DISK_USAGE_BYTES"
+    local j_source_group_json="null"
+    if [[ -n "${JOURNAL_RATE_SOURCE_GROUP:-}" ]]; then
+        j_source_group_json="$(jq -nc --arg sg "$JOURNAL_RATE_SOURCE_GROUP" '$sg')"
+    fi
+
     if command -v jq &>/dev/null; then
         jq -n \
             --arg schema "2.0" \
@@ -7767,6 +8137,17 @@ generate_summary_json() {
             --arg chassis "$chassis_detected" \
             --arg session "$session_type_detected" \
             --arg drivers "$drivers" \
+            --arg d_idx_status "${DESKTOP_INDEXER_STATUS:-info}" \
+            --arg d_idx_cov "${DESKTOP_INDEXER_COVERAGE:-active_user_managers}" \
+            --argjson d_idx_obs "$indexer_obs_json" \
+            --arg j_status "${JOURNAL_RATE_STATUS:-unknown}" \
+            --arg j_cov "${JOURNAL_RATE_COVERAGE:-user}" \
+            --argjson j_win "${JOURNAL_RATE_WINDOW_SECONDS:-900}" \
+            --argjson j_limited "$j_limited_json" \
+            --argjson j_dropped "${JOURNAL_RATE_LATEST_DROPPED:-0}" \
+            --argjson j_src "$j_source_group_json" \
+            --argjson j_bytes "$j_disk_bytes_json" \
+            --arg j_human "${JOURNAL_DISK_USAGE_HUMAN:-unknown}" \
             --argjson sec_actionable "${ARCH_AUDIT_ACTIONABLE_COUNT:-0}" \
             --argjson sec_tracker "${ARCH_AUDIT_TRACKER_COUNT:-0}" \
             --argjson aur_pkgs "$aur_pkg_count" \
@@ -7783,6 +8164,23 @@ generate_summary_json() {
                 counts: {errors: $errors, warnings: $warnings},
                 flagged: $flagged,
                 actionable_remediations: $remediations,
+                checks: {
+                    desktop_indexers: {
+                        status: $d_idx_status,
+                        coverage: $d_idx_cov,
+                        observations: $d_idx_obs
+                    },
+                    journal_rate_limit: {
+                        status: $j_status,
+                        coverage: $j_cov,
+                        window_seconds: $j_win,
+                        rate_limited: $j_limited,
+                        latest_dropped_messages: $j_dropped,
+                        source_group: $j_src,
+                        disk_usage_bytes: $j_bytes,
+                        disk_usage_human: $j_human
+                    }
+                },
                 environment: {
                     os: $os,
                     kernel: $kernel,
@@ -7857,6 +8255,8 @@ run_health_check() {
     # --- 3. SYSTEM HEALTH & SERVICES ---
     check_root_space
     check_failed_services
+    check_desktop_indexers
+    check_journal_flood
     check_sysrq
     check_pacman_lock
     check_package_integrity
@@ -8207,6 +8607,12 @@ reconstruct_tables_from_log() {
                     ucount="${ucount%% *}"
                     AUDIT_TABLE_SYS+="Systemd failed (user) | WARN ⚠ (${ucount:-$val} failed)\n"
                 fi
+                ;;
+            desktop_indexers)
+                AUDIT_TABLE_SYS+="$(_format_audit_row "Desktop Indexers" "$val" "$details")\n"
+                ;;
+            journal_rate_limit)
+                AUDIT_TABLE_SYS+="$(_format_audit_row "Journal Rate Limit" "$val" "$details")\n"
                 ;;
             sysrq)
                 if [[ "$details" =~ upstream_policy ]]; then
