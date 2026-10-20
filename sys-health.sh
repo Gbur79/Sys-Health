@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.48
+# Arch System Health & Diagnostics v2.49
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.48"
+VERSION="2.49"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -2864,81 +2864,244 @@ _validate_mirrorlist_content() {
     fi
 }
 
+_mirrorlist_db_path() {
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local db_path=""
+
+    if command -v pacman-conf &>/dev/null; then
+        db_path="$(pacman-conf -c "$conf" DBPath 2>/dev/null)" || db_path=""
+    fi
+    [[ "$db_path" == /* ]] || db_path="/var/lib/pacman"
+    printf '%s\n' "${db_path%/}"
+}
+
+_snapshot_mirrorlist_pacnew() {
+    local target_file="$1"
+    local -n out_state="$2"
+    local -n out_hash="$3"
+    local -n out_owner="$4"
+    local pacnew="${target_file}.pacnew"
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+
+    out_state=""
+    out_hash=""
+    out_owner=""
+
+    [[ "${SYS_HEALTH_RETIRE_MIRRORLIST_PACNEW:-1}" != "0" ]] || return 0
+    [[ -e "$pacnew" || -L "$pacnew" ]] || return 0
+
+    if [[ ! -f "$pacnew" || -L "$pacnew" ]]; then
+        warn "Preserving $pacnew: candidate is not a regular non-symlink file."
+        return 0
+    fi
+    if [[ "$(stat -Lc '%u' -- "$pacnew" 2>/dev/null)" != "0" ]]; then
+        warn "Preserving $pacnew: candidate is not owned by root."
+        return 0
+    fi
+    if ! command -v pacman &>/dev/null; then
+        warn "Preserving $pacnew: pacman ownership cannot be verified."
+        return 0
+    fi
+
+    out_owner="$(pacman --config "$conf" -Qqo "$target_file" 2>/dev/null | head -n 1)"
+    if [[ -z "$out_owner" ]]; then
+        warn "Preserving $pacnew: $target_file is not owned by an installed package."
+        return 0
+    fi
+
+    out_state="$(stat -Lc '%d:%i:%s:%Y:%Z:%u:%g:%a' -- "$pacnew" 2>/dev/null)" || {
+        out_state=""
+        return 0
+    }
+    out_hash="$(sha256sum -- "$pacnew" 2>/dev/null | awk '{print $1}')"
+    [[ -n "$out_hash" ]] || out_state=""
+}
+
+_retire_unchanged_mirrorlist_pacnew() {
+    local target_file="$1"
+    local expected_target_hash="$2"
+    local snap_state="$3"
+    local snap_hash="$4"
+    local snap_owner="$5"
+    local target_name="$6"
+    local pacnew="${target_file}.pacnew"
+    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
+    local db_path current_state current_hash current_owner target_hash retired
+    local -a root_cmd=()
+
+    [[ -n "$snap_state" && -n "$snap_hash" && -n "$snap_owner" ]] || return 0
+    (( EUID == 0 )) || root_cmd=(sudo --)
+
+    if [[ ! -f "$pacnew" || -L "$pacnew" ]]; then
+        warn "Preserving $target_name .pacnew state: candidate disappeared or changed type."
+        return 0
+    fi
+
+    current_state="$(stat -Lc '%d:%i:%s:%Y:%Z:%u:%g:%a' -- "$pacnew" 2>/dev/null)" || return 0
+    current_hash="$(sha256sum -- "$pacnew" 2>/dev/null | awk '{print $1}')"
+    current_owner="$(pacman --config "$conf" -Qqo "$target_file" 2>/dev/null | head -n 1)"
+    target_hash="$(sha256sum -- "$target_file" 2>/dev/null | awk '{print $1}')"
+
+    if [[ "$current_state" != "$snap_state" || "$current_hash" != "$snap_hash" ]]; then
+        warn "Preserving $pacnew: it changed while mirrors were refreshed."
+        log "MAINTENANCE mirrorlist_pacnew=preserved target=$target_name reason=changed_during_refresh"
+        return 0
+    fi
+    if [[ "$current_owner" != "$snap_owner" || "$target_hash" != "$expected_target_hash" ]]; then
+        warn "Preserving $pacnew: target ownership or verified content changed."
+        log "MAINTENANCE mirrorlist_pacnew=preserved target=$target_name reason=target_changed"
+        return 0
+    fi
+
+    db_path="$(_mirrorlist_db_path)"
+    if [[ -e "$db_path/db.lck" ]]; then
+        warn "Preserving $pacnew: a pacman transaction is active."
+        log "MAINTENANCE mirrorlist_pacnew=preserved target=$target_name reason=pacman_locked"
+        return 0
+    fi
+
+    retired="${target_file}.sys-health-retired-pacnew.$(date -u +%Y%m%dT%H%M%SZ).$$.${RANDOM}"
+    while [[ -e "$retired" || -L "$retired" ]]; do
+        retired="${target_file}.sys-health-retired-pacnew.$(date -u +%Y%m%dT%H%M%SZ).$$.${RANDOM}"
+    done
+
+    if "${root_cmd[@]}" mv -T -- "$pacnew" "$retired"; then
+        "${root_cmd[@]}" chmod 0600 -- "$retired" 2>/dev/null || true
+        ok "$target_name stale .pacnew retired safely to $retired."
+        log "MAINTENANCE mirrorlist_pacnew=retired target=$target_name owner_pkg=$snap_owner sha256=$snap_hash archive=$retired"
+    else
+        warn "Could not retire $pacnew; the verified mirrorlist remains installed and .pacnew was preserved."
+        log "MAINTENANCE mirrorlist_pacnew=preserved target=$target_name reason=rename_failed"
+    fi
+}
+
+# [SRE-AUDIT: CERTIFIED | Sol v2.49 | PATCH-MIRROR-PACNEW-001 | Fixtures: test-suite.sh Part 17]
 _apply_staged_mirrorlist() {
     local staged_file="$1"
     local target_file="$2"
     local target_name="${3:-$(basename "$target_file")}"
+    local target_dir target_base db_path staged_hash tmp_hash target_hash
+    local install_tmp="" backup_file="" target_servers=0
+    local pacnew_state="" pacnew_hash="" pacnew_owner=""
+    local backup_created=false target_existed=false
+    local -a root_cmd=()
 
-    if [[ ! -s "$staged_file" ]]; then
-        fail "Internal error: Staged mirrorlist for $target_name is missing or empty."
+    if [[ ! -s "$staged_file" || ! -f "$staged_file" || -L "$staged_file" ]]; then
+        fail "Internal error: staged mirrorlist for $target_name is missing, empty, or unsafe."
         return 1
     fi
+    command -v sha256sum &>/dev/null || {
+        fail "sha256sum is required for transactional mirrorlist verification."
+        return 1
+    }
 
-    # 1. Concurrency Gate: Check for active pacman transaction lock
-    local conf="${PACMAN_CONF:-/etc/pacman.conf}"
-    local db_path="/var/lib/pacman"
-    if command -v pacman-conf &>/dev/null; then
-        db_path="$(pacman-conf ${conf:+-c "$conf"} DBPath 2>/dev/null || echo /var/lib/pacman)"
+    target_dir="$(dirname -- "$target_file")"
+    target_base="$(basename -- "$target_file")"
+    if [[ ! -d "$target_dir" || -L "$target_dir" ]]; then
+        fail "Unsafe mirrorlist target directory: $target_dir"
+        return 1
     fi
-    if [[ -f "${db_path%/}/db.lck" ]]; then
-        fail "Cannot update $target_name: pacman database is locked (${db_path%/}/db.lck)."
+    if [[ -e "$target_file" || -L "$target_file" ]]; then
+        if [[ ! -f "$target_file" || -L "$target_file" ]]; then
+            fail "Refusing to replace non-regular or symlink target $target_file."
+            return 1
+        fi
+        target_existed=true
+    fi
+
+    db_path="$(_mirrorlist_db_path)"
+    if [[ -e "$db_path/db.lck" ]]; then
+        fail "Cannot update $target_name: pacman database is locked ($db_path/db.lck)."
         log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=pacman_locked"
         return 1
     fi
 
-    # 2. Privilege Gate: Verify sudo authorization
     if (( EUID != 0 )); then
-        if ! sudo -v 2>/dev/null; then
+        sudo -v 2>/dev/null || {
             fail "Sudo authentication required to update $target_file."
             log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=sudo_auth_failed"
             return 1
-        fi
+        }
+        root_cmd=(sudo --)
     fi
 
-    # 3. Unique Safety Backup: Record per-run backup with guaranteed rollback
-    local backup_file="${target_file}.sys-health-bak.$$.${RANDOM}"
-    local backup_created=false
-    if [[ -f "$target_file" ]]; then
-        if sudo cp -a "$target_file" "$backup_file" 2>/dev/null; then
+    staged_hash="$(sha256sum -- "$staged_file" | awk '{print $1}')"
+    _snapshot_mirrorlist_pacnew "$target_file" pacnew_state pacnew_hash pacnew_owner
+
+    if $target_existed; then
+        backup_file="${target_file}.sys-health-bak.$$.${RANDOM}"
+        while [[ -e "$backup_file" || -L "$backup_file" ]]; do
+            backup_file="${target_file}.sys-health-bak.$$.${RANDOM}"
+        done
+        if "${root_cmd[@]}" cp -a -- "$target_file" "$backup_file" 2>/dev/null; then
             backup_created=true
         else
-            fail "Failed to create atomic safety backup for $target_name ($backup_file). Mutation aborted."
+            fail "Failed to create safety backup for $target_name; mutation aborted."
             log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=backup_failed"
             return 1
         fi
     fi
 
-    # 4. Atomic Installation
-    if ! sudo install -m 644 "$staged_file" "$target_file" 2>/dev/null; then
-        fail "Failed to install staged mirrorlist into $target_file."
-        if $backup_created; then
-            sudo cp -a "$backup_file" "$target_file" 2>/dev/null || true
-            sudo rm -f "$backup_file" 2>/dev/null || true
-        fi
-        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=install_failed"
+    install_tmp="$("${root_cmd[@]}" mktemp -p "$target_dir" ".${target_base}.sys-health.XXXXXX")" || install_tmp=""
+    if [[ -z "$install_tmp" ]] || ! "${root_cmd[@]}" install -m 0644 -- "$staged_file" "$install_tmp"; then
+        [[ -n "$install_tmp" ]] && "${root_cmd[@]}" rm -f -- "$install_tmp" 2>/dev/null || true
+        $backup_created && "${root_cmd[@]}" rm -f -- "$backup_file" 2>/dev/null || true
+        fail "Failed to prepare atomic mirrorlist for $target_name."
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=prepare_failed"
         return 1
     fi
 
-    # 5. Post-Installation Verification Gate
-    local target_servers=0
-    target_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {count++} END {print count+0}' "$target_file" 2>/dev/null || echo 0)"
-    if (( target_servers == 0 )); then
-        fail "Post-install verification failed for $target_name (0 valid servers found). Rolling back..."
-        if $backup_created; then
-            sudo cp -a "$backup_file" "$target_file" 2>/dev/null || true
-            sudo rm -f "$backup_file" 2>/dev/null || true
-        fi
-        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=post_verify_empty"
+    tmp_hash="$(sha256sum -- "$install_tmp" 2>/dev/null | awk '{print $1}')"
+    target_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {n++} END {print n+0}' "$install_tmp" 2>/dev/null)"
+    if [[ "$tmp_hash" != "$staged_hash" ]] || (( target_servers == 0 )); then
+        "${root_cmd[@]}" rm -f -- "$install_tmp" 2>/dev/null || true
+        $backup_created && "${root_cmd[@]}" rm -f -- "$backup_file" 2>/dev/null || true
+        fail "Prepared mirrorlist verification failed for $target_name."
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=prepared_verify_failed"
         return 1
     fi
 
-    # 6. Transaction Success: Safely clean up unique backup
+    if [[ -e "$db_path/db.lck" ]] || ! "${root_cmd[@]}" mv -fT -- "$install_tmp" "$target_file"; then
+        "${root_cmd[@]}" rm -f -- "$install_tmp" 2>/dev/null || true
+        $backup_created && "${root_cmd[@]}" rm -f -- "$backup_file" 2>/dev/null || true
+        fail "Atomic publication aborted for $target_name."
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=publish_failed_or_locked"
+        return 1
+    fi
+    install_tmp=""
+
+    target_hash="$(sha256sum -- "$target_file" 2>/dev/null | awk '{print $1}')"
+    target_servers="$(awk '/^[[:space:]]*Server[[:space:]]*=/ {n++} END {print n+0}' "$target_file" 2>/dev/null)"
+    if [[ "$target_hash" != "$staged_hash" ]] || (( target_servers == 0 )); then
+        fail "Post-install verification failed for $target_name."
+        if [[ "$target_hash" == "$staged_hash" ]]; then
+            if $backup_created; then
+                if ! "${root_cmd[@]}" mv -fT -- "$backup_file" "$target_file"; then
+                    fail "Rollback failed; safety backup retained at $backup_file."
+                    log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=rollback_failed backup=$backup_file"
+                    return 1
+                fi
+                backup_created=false
+            elif ! $target_existed; then
+                "${root_cmd[@]}" rm -f -- "$target_file" 2>/dev/null || true
+            fi
+        else
+            warn "Target changed concurrently; backup retained at $backup_file and no destructive rollback was attempted."
+        fi
+        log "MAINTENANCE mirrorlist_update=failed target=$target_name reason=post_verify_failed"
+        return 1
+    fi
+
+    _retire_unchanged_mirrorlist_pacnew \
+        "$target_file" "$staged_hash" "$pacnew_state" "$pacnew_hash" "$pacnew_owner" "$target_name"
+
     if $backup_created; then
-        sudo rm -f "$backup_file" 2>/dev/null || true
+        "${root_cmd[@]}" rm -f -- "$backup_file" 2>/dev/null || \
+            warn "Verified update succeeded, but backup cleanup failed: $backup_file"
     fi
 
     ok "$target_name mirrorlist staged, verified ($target_servers servers), and updated."
-    log "MAINTENANCE mirrorlist_update=success target=$target_name servers=$target_servers"
+    log "MAINTENANCE mirrorlist_update=success target=$target_name servers=$target_servers sha256=$staged_hash"
     return 0
 }
 
