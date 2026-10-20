@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.49] - 2026-10-20
+
+### Fixed & Hardened (SRE Architectural Audit - Transactional Mirrorlist Publication & Pacnew Retirement / PATCH-MIRROR-PACNEW-001)
+- **MOD-11 Network L7, Mirror Ranking & Pacnew Auto-Retirement (`_apply_staged_mirrorlist`, `refresh_and_rank_mirrors` / PATCH-MIRROR-PACNEW-001)**:
+  - Implemented atomic staging publication via root-owned `mktemp -p "$target_dir"` and same-filesystem `mv -fT`, replacing non-atomic in-place `install`.
+  - Added strict symlink, directory safety, and dynamic pacman DB lock (`$db_path/db.lck`) checking prior to staging and final publication.
+  - Implemented pre-mutation identity/hash snapshot (`_snapshot_mirrorlist_pacnew`) capturing inode, size, mtime, ctime, uid, gid, mode, SHA-256 and ALPM package ownership.
+  - Implemented safe, post-verification retirement of stale `.pacnew` mirrorlists (`_retire_unchanged_mirrorlist_pacnew`), moving unchanged `.pacnew` files into secure 0600 technical archives (`*.sys-health-retired-pacnew.*`) upon verified update.
+  - Guaranteed fail-closed `.pacnew` preservation for concurrent modifications during ranking, active pacman transactions, non-root ownership, symlink targets, or direct-writer rankers (CachyOS / Manjaro).
+  - Added hermetic regression test suite Part 17 covering `.pacnew` retirement success, symlink guard preservation, and post-verification rollback integrity.
+  - Expanded test suite coverage from 73/73 to 76/76 tests passing (100% PASS).
+
 ## [2.48] - 2026-10-18
 
 ### Fixed & Hardened (SRE Architectural Audit - Desktop Indexers & Journal Rate Limit / PATCH-041)
