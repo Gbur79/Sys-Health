@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.50] - 2026-10-22
+
+### Fixed & Hardened (SRE Architectural Audit - System Health & Services Hardening / ARGON-20261022-MOD-07-HARDENING)
+- **MOD-07 System Health & Services (`check_root_space`, `check_sysrq`, `add_row`)**:
+  - Hardened `check_root_space` with 3-second timeout protection on `df -P` to prevent hangs on unresponsive or degraded mounts.
+  - Added proactive inode exhaustion detection (`df -Pi`) flagging `FAIL ✖` when filesystem inodes exceed 95% capacity.
+  - Enhanced `check_sysrq` evaluation to support dynamic bitmask inspection (`(sysrq_val & 176) == 176`), correctly acknowledging safe custom/upstream REISUB policies.
+  - Fixed fallback category routing in `add_row` by mapping "Desktop Indexers", "Journal Rate Limit", and "Orphan packages" to the `SYS` table.
+- **Hermetic Regression Test Suite Expansion (`dev-tools/test-suite.sh`)**:
+  - Hardened Fixture 14.1 against interactive `gum spin` shell function shadowing.
+  - All 76/76 regression tests passing (100% PASS).
+
 ## [2.49] - 2026-10-20
 
 ### Fixed & Hardened (SRE Architectural Audit - Transactional Mirrorlist Publication & Pacnew Retirement / PATCH-MIRROR-PACNEW-001)
