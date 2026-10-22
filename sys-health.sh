@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.49
+# Arch System Health & Diagnostics v2.50
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.49"
+VERSION="2.50"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -446,7 +446,7 @@ add_row() {
             "CPU microcode"*|"GPU runtime"*|"GPU errors & lockups"|"DKMS"*|"CPU temperature"|"SMART disk health"|"Audio subsystem"*|"SSD/NVMe TRIM timer"|"Power & Battery"*)
                 sec="HW"
                 ;;
-            "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys")
+            "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys"|"Desktop Indexers"*|"Journal Rate Limit"*|"Orphan packages"*)
                 sec="SYS"
                 ;;
             "Network link & Gateway"*|"System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist"*)
@@ -5991,9 +5991,19 @@ check_root_space() {
                 ro_mounts+=("$mnt")
             fi
 
-            local usage
-            usage="$(df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}')"
+            local usage inodes_usage
+            usage="$(timeout 3s df -P "$mnt" 2>/dev/null | awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}')"
+            inodes_usage="$(timeout 3s df -Pi "$mnt" 2>/dev/null | awk 'NR==2 {gsub(/[^0-9]/,"",$5); print $5+0}')"
             [[ -z "$usage" ]] && continue
+
+            if [[ -n "$inodes_usage" ]] && (( inodes_usage >= 95 )); then
+                add_row "Root disk space" "FAIL ✖ ($mnt inodes full: ${inodes_usage}%)" "SYS"
+                ((ERRORS++))
+                log "HEALTH root_space=FAIL status=inodes_exhausted mount=$mnt usage=${inodes_usage}%"
+                worst_usage=100
+                worst_mount="$mnt"
+                continue
+            fi
             checked_mounts+=("$mnt: ${usage}%")
             if (( usage > worst_usage )); then
                 worst_usage="$usage"
@@ -6447,7 +6457,7 @@ check_sysrq() {
     if [[ "$sysrq_val" == "1" ]]; then
         add_row "Magic SysRq keys" "PASS ✔ (full emergency control enabled)" "SYS"
         log "HEALTH sysrq=PASS val=1"
-    elif [[ "$sysrq_val" =~ ^(16|176|22)$ ]]; then
+    elif [[ "$sysrq_val" =~ ^[0-9]+$ ]] && { [[ "$sysrq_val" =~ ^(16|22)$ ]] || (( (sysrq_val & 176) == 176 )); }; then
         add_row "Magic SysRq keys" "PASS ✔ (safe upstream default: val=$sysrq_val)" "SYS"
         log "HEALTH sysrq=PASS val=$sysrq_val upstream_policy"
     elif [[ "$sysrq_val" == "0" ]]; then
