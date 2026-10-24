@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.50
+# Arch System Health & Diagnostics v2.52
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.50"
+VERSION="2.52"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -210,7 +210,7 @@ fi
 
 # Sudo credentials management (interactive prompts vs batch best-effort)
 HAVE_SUDO=0
-if [[ "$ACTION" != "sample" && "$ACTION" != "software" && "$ACTION" != "report" && "$ACTION" != "test" ]]; then
+if [[ "$ACTION" != "sample" && "$ACTION" != "software" && "$ACTION" != "report" && "$ACTION" != "test" && "$ACTION" != "gaming" ]]; then
     if sudo -n true 2>/dev/null; then
         HAVE_SUDO=1
     elif [[ "$ACTION" == "interactive" ]]; then
@@ -5349,8 +5349,9 @@ check_gpu() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.45 | PATCH-037 | Fixtures: test-suite.sh Part 5]
+# [SRE-AUDIT: CERTIFIED | Sol v2.52 | PATCH-043 | Fixtures: test-suite.sh Part 5]
 check_gpu_errors() {
+    local root="${SYS_HEALTH_ROOT:-}"
     local vga_info drivers_in_use
     vga_info="$(lspci -k 2>/dev/null | grep -A 4 -Ei 'VGA|3D|Display' || true)"
     drivers_in_use="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' || true)"
@@ -5375,6 +5376,51 @@ check_gpu_errors() {
     local klog=""
     klog="$(journalctl -b 0 -k --no-pager 2>/dev/null || dmesg 2>/dev/null || true)"
 
+    # --- Wayland Compositor Telemetry (kwin_wayland, gnome-shell, Hyprland) ---
+    if $is_wayland; then
+        local comp_log=""
+        if [[ -z "$root" ]]; then
+            if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
+                comp_log="$(journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+            else
+                comp_log="$(journalctl --user -b 0 --no-pager 2>/dev/null || journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+            fi
+            if [[ -z "$comp_log" ]]; then
+                comp_log="$(journalctl -b 0 --no-pager 2>/dev/null || true)"
+            fi
+        else
+            # Test-suite harness compatibility
+            comp_log="$(journalctl -b 0 --user --no-pager 2>/dev/null || journalctl -b 0 --no-pager 2>/dev/null || true)"
+        fi
+
+        # 1. Critical Wayland GPU crashes, context losses, and pageflip timeouts
+        local wayland_crit=""
+        wayland_crit="$(printf '%s\n' "$comp_log" | grep -Ei "(kwin_wayland_drm: (Page flip timed out|Failed to create framebuffer|Presentation failed: No such device|GPU reset detected)|EGL_CONTEXT_LOST|Failed to create EGL context|Failed to make EGL context current|kwin_scene_opengl:.*GL_OUT_OF_MEMORY|plasma-kwin_wayland\.service: Main process exited, code=killed)" | head -n 1 || true)"
+        if [[ -n "$wayland_crit" ]]; then
+            detected_errors+=("Wayland compositor critical GPU error: $wayland_crit")
+        fi
+
+        # 2. Benign DPMS modeset / atomic commit jitter filter (DP 1.2 MST wakeups)
+        local modeset_fail_count
+        modeset_fail_count="$(printf '%s\n' "$comp_log" | grep -Eic "(kwin_wayland.*(Modeset failed|Atomic commit failed|Presentation failed)|gnome-shell.*(Failed to flip|Failed to set mode))" || true)"
+        modeset_fail_count="${modeset_fail_count:-0}"
+        modeset_fail_count="${modeset_fail_count//[^0-9]/}"
+
+        if (( modeset_fail_count > 0 )); then
+            local uptime_sec uptime_hours dynamic_threshold modeset_threshold
+            uptime_sec="$(awk '{print int($1)}' "${root}/proc/uptime" 2>/dev/null || awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 3600)"
+            uptime_hours=$(( (uptime_sec + 3599) / 3600 ))
+            dynamic_threshold=$(( 30 + (uptime_hours * 10) ))
+            modeset_threshold="${WAYLAND_MODESET_WARN_THRESHOLD:-$dynamic_threshold}"
+
+            if (( modeset_fail_count > modeset_threshold )); then
+                detected_errors+=("$modeset_fail_count modeset/atomic commit stalls in Wayland compositor (threshold: $modeset_threshold)")
+            else
+                detected_notes+=("Minor modeset jitter ($modeset_fail_count events in Wayland compositor) - normal DPMS transitions")
+            fi
+        fi
+    fi
+
     # --- NVIDIA Diagnostics ---
     if [[ "$drivers_in_use" == *"nvidia"* ]]; then
         local nv_xid
@@ -5389,6 +5435,7 @@ check_gpu_errors() {
             detected_errors+=("NVIDIA DRM/KMS error in kernel log: $nv_drm_err")
         fi
 
+        # Legacy X11 fliplock stalls
         if ! $is_wayland && pgrep -x "Xorg|X" &>/dev/null; then
             local xorg_log="/var/log/Xorg.0.log"
             local user_home="${HOME}"
@@ -5397,9 +5444,8 @@ check_gpu_errors() {
             fi
             [[ ! -f "$xorg_log" && -f "$user_home/.local/share/xorg/Xorg.0.log" ]] && xorg_log="$user_home/.local/share/xorg/Xorg.0.log"
 
-            # Verify whether Xorg log is fresh from the current boot session
             local btime=0
-            btime="$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)"
+            btime="$(awk '/btime/ {print $2}' "${root}/proc/stat" 2>/dev/null || awk '/btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)"
             local log_mtime=0
             if [[ -f "$xorg_log" ]]; then
                 log_mtime="$(stat -c %Y "$xorg_log" 2>/dev/null || echo 0)"
@@ -5411,11 +5457,11 @@ check_gpu_errors() {
                 fliplock_count="${fliplock_count:-0}"
                 fliplock_count="${fliplock_count//[^0-9]/}"
 
-                local uptime_sec
-                uptime_sec="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 3600)"
-                local uptime_hours=$(( (uptime_sec + 3599) / 3600 ))
-                local dynamic_threshold=$(( 30 + (uptime_hours * 10) ))
-                local fliplock_threshold="${FLIPLOCK_WARN_THRESHOLD:-$dynamic_threshold}"
+                local uptime_sec uptime_hours dynamic_threshold fliplock_threshold
+                uptime_sec="$(awk '{print int($1)}' "${root}/proc/uptime" 2>/dev/null || awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 3600)"
+                uptime_hours=$(( (uptime_sec + 3599) / 3600 ))
+                dynamic_threshold=$(( 30 + (uptime_hours * 10) ))
+                fliplock_threshold="${FLIPLOCK_WARN_THRESHOLD:-$dynamic_threshold}"
 
                 if (( fliplock_count > fliplock_threshold )); then
                     detected_errors+=("$fliplock_count fliplock stalls in Xorg (threshold: $fliplock_threshold)")
@@ -5435,7 +5481,7 @@ check_gpu_errors() {
         fi
     fi
 
-    # --- Intel Graphics Diagnostics (Hardened against false matches on normal GuC init) ---
+    # --- Intel Graphics Diagnostics ---
     if [[ "$drivers_in_use" == *"i915"* || "$drivers_in_use" == *"xe"* ]]; then
         local intel_err
         intel_err="$(printf '%s\n' "$klog" | grep -Ei "(i915.*GPU HANG|\bxe\b.*GPU HANG|i915_reset|\[drm\] \*ERROR\*.*xe|xe\s+[0-9a-fA-F:.]+\s*:\s*\[drm\].*(error|failed|timeout|fault)|i915: Failed to load DSP firmware|\bxe\b: probe failed|\[drm\] \*ERROR\* intel_)" | head -n 1 || true)"
@@ -7387,7 +7433,7 @@ check_arch_audit() {
 # Gaming & Steam readiness
 # ------------------------------------------------------------------------------
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.44 | PATCH-032 | Fixtures: test-suite.sh Part 13]
+# [SRE-AUDIT: CERTIFIED | Sol v2.50 | PATCH-042 | Fixtures: test-suite.sh Part 13]
 detect_gaming_system() {
     local target_home="${HOME}"
     if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
@@ -7395,14 +7441,19 @@ detect_gaming_system() {
     fi
     local root="${SYS_HEALTH_ROOT:-}"
 
-    # 1. Check for gaming client binaries
+    # 1. Check for gaming client binaries (host PATH or mock root bin)
     if command -v steam &>/dev/null || command -v wine &>/dev/null || command -v lutris &>/dev/null || \
        command -v heroic &>/dev/null || command -v bottles &>/dev/null || command -v gamescope &>/dev/null; then
         return 0
     fi
+    if [[ -n "$root" ]]; then
+        for bin in steam wine lutris heroic bottles gamescope; do
+            [[ -f "${root}/usr/bin/$bin" || -f "${root}/bin/$bin" ]] && return 0
+        done
+    fi
 
     # 2. Check for Flatpak gaming applications
-    if command -v flatpak &>/dev/null; then
+    if command -v flatpak &>/dev/null && [[ -z "$root" ]]; then
         if flatpak list --app 2>/dev/null | grep -qE 'com\.valvesoftware\.Steam|com\.heroicgameslauncher\.hgl|net\.lutris\.Lutris|com\.usebottles\.bottles'; then
             return 0
         fi
@@ -7418,8 +7469,14 @@ detect_gaming_system() {
         return 0
     fi
 
-    # 4. Check for gaming helper packages or 32-bit graphics stack via ALPM
-    if pacman -Qq 2>/dev/null | grep -qE '^(steam|lutris|heroic-games-launcher-bin|bottles|wine|wine-staging|protonup-qt|gamemode|mangohud|gamescope|lib32-vulkan-icd-loader)$'; then
+    # 4. Check for gaming helper packages or 32-bit graphics stack via ALPM (root-aware)
+    local alpm_pkgs=""
+    if [[ -n "$root" && -d "${root}/var/lib/pacman/local" ]]; then
+        alpm_pkgs="$(find "${root}/var/lib/pacman/local" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's|.*/||' | sed -E 's/-[0-9]+.*//' || true)"
+    else
+        alpm_pkgs="$(pacman -Qq 2>/dev/null || true)"
+    fi
+    if printf '%s\n' "$alpm_pkgs" | grep -qE '^(steam|lutris|heroic-games-launcher-bin|bottles|wine|wine-staging|protonup-qt|gamemode|mangohud|gamescope|lib32-vulkan-icd-loader)$'; then
         return 0
     fi
 
@@ -7730,7 +7787,7 @@ except Exception as e:
         log "HEALTH cpu_governor=INFO governor=$gov gamemode=none"
     fi
 
-    # 7. Desktop Session & Compositor Sync
+    # 7. Desktop Session, Wayland Explicit Sync & Compositor Tearing
     local session_type="${XDG_SESSION_TYPE:-unknown}"
     if [[ "$session_type" == "unknown" ]]; then
         if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
@@ -7740,23 +7797,96 @@ except Exception as e:
         fi
     fi
 
-    if [[ "${active_drivers[*]}" == *"nvidia"* && ( "$gpu_name" =~ 9[0-9]{2} || "$gpu_name" =~ Maxwell || "$vga_info" =~ GM204 ) ]]; then
-        if [[ "$session_type" == "x11" ]]; then
-            add_row "Desktop session & GPU" "PASS ✔ (X11 optimal for Maxwell | KWin bypass OK)" "GAME"
-            log "HEALTH desktop_session=PASS session=x11 gpu=maxwell"
-        elif [[ "$session_type" == "wayland" ]]; then
-            add_row "Desktop session & GPU" "INFO ℹ (Wayland on Maxwell/580xx - verify explicit sync)" "GAME"
-            log "HEALTH desktop_session=INFO session=wayland gpu=maxwell"
-        else
-            add_row "Desktop session & GPU" "INFO ℹ (Session: $session_type)" "GAME"
-            log "HEALTH desktop_session=INFO session=$session_type"
+    local compositor_name="unknown"
+    if [[ "$session_type" == "wayland" ]]; then
+        if pgrep -x kwin_wayland &>/dev/null || [[ "${XDG_CURRENT_DESKTOP:-}" =~ KDE|Plasma ]]; then
+            compositor_name="kwin_wayland"
+        elif pgrep -x mutter &>/dev/null || [[ "${XDG_CURRENT_DESKTOP:-}" =~ GNOME ]]; then
+            compositor_name="mutter"
+        elif pgrep -x Hyprland &>/dev/null; then
+            compositor_name="Hyprland"
+        elif pgrep -x sway &>/dev/null; then
+            compositor_name="sway"
+        elif pgrep -x gamescope &>/dev/null; then
+            compositor_name="gamescope"
         fi
-    elif [[ "$session_type" == "wayland" ]]; then
-        add_row "Desktop session & GPU" "PASS ✔ (Wayland session | native gaming compositor)" "GAME"
-        log "HEALTH desktop_session=PASS session=wayland"
     elif [[ "$session_type" == "x11" ]]; then
-        add_row "Desktop session & GPU" "PASS ✔ (X11 session | direct compositor unredirect)" "GAME"
-        log "HEALTH desktop_session=PASS session=x11"
+        compositor_name="${XDG_CURRENT_DESKTOP:-X11}"
+    fi
+
+    if [[ "$session_type" == "wayland" ]]; then
+        local syncobj_supported=false tearing_supported=false xwayland_ok=false
+        local -a session_notes=()
+
+        # 7a. Query active Wayland protocols via wayland-info (if available)
+        if command -v wayland-info &>/dev/null; then
+            local winfo
+            winfo="$(wayland-info 2>/dev/null || true)"
+            if printf '%s\n' "$winfo" | grep -q "wp_linux_drm_syncobj_manager_v1"; then
+                syncobj_supported=true
+            fi
+            if printf '%s\n' "$winfo" | grep -q "wp_tearing_control_v1"; then
+                tearing_supported=true
+            fi
+        fi
+
+        # 7b. Fallback compositor feature heuristics if wayland-info missing or in mock root
+        if ! $syncobj_supported; then
+            if [[ "$compositor_name" == "kwin_wayland" ]]; then
+                # Plasma 6 natively implements syncobj-v1 and tearing-v1
+                local kwin_ver
+                kwin_ver="$(kwin_wayland --version 2>/dev/null || plasmashell --version 2>/dev/null || echo "")"
+                if [[ "$kwin_ver" =~ [6-9]\.[0-9]+ ]]; then
+                    syncobj_supported=true
+                    tearing_supported=true
+                fi
+            fi
+        fi
+
+        # 7c. Inspect XWayland readiness for Steam / Proton titles
+        if command -v Xwayland &>/dev/null || [[ -f "${root}/usr/bin/Xwayland" ]]; then
+            xwayland_ok=true
+        fi
+
+        # 7d. NVIDIA KMS modeset audit (critical for Wayland stability)
+        local nvidia_modeset_ok=true
+        if [[ "${active_drivers[*]}" == *"nvidia"* ]]; then
+            local ms_val=""
+            # Check sysfs parameter if readable (root or mock root fixture)
+            if [[ -r "${root}/sys/module/nvidia_drm/parameters/modeset" ]]; then
+                ms_val="$(cat "${root}/sys/module/nvidia_drm/parameters/modeset" 2>/dev/null || echo "")"
+                if [[ "$ms_val" == "N" || "$ms_val" == "0" ]]; then
+                    nvidia_modeset_ok=false
+                fi
+            elif grep -qE 'nvidia[-_]drm\.modeset=0\b' "${root}/proc/cmdline" /proc/cmdline 2>/dev/null || \
+                 grep -qE '^\s*options\s+nvidia[-_]drm\s+modeset=0\b' "${root}/etc/modprobe.d/"*.conf /etc/modprobe.d/*.conf 2>/dev/null; then
+                nvidia_modeset_ok=false
+            fi
+        fi
+
+        # Evaluate verdict
+        if ! $nvidia_modeset_ok; then
+            add_row "Desktop session & GPU" "WARN ⚠ (NVIDIA Wayland requires nvidia-drm.modeset=1)" "GAME"
+            ((WARNINGS++))
+            log "HEALTH desktop_session=WARN session=wayland compositor=$compositor_name reason=nvidia_drm_modeset_disabled"
+        elif ! $xwayland_ok && $is_gamer; then
+            add_row "Desktop session & GPU" "WARN ⚠ (Wayland session missing xorg-xwayland for Steam)" "GAME"
+            ((WARNINGS++))
+            log "HEALTH desktop_session=WARN session=wayland xwayland=missing"
+        elif $syncobj_supported; then
+            local features="Explicit sync [syncobj-v1]"
+            if $tearing_supported; then
+                features="$features & tearing OK"
+            fi
+            add_row "Desktop session & GPU" "PASS ✔ (Wayland [$compositor_name] | $features)" "GAME"
+            log "HEALTH desktop_session=PASS session=wayland compositor=$compositor_name explicit_sync=yes tearing=$tearing_supported"
+        else
+            add_row "Desktop session & GPU" "PASS ✔ (Wayland [$compositor_name] | native gaming session)" "GAME"
+            log "HEALTH desktop_session=PASS session=wayland compositor=$compositor_name explicit_sync=unverified"
+        fi
+    elif [[ "$session_type" == "x11" ]]; then
+        add_row "Desktop session & GPU" "PASS ✔ (X11 [$compositor_name] | direct compositor unredirect)" "GAME"
+        log "HEALTH desktop_session=PASS session=x11 compositor=$compositor_name"
     else
         add_row "Desktop session & GPU" "INFO ℹ (Session: $session_type)" "GAME"
         log "HEALTH desktop_session=INFO session=$session_type"
