@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.56] - 2026-10-24
+
+### Fixed & Hardened (SRE Architectural Audit - Hardware & Wayland Modesetting / PATCH-044)
+* **Hardware & GPU (MOD-05):** Wdrożono dwuetapowe okno czasowe (temporal windowing) w `check_gpu_errors` (`journalctl --since '-10 min'`) eliminujące fałszywe alarmy `WARN ⚠` przy salwach próbkowania trybów EDID/MST podczas rozruchu Wayland (startup burst filter).
+* **Universal Wayland Compositor Telemetry:** Rozszerzono regex detekcji błędów modesettingu o kompozytory oparte na wlroots (`Hyprland`, `Sway`).
+* **Test Suite:** Dodano hermetyczny Fixture 5.8b w `dev-tools/test-suite.sh` weryfikujący bezbłędną degradację salwy startowej do statusu `PASS ✔` (11/11 testów w Part 5, 98/98 w całym zestawie).
+
+### Added & Hardened (SRE Architectural Audit - Selective Evidence AI-Context & CI Workflow / PAKIET 3 / PATCH-015 & PATCH-016)
+- **MOD-08 AI Telemetry & Selective Evidence Routing (`sys-health --ai-context`, PATCH-015)**:
+  - Added dedicated CLI option `sys-health --ai-context` producing an ultra-compact, token-lean diagnostic envelope (<800 tokens, 100% ANSI-free JSON) specifically tailored for LLM agents (Goose, SysPilot, Claude Code, Cursor).
+  - Implemented dynamic cache freshness and staleness detection (`cache_stale: true/false`, `age_seconds: N`) with a 300-second (5-minute) TTL gate.
+  - Implemented graceful fallback when no previous audit is present (clean `UNKNOWN` status JSON with guidance to run `--audit`).
+  - Implemented dynamic Selective Evidence Routing in `ACTION_REQUIRED` and `REVIEW_WARNINGS` states:
+    - Failed systemd services (system or user): extracts failing unit name, status, and up to 20 lines of `journalctl` logs into `evidence.systemd`.
+    - GPU and DKMS advisories: extracts sections 3–6 of `software-state.txt` into `evidence.gpu_dkms`.
+    - Bootloader, initramfs, and kernel issues: extracts sections 7–9b of `software-state.txt` into `evidence.boot_storage`.
+  - In `ALL_CLEAR` healthy state, evidence payloads are omitted (`evidence: {}`), keeping token consumption at ~400 tokens (<1500 bytes).
+- **GitHub Actions CI Automation (`.github/workflows/ci.yml`, PATCH-016)**:
+  - Created automated CI pipeline for open-source repository maintaining multi-hardware Arch Linux portability.
+  - Validates bash syntax (`bash -n`) across all executable scripts (`sys-health.sh`, `slice.sh`, `test-suite.sh`).
+  - Enforces ShellCheck linting without errors or style regressions.
+  - Executes hermetic regression test suite in isolated root.
+  - Enforces machine telemetry contract verification (strict JSON validation, zero ANSI escape sequences, byte budget thresholds).
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Added Part 19 with 6 new test fixtures covering `--ai-context` fallback, `ALL_CLEAR` byte budgets, selective evidence routing for systemd, GPU/DKMS, bootloader/initramfs, and cache staleness TTL.
+  - All 97/97 tests passing (100% PASS).
+
+---
+
+## [2.54] - 2026-10-24
+
+### Added & Hardened (SRE Architectural Audit - Network Topology Mock-Suite & 4-State Determinist / PAKIET 2 / PATCH-033 & PATCH-017)
+- **MOD-11 Network & Topology Resilience Mock-Suite (PATCH-033)**:
+  - Hermetyczny zestaw testów routingu i topologii w `dev-tools/test-suite.sh` (Part 18): testy braku bramy domyślnej, odporności na fałszywe alarmy `metered connection` na interfejsach wirtualnych/mostkach oraz wsparcia dla routerów stealth (pfSense ICMP drop).
+  - Uszczelniono detekcję połączeń taryfowych NetworkManager (`metered connection`). Interfejsy wirtualne, mostki i tunele (`virbr*`, `docker*`, `br-*`, `tailscale*`, `tun*`, `wg*`, `tap*`, `veth*`, `zt*`) są ignorowane, a ostrzeżenie `WARN ⚠` jest zastrzeżone wyłącznie dla fizycznych interfejsów Ethernet (`^(en[a-z0-9]+|eth[0-9]+)$`).
+  - Rozszerzono odporność na zaporowe bramy sieciowe pfSense o pełną paletę stanów sąsiedztwa ARP (`REACHABLE|DELAY|STALE|PERMANENT|PROBE`) oraz sondy IPv6 dla sieci pure-IPv6.
+- **Czterostanowy Deterministyczny Model Statusów (PATCH-017)**:
+  - Wyeliminowanie cichych powrotów (`return` bez `add_row`) w `check_fstrim()` i `check_arch_news()` przy braku narzędzi (`systemctl`, `curl`) lub w środowiskach offline/non-systemd.
+  - Wyeliminowanie bezwarunkowego fałszywego `PASS ✔ (AC Desktop power)` w `check_power()` na maszynach wirtualnych (KVM/QEMU), kontenerach (`INFO ℹ`) oraz laptopach z niewykrytą baterią (`WARN ⚠`).
+  - `detect_chassis()`: Dodano wsparcie dla wirtualizacji (`systemd-detect-virt`) oraz rozszerzonych identyfikatorów SMBIOS tabletów i hybryd (chassis 30, 31, 32).
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Rozszerzono zestaw testów regresyjnych o Part 18 (7 nowych testów fixture).
+  - Wszystkie 91/91 testów przechodzi pomyślnie (100% PASS).
+
+---
+
+## [2.53] - 2026-10-24
+
+### Added & Hardened (SRE Architectural Audit - Context-Aware Services Triage & Mirror Telemetry / PAKIET 1 / PATCH-035 & PATCH-044)
+- **MOD-07 System Health & Services (`check_failed_services`, Issue #5)**:
+  - Extracted primary failed unit name (`unit=$first_svc` for system units, `unit=$first_user_svc` for user units) in `HEALTH` log lines.
+  - Implemented contextual, unit-specific actionable remediations in `generate_summary_json()` with direct `journalctl` inspection and `reset-failed` commands.
+  - Added dedicated explanations for known Arch/EOS oneshot maintenance timers (`systemd-tmpfiles-clean.service`, `fstrim.service`, `plocate-updatedb.service`, `btrfs-scrub@*.service`, `logrotate.service`).
+  - Enforced strict unprivileged user session context (`systemctl --user`, strictly zero `sudo`).
+  - Added regression Fixture 4.4 in `dev-tools/test-suite.sh` validating unit extraction and triage commands.
+- **MOD-08 & MOD-11 Network & AI Telemetry (`check_mirrorlist_age`, `generate_summary_json`, SysPilot ISSUE-DDE9)**:
+  - Preserved active mirror state across global variables (`MIRROR_PRIMARY_DEAD`, `MIRROR_PRIMARY_ALIVE`, `MIRROR_ARCH_AGE_DAYS`, `MIRROR_ARCH_SERVERS`, `MIRROR_DISTRO_AGE_DAYS`, `MIRROR_DISTRO_SERVERS`, `MIRROR_STATUS_LABEL`, `MIRROR_STATUS`).
+  - Added additive `checks.mirrors` object to `summary.json` (schema 2.0) exposing mirror status, latency/reachability, and server counts for desktop dashboards and applets without extra network requests.
+  - Added regression Test 1.6 in `dev-tools/test-suite.sh` asserting schema 2.0 mirrors contract.
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Expanded regression test suite to 84 hermetic tests across 17 parts.
+  - All 84/84 tests passing (100% PASS).
+
 ## [2.52] - 2026-10-23
 
 ### Fixed & Hardened (SRE Architectural Audit - Wayland Compositor GPU Telemetry Hardening / PATCH-043 / ARGON-20261023-MOD-005)
