@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.56] - 2026-10-24
 
-### Fixed & Hardened (SRE Architectural Audit - Hardware & Wayland Modesetting / PATCH-044)
-* **Hardware & GPU (MOD-05):** Wdrożono dwuetapowe okno czasowe (temporal windowing) w `check_gpu_errors` (`journalctl --since '-10 min'`) eliminujące fałszywe alarmy `WARN ⚠` przy salwach próbkowania trybów EDID/MST podczas rozruchu Wayland (startup burst filter).
-* **Universal Wayland Compositor Telemetry:** Rozszerzono regex detekcji błędów modesettingu o kompozytory oparte na wlroots (`Hyprland`, `Sway`).
-* **Test Suite:** Dodano hermetyczny Fixture 5.8b w `dev-tools/test-suite.sh` weryfikujący bezbłędną degradację salwy startowej do statusu `PASS ✔` (11/11 testów w Part 5, 98/98 w całym zestawie).
+### Fixed & Hardened (EOS-SRE Architectural Audit - Hardware & Wayland Modesetting / PATCH-044)
+* **Hardware & GPU (MOD-05):** Implemented two-stage temporal windowing in `check_gpu_errors` (`journalctl --since '-10 min'`) eliminating false-positive `WARN ⚠` alerts during EDID/MST mode-probing bursts at Wayland startup (startup burst filter).
+* **Universal Wayland Compositor Telemetry:** Extended modesetting error detection regex to cover wlroots-based compositors (`Hyprland`, `Sway`).
+* **Test Suite:** Added hermetic Fixture 5.8b to `dev-tools/test-suite.sh` verifying seamless degradation of the startup burst to `PASS ✔` status (11/11 tests in Part 5, 98/98 overall suite).
 
-### Added & Hardened (SRE Architectural Audit - Selective Evidence AI-Context & CI Workflow / PAKIET 3 / PATCH-015 & PATCH-016)
+### Added & Hardened (EOS-SRE Architectural Audit - Selective Evidence AI-Context & CI Workflow / BUNDLE 3 / PATCH-015 & PATCH-016)
 - **MOD-08 AI Telemetry & Selective Evidence Routing (`sys-health --ai-context`, PATCH-015)**:
   - Added dedicated CLI option `sys-health --ai-context` producing an ultra-compact, token-lean diagnostic envelope (<800 tokens, 100% ANSI-free JSON) specifically tailored for LLM agents (Goose, SysPilot, Claude Code, Cursor).
   - Implemented dynamic cache freshness and staleness detection (`cache_stale: true/false`, `age_seconds: N`) with a 300-second (5-minute) TTL gate.
@@ -38,18 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.54] - 2026-10-24
 
-### Added & Hardened (SRE Architectural Audit - Network Topology Mock-Suite & 4-State Determinist / PAKIET 2 / PATCH-033 & PATCH-017)
+### Added & Hardened (EOS-SRE Architectural Audit - Network Topology Mock-Suite & 4-State Determinism / BUNDLE 2 / PATCH-033 & PATCH-017)
 - **MOD-11 Network & Topology Resilience Mock-Suite (PATCH-033)**:
-  - Hermetyczny zestaw testów routingu i topologii w `dev-tools/test-suite.sh` (Part 18): testy braku bramy domyślnej, odporności na fałszywe alarmy `metered connection` na interfejsach wirtualnych/mostkach oraz wsparcia dla routerów stealth (pfSense ICMP drop).
-  - Uszczelniono detekcję połączeń taryfowych NetworkManager (`metered connection`). Interfejsy wirtualne, mostki i tunele (`virbr*`, `docker*`, `br-*`, `tailscale*`, `tun*`, `wg*`, `tap*`, `veth*`, `zt*`) są ignorowane, a ostrzeżenie `WARN ⚠` jest zastrzeżone wyłącznie dla fizycznych interfejsów Ethernet (`^(en[a-z0-9]+|eth[0-9]+)$`).
-  - Rozszerzono odporność na zaporowe bramy sieciowe pfSense o pełną paletę stanów sąsiedztwa ARP (`REACHABLE|DELAY|STALE|PERMANENT|PROBE`) oraz sondy IPv6 dla sieci pure-IPv6.
-- **Czterostanowy Deterministyczny Model Statusów (PATCH-017)**:
-  - Wyeliminowanie cichych powrotów (`return` bez `add_row`) w `check_fstrim()` i `check_arch_news()` przy braku narzędzi (`systemctl`, `curl`) lub w środowiskach offline/non-systemd.
-  - Wyeliminowanie bezwarunkowego fałszywego `PASS ✔ (AC Desktop power)` w `check_power()` na maszynach wirtualnych (KVM/QEMU), kontenerach (`INFO ℹ`) oraz laptopach z niewykrytą baterią (`WARN ⚠`).
-  - `detect_chassis()`: Dodano wsparcie dla wirtualizacji (`systemd-detect-virt`) oraz rozszerzonych identyfikatorów SMBIOS tabletów i hybryd (chassis 30, 31, 32).
+  - Hermetic routing and topology test suite in `dev-tools/test-suite.sh` (Part 18): test fixtures for default gateway absence, resilience against false-positive `metered connection` alerts on virtual interfaces/bridges, and support for stealth routers (pfSense ICMP drop).
+  - Hardened NetworkManager metered connection detection. Virtual interfaces, bridges, and tunnels (`virbr*`, `docker*`, `br-*`, `tailscale*`, `tun*`, `wg*`, `tap*`, `veth*`, `zt*`) are ignored, restricting `WARN ⚠` alerts strictly to physical Ethernet interfaces (`^(en[a-z0-9]+|eth[0-9]+)$`).
+  - Extended resilience for pfSense firewall gateways to cover the complete set of ARP neighbor states (`REACHABLE|DELAY|STALE|PERMANENT|PROBE`) as well as IPv6 neighbor probes for pure-IPv6 networks.
+- **Four-State Deterministic Status Model (PATCH-017)**:
+  - Eliminated silent returns (`return` without `add_row`) in `check_fstrim()` and `check_arch_news()` when external tools are missing (`systemctl`, `curl`) or running in offline/non-systemd environments.
+  - Eliminated unconditional false `PASS ✔ (AC Desktop power)` in `check_power()` inside virtual machines (KVM/QEMU), containers (`INFO ℹ`), and laptops with missing/undetected batteries (`WARN ⚠`).
+  - `detect_chassis()`: Added virtualization detection support (`systemd-detect-virt`) and extended SMBIOS chassis IDs for tablets and convertibles (chassis 30, 31, 32).
 - **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
-  - Rozszerzono zestaw testów regresyjnych o Part 18 (7 nowych testów fixture).
-  - Wszystkie 91/91 testów przechodzi pomyślnie (100% PASS).
+  - Expanded regression test suite with Part 18 (7 new test fixtures).
+  - All 91/91 tests passing successfully (100% PASS).
 
 ---
 
