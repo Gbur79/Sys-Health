@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.52
+# Arch System Health & Diagnostics v2.55
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,12 +8,22 @@
 
 set -o pipefail
 
-VERSION="2.52"
+VERSION="2.55"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
 STATE_SNAPSHOT="$STATE_DIR/software-state.txt"
 RAW_DIR="$STATE_DIR/runs"
+
+# Global mirror telemetry state (PATCH-044 / SysPilot ISSUE-DDE9)
+MIRROR_PRIMARY_DEAD=false
+MIRROR_PRIMARY_ALIVE=false
+MIRROR_ARCH_AGE_DAYS=""
+MIRROR_ARCH_SERVERS=""
+MIRROR_DISTRO_AGE_DAYS=""
+MIRROR_DISTRO_SERVERS=""
+MIRROR_STATUS_LABEL=""
+MIRROR_STATUS="unknown"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 
@@ -51,6 +61,7 @@ Options:
   -g, --gaming           Run read-only gaming & Steam readiness audit and exit
   -p, --sample [SECS]    Run dynamic performance flight recorder / sample (default: 3s)
   -j, --json             Print latest summary JSON to stdout (or pair with --sample/--software)
+  --ai-context           Print token-lean diagnostic envelope & selective evidence to stdout (<800 tokens)
   -s, --snapshot         Print latest system software state snapshot to stdout and exit
   -r, --report           Print latest text audit report to stdout and exit
   -m, --maintenance      Run safe maintenance non-interactively, then run health audit
@@ -111,6 +122,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_JSON=1
             shift
             ;;
+        --ai-context)
+            ACTION="ai-context"
+            shift
+            ;;
         -s|--snapshot)
             ACTION="snapshot"
             shift
@@ -151,6 +166,180 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.55 | PATCH-015/PATCH-016 | Fixtures: test-suite.sh Part 19]
+_slice_state_snapshot() {
+    local start_pattern="$1"
+    local end_pattern="$2"
+    local state_dir="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/system-health}"
+    local snap="${STATE_SNAPSHOT:-$state_dir/software-state.txt}"
+    if [[ ! -f "$snap" || ! -s "$snap" ]]; then
+        echo "state snapshot unavailable (run sys-health --audit)"
+        return 0
+    fi
+    awk -v s="$start_pattern" -v e="$end_pattern" '
+        $0 ~ s { recording=1 }
+        recording {
+            if ($0 ~ e && $0 !~ s) exit;
+            print;
+        }
+    ' "$snap" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba'
+}
+
+_get_systemd_evidence() {
+    local state_dir="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/system-health}"
+    local log_file="${LOG_FILE:-$state_dir/system-health.log}"
+    local snap_file="${STATE_SNAPSHOT:-$state_dir/software-state.txt}"
+    local out=""
+    local -a failed_units=()
+
+    if [[ -f "$log_file" ]]; then
+        while IFS= read -r u; do
+            [[ -n "$u" && "$u" != "none" ]] && failed_units+=("$u")
+        done < <(awk -F'unit=' '/^HEALTH systemd(_user)?_failed/ {split($2, a, " "); print a[1]}' "$log_file" 2>/dev/null | sort -u)
+    fi
+
+    if (( ${#failed_units[@]} == 0 )) && [[ -f "$snap_file" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^([a-zA-Z0-9@._-]+)\.(service|socket|timer|scope|device|mount) ]] && failed_units+=("${BASH_REMATCH[0]}")
+        done < <(awk '/^--- 10\. Failed Systemd Services/,/^--- 12\. Desktop & Session/' "$snap_file" 2>/dev/null | grep -E '\.service|\.socket|\.timer')
+    fi
+
+    local count=0
+    for u in "${failed_units[@]}"; do
+        (( count >= 3 )) && break
+        ((count++))
+        out+="=== Unit: $u ===\n"
+        local u_status=""
+        if command -v systemctl &>/dev/null; then
+            u_status="$(systemctl status "$u" --no-pager -l -n 0 2>/dev/null || systemctl --user status "$u" --no-pager -l -n 0 2>/dev/null || true)"
+            [[ -n "$u_status" ]] && out+="$u_status\n"
+        fi
+        local u_log=""
+        if command -v journalctl &>/dev/null; then
+            u_log="$(journalctl -u "$u" -b --no-pager -n 20 2>/dev/null || journalctl --user -u "$u" -b --no-pager -n 20 2>/dev/null || true)"
+        fi
+        if [[ -n "$u_log" ]]; then
+            out+="--- Journal (last 20 lines) ---\n$u_log\n"
+        fi
+    done
+
+    if [[ -z "$out" ]] && [[ -f "$log_file" ]]; then
+        out="$(awk '/^### FAILED SYSTEMD UNITS/,/^###/ {if (/^###/ && !/### FAILED SYSTEMD/) exit; print}' "$log_file" 2>/dev/null | head -n 25 || true)"
+    fi
+
+    if [[ -z "$out" ]] && [[ -f "$snap_file" ]]; then
+        out="$(awk '/^--- 10\. Failed Systemd Services/,/^--- 12\. Desktop & Session/' "$snap_file" 2>/dev/null | head -n 25 || true)"
+    fi
+
+    [[ -z "$out" ]] && out="No detailed systemd journal entries available."
+    printf '%b' "$out" | head -n 25
+}
+
+show_ai_context() {
+    local state_dir="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/system-health}"
+    local summary_file="${SUMMARY_FILE:-$state_dir/summary.json}"
+    local log_file="${LOG_FILE:-$state_dir/system-health.log}"
+
+    if [[ ! -f "$summary_file" ]]; then
+        cat << 'EOF'
+{
+  "status": "UNKNOWN",
+  "cache_stale": true,
+  "age_seconds": null,
+  "note": "No previous audit found. Run with --audit to generate telemetry.",
+  "evidence": {}
+}
+EOF
+        return 0
+    fi
+
+    local now_ts summary_mtime age_sec=0 cache_stale=false
+    now_ts="$(date +%s)"
+    summary_mtime="$(stat -c %Y "$summary_file" 2>/dev/null || echo 0)"
+    if (( summary_mtime > 0 )); then
+        age_sec=$(( now_ts - summary_mtime ))
+        (( age_sec < 0 )) && age_sec=0
+        if (( age_sec > 300 )); then
+            cache_stale=true
+        fi
+    else
+        cache_stale=true
+        age_sec=0
+    fi
+
+    local status_val err_cnt warn_cnt flagged_raw
+    status_val="$(jq -r '.status // "UNKNOWN"' "$summary_file" 2>/dev/null || echo "UNKNOWN")"
+    err_cnt="$(jq -r '.counts.errors // 0' "$summary_file" 2>/dev/null || echo 0)"
+    warn_cnt="$(jq -r '.counts.warnings // 0' "$summary_file" 2>/dev/null || echo 0)"
+    flagged_raw="$(jq -r '(.flagged // [])[]' "$summary_file" 2>/dev/null || true)"
+
+    local ev_systemd="" ev_gpu="" ev_boot=""
+    local has_systemd=false has_gpu=false has_boot=false
+
+    if [[ "$status_val" != "ALL_CLEAR" && ( "$err_cnt" -gt 0 || "$warn_cnt" -gt 0 ) ]]; then
+        while IFS= read -r item; do
+            [[ -z "$item" ]] && continue
+            case "$item" in
+                systemd_failed|systemd_user_failed)
+                    has_systemd=true
+                    ;;
+                gpu|gpu_errors|dkms|vulkan_32bit|gtx970_vram|gpu_vram)
+                    has_gpu=true
+                    ;;
+                kernel_modules|initramfs|efi|reboot_pending|bootloader_sync|previous_boot|cpu_microcode)
+                    has_boot=true
+                    ;;
+            esac
+        done <<< "$flagged_raw"
+
+        if ! $has_systemd && grep -qE '^HEALTH systemd(_user)?_failed=(WARN|FAIL)' "$log_file" 2>/dev/null; then
+            has_systemd=true
+        fi
+        if ! $has_gpu && grep -qE '^HEALTH (gpu|gpu_errors|dkms)=(WARN|FAIL)' "$log_file" 2>/dev/null; then
+            has_gpu=true
+        fi
+        if ! $has_boot && grep -qE '^HEALTH (kernel_modules|initramfs|efi|bootloader_sync)=(WARN|FAIL)' "$log_file" 2>/dev/null; then
+            has_boot=true
+        fi
+
+        if $has_systemd; then
+            ev_systemd="$(_get_systemd_evidence)"
+        fi
+        if $has_gpu; then
+            ev_gpu="$(_slice_state_snapshot '^--- 3[.] GPU Packages' '^--- 7[.] Initramfs Configuration')"
+        fi
+        if $has_boot; then
+            ev_boot="$(_slice_state_snapshot '^--- 7[.] Initramfs Configuration' '^--- 10[.] Failed Systemd Services')"
+        fi
+    fi
+
+    jq -n \
+        --argjson base "$(< "$summary_file")" \
+        --argjson cache_stale "$cache_stale" \
+        --argjson age_seconds "$age_sec" \
+        --arg ev_sys "$ev_systemd" \
+        --arg ev_gpu "$ev_gpu" \
+        --arg ev_boot "$ev_boot" \
+        '{
+            schema_version: ($base.schema_version // "2.0"),
+            status: ($base.status // "UNKNOWN"),
+            cache_stale: $cache_stale,
+            age_seconds: $age_seconds,
+            timestamp: ($base.timestamp // null),
+            run_id: ($base.run_id // null),
+            counts: ($base.counts // {errors: 0, warnings: 0}),
+            environment: ($base.environment // null),
+            flagged: ($base.flagged // []),
+            actionable_remediations: ($base.actionable_remediations // []),
+            evidence: (
+                {}
+                | if ($ev_sys != "") then . + {systemd: $ev_sys} else . end
+                | if ($ev_gpu != "") then . + {gpu_dkms: $ev_gpu} else . end
+                | if ($ev_boot != "") then . + {boot_storage: $ev_boot} else . end
+            )
+        }'
+}
+
 if [[ "$ACTION" == "interactive" && "$OUTPUT_JSON" -eq 1 ]]; then
     ACTION="json"
 fi
@@ -163,6 +352,11 @@ if [[ "$ACTION" == "json" ]]; then
     else
         echo '{"status": "UNKNOWN", "errors": 0, "warnings": 0, "note": "No previous audit found. Run with --audit to generate."}'
     fi
+    exit 0
+fi
+
+if [[ "$ACTION" == "ai-context" ]]; then
+    show_ai_context
     exit 0
 fi
 
@@ -801,15 +995,30 @@ detect_initramfs_generator() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-017 | Fixtures: test-suite.sh Part 18]
 detect_chassis() {
     local ch=""
     if command -v hostnamectl &>/dev/null; then
         ch="$(hostnamectl chassis 2>/dev/null || true)"
     fi
+    if [[ -z "$ch" || "$ch" == "n/a" ]]; then
+        local virt=""
+        if command -v systemd-detect-virt &>/dev/null; then
+            virt="$(systemd-detect-virt 2>/dev/null || true)"
+        fi
+        if [[ -n "$virt" && "$virt" != "none" ]]; then
+            if [[ "$virt" =~ (docker|lxc|podman|containerd|systemd-nspawn) ]]; then
+                ch="container"
+            else
+                ch="vm"
+            fi
+        fi
+    fi
     if [[ -z "$ch" || "$ch" == "n/a" ]] && [[ -f /sys/class/dmi/id/chassis_type ]]; then
         case "$(< /sys/class/dmi/id/chassis_type)" in
-            8|9|10|11|14) ch="laptop" ;;
+            8|9|10|11|14|30|31|32) ch="laptop" ;;
             3|4|5|6|7|15|16) ch="desktop" ;;
+            1|2) ch="unknown" ;;
             *) ch="desktop" ;;
         esac
     fi
@@ -5349,7 +5558,7 @@ check_gpu() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.52 | PATCH-043 | Fixtures: test-suite.sh Part 5]
+# [SRE-AUDIT: CERTIFIED | Sol v2.53 | PATCH-044 | Fixtures: test-suite.sh Part 5]
 check_gpu_errors() {
     local root="${SYS_HEALTH_ROOT:-}"
     local vga_info drivers_in_use
@@ -5376,21 +5585,25 @@ check_gpu_errors() {
     local klog=""
     klog="$(journalctl -b 0 -k --no-pager 2>/dev/null || dmesg 2>/dev/null || true)"
 
-    # --- Wayland Compositor Telemetry (kwin_wayland, gnome-shell, Hyprland) ---
+    # --- Wayland Compositor Telemetry (kwin_wayland, gnome-shell, Hyprland, Sway) ---
     if $is_wayland; then
-        local comp_log=""
+        local comp_log="" recent_comp_log=""
         if [[ -z "$root" ]]; then
             if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
                 comp_log="$(journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+                recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
             else
                 comp_log="$(journalctl --user -b 0 --no-pager 2>/dev/null || journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+                recent_comp_log="$(journalctl --user -b 0 --since '-10 min' --no-pager 2>/dev/null || journalctl -b 0 --since '-10 min' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
             fi
             if [[ -z "$comp_log" ]]; then
                 comp_log="$(journalctl -b 0 --no-pager 2>/dev/null || true)"
+                recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager 2>/dev/null || true)"
             fi
         else
             # Test-suite harness compatibility
             comp_log="$(journalctl -b 0 --user --no-pager 2>/dev/null || journalctl -b 0 --no-pager 2>/dev/null || true)"
+            recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager 2>/dev/null || true)"
         fi
 
         # 1. Critical Wayland GPU crashes, context losses, and pageflip timeouts
@@ -5400,9 +5613,10 @@ check_gpu_errors() {
             detected_errors+=("Wayland compositor critical GPU error: $wayland_crit")
         fi
 
-        # 2. Benign DPMS modeset / atomic commit jitter filter (DP 1.2 MST wakeups)
+        # 2. Benign DPMS modeset / atomic commit jitter filter (DP 1.2 MST wakeups & startup burst)
+        local modeset_err_regex="(kwin_wayland.*(Modeset failed|Atomic commit failed|Presentation failed)|gnome-shell.*(Failed to flip|Failed to set mode)|wlr_drm.*Failed to set mode|failed to commit modeset)"
         local modeset_fail_count
-        modeset_fail_count="$(printf '%s\n' "$comp_log" | grep -Eic "(kwin_wayland.*(Modeset failed|Atomic commit failed|Presentation failed)|gnome-shell.*(Failed to flip|Failed to set mode))" || true)"
+        modeset_fail_count="$(printf '%s\n' "$comp_log" | grep -Eic "$modeset_err_regex" || true)"
         modeset_fail_count="${modeset_fail_count:-0}"
         modeset_fail_count="${modeset_fail_count//[^0-9]/}"
 
@@ -5413,8 +5627,24 @@ check_gpu_errors() {
             dynamic_threshold=$(( 30 + (uptime_hours * 10) ))
             modeset_threshold="${WAYLAND_MODESET_WARN_THRESHOLD:-$dynamic_threshold}"
 
-            if (( modeset_fail_count > modeset_threshold )); then
-                detected_errors+=("$modeset_fail_count modeset/atomic commit stalls in Wayland compositor (threshold: $modeset_threshold)")
+            # Temporal windowing: check if errors are actively occurring in the rolling 10m window
+            local recent_fail_count=0
+            if [[ -n "$recent_comp_log" ]]; then
+                recent_fail_count="$(printf '%s\n' "$recent_comp_log" | grep -Eic "$modeset_err_regex" || true)"
+                recent_fail_count="${recent_fail_count:-0}"
+                recent_fail_count="${recent_fail_count//[^0-9]/}"
+            fi
+
+            # Evaluation: Active recurring stalls vs historical boot/DPMS burst
+            if (( recent_fail_count > modeset_threshold || recent_fail_count > 10 )); then
+                detected_errors+=("$recent_fail_count recent modeset/atomic commit stalls in Wayland compositor (active in last 10m; threshold: ${WAYLAND_MODESET_WARN_THRESHOLD:-10})")
+            elif (( modeset_fail_count > modeset_threshold )); then
+                # Historical count exceeded threshold, but rolling window is clear
+                if (( recent_fail_count == 0 )); then
+                    detected_notes+=("Minor modeset jitter ($modeset_fail_count startup/DPMS probe events in Wayland compositor) - stable in rolling window")
+                else
+                    detected_errors+=("$modeset_fail_count modeset/atomic commit stalls in Wayland compositor (threshold: $modeset_threshold, $recent_fail_count in last 10m)")
+                fi
             else
                 detected_notes+=("Minor modeset jitter ($modeset_fail_count events in Wayland compositor) - normal DPMS transitions")
             fi
@@ -5881,11 +6111,16 @@ check_audio() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-017 | Fixtures: test-suite.sh Part 18]
 check_power() {
     local -a sys_batteries=()
+    local has_psu_dir=false
+    local has_ac_online=false
     local psu_dir
+
     for psu_dir in /sys/class/power_supply/*; do
         [[ -d "$psu_dir" ]] || continue
+        has_psu_dir=true
         local psu_type="" psu_scope=""
         [[ -r "$psu_dir/type" ]] && psu_type="$(< "$psu_dir/type")"
         [[ -r "$psu_dir/scope" ]] && psu_scope="$(< "$psu_dir/scope")"
@@ -5895,6 +6130,10 @@ check_power() {
             if [[ "$bname" =~ ^(BAT[0-9]+|battery) || "$psu_scope" == "System" ]]; then
                 sys_batteries+=("$psu_dir")
             fi
+        elif [[ "$psu_type" != "Battery" ]]; then
+            local online="0"
+            [[ -r "$psu_dir/online" ]] && online="$(< "$psu_dir/online")"
+            [[ "$online" == "1" ]] && has_ac_online=true
         fi
     done
 
@@ -5932,13 +6171,43 @@ check_power() {
             log "HEALTH power=PASS battery=$worst_cap details='$combined_bats'"
         fi
     else
-        add_row "Power & Battery" "PASS ✔ (AC Desktop power)" "HW"
-        log "HEALTH power=PASS chassis=desktop ac=online"
+        local chassis
+        chassis="$(detect_chassis)"
+
+        local virt_type=""
+        if command -v systemd-detect-virt &>/dev/null; then
+            virt_type="$(systemd-detect-virt 2>/dev/null || true)"
+        fi
+
+        if [[ -n "$virt_type" && "$virt_type" != "none" ]] || [[ "$chassis" =~ ^(vm|container)$ ]]; then
+            local v_label="${virt_type:-$chassis}"
+            [[ "$v_label" == "none" ]] && v_label="$chassis"
+            add_row "Power & Battery" "INFO ℹ (${v_label^^} environment - host managed)" "HW"
+            ((INFO_COUNT++))
+            log "HEALTH power=INFO chassis=$chassis virt=${virt_type:-none}"
+        elif [[ "$chassis" =~ ^(laptop|tablet|convertible|portable)$ ]]; then
+            if $has_ac_online; then
+                add_row "Power & Battery" "WARN ⚠ (Laptop chassis: no battery detected; running on AC)" "HW"
+                ((WARNINGS++))
+                log "HEALTH power=WARN chassis=$chassis battery=missing ac=online"
+            else
+                add_row "Power & Battery" "WARN ⚠ (Laptop chassis: no battery detected)" "HW"
+                ((WARNINGS++))
+                log "HEALTH power=WARN chassis=$chassis battery=missing ac=offline"
+            fi
+        else
+            add_row "Power & Battery" "PASS ✔ (AC Desktop power)" "HW"
+            log "HEALTH power=PASS chassis=desktop ac=online"
+        fi
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-017 | Fixtures: test-suite.sh Part 18]
 check_fstrim() {
     if ! command -v systemctl &>/dev/null; then
+        add_row "SSD/NVMe TRIM timer" "INFO ℹ (systemctl unavailable)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH fstrim=INFO reason=systemctl_unavailable"
         return
     fi
 
@@ -6084,6 +6353,7 @@ check_root_space() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.53 | PATCH-035 | Fixtures: test-suite.sh Part 4]
 check_failed_services() {
     FAILED_SERVICES="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sed '/^$/d')"
 
@@ -6096,7 +6366,7 @@ check_failed_services() {
         first_svc="$(head -n1 <<< "$FAILED_SERVICES")"
         add_row "Systemd failed (system)" "WARN ⚠ ($count failed)" "SYS"
         ((WARNINGS++))
-        log "HEALTH systemd_failed=WARN count=$count"
+        log "HEALTH systemd_failed=WARN count=$count unit=$first_svc"
         {
             echo "### FAILED SYSTEMD UNITS (SYSTEM)"
             systemctl --failed --no-legend --plain 2>&1
@@ -6178,11 +6448,12 @@ check_failed_services() {
         add_row "Systemd failed (user)" "PASS ✔" "SYS"
         log "HEALTH systemd_user_failed=0"
     else
-        local summary_text
+        local summary_text first_user_svc
+        first_user_svc="$(head -n1 <<< "$FAILED_USER_SERVICES")"
         summary_text="$(IFS='; '; echo "${user_audit_details[*]}")"
         add_row "Systemd failed (user)" "WARN ⚠ ($total_user_failed failed)" "SYS"
         ((WARNINGS++))
-        log "HEALTH systemd_user_failed=WARN count=$total_user_failed details='$summary_text'"
+        log "HEALTH systemd_user_failed=WARN count=$total_user_failed unit=$first_user_svc details='$summary_text'"
     fi
 }
 
@@ -6692,6 +6963,7 @@ check_orphan_packages() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-033 | Fixtures: test-suite.sh Part 18]
 check_network() {
     if ! command -v ip &>/dev/null; then
         add_row "Network link & Gateway" "INFO ℹ (ip tool missing)" "NET"
@@ -6782,7 +7054,16 @@ check_network() {
 
     local ping_ms="<1" gw_stealth=false
     if [[ "$gw" == "p2p" ]]; then
-        if ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+        if $is_ipv6_only; then
+            if ping -6 -c 1 -W 1 2606:4700:4700::1111 &>/dev/null || ping -6 -c 1 -W 1 2001:4860:4860::8888 &>/dev/null; then
+                ping_ms="p2p"
+            else
+                add_row "Network link & Gateway" "FAIL ✖ (p2p tunnel $dev has no internet reachability)" "NET"
+                ((ERRORS++))
+                log "HEALTH network=FAIL iface=$dev gateway=p2p ping=unreachable"
+                return
+            fi
+        elif ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
             ping_ms="p2p"
         else
             add_row "Network link & Gateway" "FAIL ✖ (p2p tunnel $dev has no internet reachability)" "NET"
@@ -6804,10 +7085,25 @@ check_network() {
             fi
         else
             # Gateway dropped ICMP (stealth router/firewall): verify via ARP neighbor table or public ping
-            if ip neigh show "$gw" 2>/dev/null | grep -qiE 'REACHABLE|DELAY|STALE'; then
-                gw_stealth=true
-                ping_ms="stealth"
-            elif ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+            local arp_ok=false
+            if ip neigh show "$gw" 2>/dev/null | grep -qiE 'REACHABLE|DELAY|STALE|PERMANENT|PROBE'; then
+                arp_ok=true
+            elif [[ -n "$dev" ]] && ip neigh show dev "$dev" 2>/dev/null | grep -qiE 'REACHABLE|DELAY|STALE|PERMANENT|PROBE'; then
+                arp_ok=true
+            fi
+
+            local pub_ping_ok=false
+            if $is_ipv6_only; then
+                if ping -6 -c 1 -W 1 2606:4700:4700::1111 &>/dev/null || ping -6 -c 1 -W 1 2001:4860:4860::8888 &>/dev/null; then
+                    pub_ping_ok=true
+                fi
+            else
+                if ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+                    pub_ping_ok=true
+                fi
+            fi
+
+            if $arp_ok || $pub_ping_ok; then
                 gw_stealth=true
                 ping_ms="stealth"
             else
@@ -6835,7 +7131,6 @@ check_network() {
     fi
 
     # Generic orphan VPN DNS detection (covers AirVPN, WireGuard, OpenVPN, Mullvad)
-    # Only alert if dedicated VPN DNS server is configured in resolv.conf without active VPN interface AND is unreachable
     if grep -qE '^(nameserver 10\.128\.0\.1|nameserver 10\.64\.0\.1)' /etc/resolv.conf 2>/dev/null; then
         if ! ip link show 2>/dev/null | grep -qiE '(tun|wg|tap|airvpn|nordlynx|mullvad)'; then
             if ! ping -c 1 -W 1 10.64.0.1 &>/dev/null && ! ping -c 1 -W 1 10.128.0.1 &>/dev/null; then
@@ -6862,7 +7157,6 @@ check_network() {
                 log "HEALTH network=WARN iface=$dev degraded_speed=${speed}Mbps gateway=$gw"
                 return
             elif (( speed <= 100 && speed > 0 )); then
-                # Only flag as degraded if interface is known to support Gigabit+
                 if command -v ethtool &>/dev/null && ethtool "$dev" 2>/dev/null | grep -qE '1000base|2500base|5000base|10000base'; then
                     add_row "Network link & Gateway" "WARN ⚠ ($dev: degraded link speed 100Mb/s on Gigabit+ NIC)" "NET"
                     ((WARNINGS++))
@@ -6875,12 +7169,17 @@ check_network() {
 
     # NetworkManager Community Gotcha: unintended 'metered connection' throttling
     local metered_status="no"
-    if command -v nmcli &>/dev/null; then
+    local is_virtual_or_bridge=false
+    if [[ "$dev" =~ ^(virbr|docker|br-|br[0-9]|tailscale|tun|wg|tap|veth|zt|lo|dummy|bond|team) ]]; then
+        is_virtual_or_bridge=true
+    fi
+
+    if ! $is_virtual_or_bridge && command -v nmcli &>/dev/null; then
         metered_status="$(nmcli -t -f GENERAL.METERED dev show "$dev" 2>/dev/null | cut -d: -f2- || true)"
         if [[ "$metered_status" =~ ^yes ]]; then
             local conn_name
             conn_name="$(nmcli -t -f GENERAL.CONNECTION dev show "$dev" 2>/dev/null | cut -d: -f2- || echo "$dev")"
-            if [[ "$dev" =~ ^(en|eth) ]]; then
+            if [[ "$dev" =~ ^(en[a-z0-9]+|eth[0-9]+)$ ]]; then
                 add_row "Network link & Gateway" "WARN ⚠ ($dev: metered connection enabled on wired Ethernet)" "NET"
                 ((WARNINGS++))
                 log "HEALTH network=WARN metered=yes dev=$dev connection=\"$conn_name\""
@@ -7132,16 +7431,28 @@ check_updates() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.53 | PATCH-044 | Fixtures: test-suite.sh Part 1, Part 12]
 check_mirrorlist_age() {
     local now
     now=$(date +%s)
     local -a mirror_files=()
     mapfile -t mirror_files < <(discover_active_mirrorlists)
 
+    MIRROR_PRIMARY_DEAD=false
+    MIRROR_PRIMARY_ALIVE=false
+    MIRROR_ARCH_AGE_DAYS=""
+    MIRROR_ARCH_SERVERS=""
+    MIRROR_DISTRO_AGE_DAYS=""
+    MIRROR_DISTRO_SERVERS=""
+    MIRROR_STATUS_LABEL=""
+    MIRROR_STATUS="unknown"
+
     if (( ${#mirror_files[@]} == 0 )); then
         add_row "Mirrorlist status" "WARN ⚠ (no active mirrorlists configured)" "NET"
         ((WARNINGS++))
         log "HEALTH mirrorlist_age=WARN missing_all details='no active mirrorlists configured'"
+        MIRROR_STATUS="WARN"
+        MIRROR_STATUS_LABEL="no active mirrorlists configured"
         return
     fi
 
@@ -7159,6 +7470,7 @@ check_mirrorlist_age() {
     if [[ "$http_code" == "NA" ]]; then
         primary_info="probe unavail"
     elif [[ -n "$primary_url" && "$http_code" =~ ^(200|301|302)$ ]]; then
+        MIRROR_PRIMARY_ALIVE=true
         if [[ "$primary_ms" =~ ^[0-9]+$ ]] && (( primary_ms > 400 )); then
             primary_slow=true
             primary_info="${primary_ms}ms high-latency"
@@ -7169,6 +7481,7 @@ check_mirrorlist_age() {
         # Check if internet control plane is alive before flagging mirror as dead
         if _probe_network_control_plane; then
             primary_dead=true
+            MIRROR_PRIMARY_DEAD=true
             primary_info="primary DEAD"
         fi
     fi
@@ -7219,6 +7532,15 @@ check_mirrorlist_age() {
             done
             labels+=("${fname}: ${item_str}")
         fi
+
+        # Persist mirror state in global telemetry variables (PATCH-044)
+        if [[ "$fname" == "Arch" ]]; then
+            MIRROR_ARCH_AGE_DAYS="$days"
+            MIRROR_ARCH_SERVERS="$srv_cnt"
+        elif [[ "$fname" == "Distro" ]] || [[ -z "$MIRROR_DISTRO_SERVERS" && "$fname" != "Arch" ]]; then
+            MIRROR_DISTRO_AGE_DAYS="$days"
+            MIRROR_DISTRO_SERVERS="$srv_cnt"
+        fi
     done
 
     # If primary_info was not attached yet (e.g. non-Arch distro or custom name), attach to first label
@@ -7234,11 +7556,14 @@ check_mirrorlist_age() {
             status_label+=" │ $l"
         fi
     done
+    MIRROR_STATUS_LABEL="$status_label"
 
     if [[ -z "$status_label" ]]; then
         add_row "Mirrorlist status" "INFO ℹ (no readable server entries)" "NET"
         ((INFO_COUNT++)) || true
         log "HEALTH mirrorlist_age=INFO details='no readable server entries'"
+        MIRROR_STATUS="INFO"
+        MIRROR_STATUS_LABEL="no readable server entries"
         return
     fi
 
@@ -7246,18 +7571,25 @@ check_mirrorlist_age() {
         add_row "Mirrorlist status" "WARN ⚠ ($status_label)" "NET"
         ((WARNINGS++)) || true
         log "HEALTH mirrorlist_age=WARN max_days=$max_days details='$status_label'"
+        MIRROR_STATUS="WARN"
     elif $primary_slow || $low_redundancy || (( max_days > 45 )); then
         add_row "Mirrorlist status" "INFO ℹ ($status_label)" "NET"
         ((INFO_COUNT++)) || true
         log "HEALTH mirrorlist_age=INFO max_days=$max_days details='$status_label'"
+        MIRROR_STATUS="INFO"
     else
         add_row "Mirrorlist status" "PASS ✔ ($status_label)" "NET"
         log "HEALTH mirrorlist_age=PASS max_days=$max_days details='$status_label'"
+        MIRROR_STATUS="PASS"
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-017 | Fixtures: test-suite.sh Part 18]
 check_arch_news() {
     if ! command -v curl &>/dev/null; then
+        add_row "Arch News (Latest)" "INFO ℹ (curl unavailable)" "NET"
+        ((INFO_COUNT++))
+        log "HEALTH arch_news=INFO reason=curl_missing"
         return
     fi
 
@@ -7265,7 +7597,9 @@ check_arch_news() {
     rss_data="$(curl -fsS --max-time 4 https://archlinux.org/feeds/news/ 2>/dev/null || true)"
 
     if [[ -z "$rss_data" ]]; then
-        log "HEALTH arch_news=UNAVAILABLE (network/timeout)"
+        add_row "Arch News (Latest)" "INFO ℹ (feed unavailable / offline)" "NET"
+        ((INFO_COUNT++))
+        log "HEALTH arch_news=INFO reason=feed_unavailable"
         return
     fi
 
@@ -8201,10 +8535,48 @@ generate_summary_json() {
                         risk="HIGH"
                     fi
                     ;;
-                systemd_failed|systemd_user_failed)
+                systemd_failed)
                     code="SYS_SERVICE_FAILED"
-                    summary="Failed systemd service units detected"
-                    fix="Inspect failed units: systemctl --failed (or systemctl --user --failed)"
+                    local unit="" note=""
+                    if [[ "$rest" =~ unit=([^[:space:]]+) ]]; then
+                        unit="${BASH_REMATCH[1]}"
+                    fi
+                    case "$unit" in
+                        systemd-tmpfiles-clean*) note=" (temporary files cleanup failed)" ;;
+                        fstrim*) note=" (periodic SSD TRIM failed)" ;;
+                        plocate-updatedb*) note=" (locate database index failed)" ;;
+                        btrfs-scrub*) note=" (btrfs scrub maintenance failed)" ;;
+                        logrotate*) note=" (log rotation failed)" ;;
+                    esac
+                    if [[ -n "$unit" ]]; then
+                        summary="Failed systemd service unit: ${unit}${note}"
+                        fix="Inspect logs: journalctl -u ${unit} -b --no-pager | Reset state: sudo systemctl reset-failed ${unit}"
+                    else
+                        summary="Failed systemd service units detected"
+                        fix="Inspect failed units: systemctl --failed"
+                    fi
+                    risk="LOW"
+                    ;;
+                systemd_user_failed)
+                    code="SYS_SERVICE_FAILED"
+                    local unit="" note=""
+                    if [[ "$rest" =~ unit=([^[:space:]]+) ]]; then
+                        unit="${BASH_REMATCH[1]}"
+                    fi
+                    case "$unit" in
+                        systemd-tmpfiles-clean*) note=" (temporary files cleanup failed)" ;;
+                        fstrim*) note=" (periodic SSD TRIM failed)" ;;
+                        plocate-updatedb*) note=" (locate database index failed)" ;;
+                        btrfs-scrub*) note=" (btrfs scrub maintenance failed)" ;;
+                        logrotate*) note=" (log rotation failed)" ;;
+                    esac
+                    if [[ -n "$unit" ]]; then
+                        summary="Failed user session service unit: ${unit}${note}"
+                        fix="Inspect user logs: journalctl --user -u ${unit} -b --no-pager | Reset state: systemctl --user reset-failed ${unit}"
+                    else
+                        summary="Failed systemd user service units detected"
+                        fix="Inspect user units: systemctl --user --failed"
+                    fi
                     risk="LOW"
                     ;;
                 desktop_indexers)
@@ -8423,6 +8795,19 @@ generate_summary_json() {
         j_source_group_json="$(jq -nc --arg sg "$JOURNAL_RATE_SOURCE_GROUP" '$sg')"
     fi
 
+    # Mirrors telemetry payload for schema 2.0 (PATCH-044 / SysPilot ISSUE-DDE9)
+    local m_status="${MIRROR_STATUS:-unknown}"
+    local m_msg="${MIRROR_STATUS_LABEL:-unknown}"
+    local m_arch_age="null" m_arch_srv="null"
+    local m_distro_age="null" m_distro_srv="null"
+    local m_primary_alive=false
+
+    [[ "${MIRROR_PRIMARY_ALIVE:-}" == "true" ]] && m_primary_alive=true
+    [[ "${MIRROR_ARCH_AGE_DAYS:-}" =~ ^[0-9]+$ ]] && m_arch_age="${MIRROR_ARCH_AGE_DAYS}"
+    [[ "${MIRROR_ARCH_SERVERS:-}" =~ ^[0-9]+$ ]] && m_arch_srv="${MIRROR_ARCH_SERVERS}"
+    [[ "${MIRROR_DISTRO_AGE_DAYS:-}" =~ ^[0-9]+$ ]] && m_distro_age="${MIRROR_DISTRO_AGE_DAYS}"
+    [[ "${MIRROR_DISTRO_SERVERS:-}" =~ ^[0-9]+$ ]] && m_distro_srv="${MIRROR_DISTRO_SERVERS}"
+
     if command -v jq &>/dev/null; then
         jq -n \
             --arg schema "2.0" \
@@ -8451,6 +8836,13 @@ generate_summary_json() {
             --argjson j_src "$j_source_group_json" \
             --argjson j_bytes "$j_disk_bytes_json" \
             --arg j_human "${JOURNAL_DISK_USAGE_HUMAN:-unknown}" \
+            --arg m_status "$m_status" \
+            --arg m_msg "$m_msg" \
+            --argjson m_primary_alive "$m_primary_alive" \
+            --argjson m_arch_age "$m_arch_age" \
+            --argjson m_arch_srv "$m_arch_srv" \
+            --argjson m_distro_age "$m_distro_age" \
+            --argjson m_distro_srv "$m_distro_srv" \
             --argjson sec_actionable "${ARCH_AUDIT_ACTIONABLE_COUNT:-0}" \
             --argjson sec_tracker "${ARCH_AUDIT_TRACKER_COUNT:-0}" \
             --argjson aur_pkgs "$aur_pkg_count" \
@@ -8482,6 +8874,15 @@ generate_summary_json() {
                         source_group: $j_src,
                         disk_usage_bytes: $j_bytes,
                         disk_usage_human: $j_human
+                    },
+                    mirrors: {
+                        status: $m_status,
+                        message: $m_msg,
+                        arch_age_days: $m_arch_age,
+                        arch_primary_alive: $m_primary_alive,
+                        arch_servers: $m_arch_srv,
+                        distro_age_days: $m_distro_age,
+                        distro_servers: $m_distro_srv
                     }
                 },
                 environment: {
@@ -8897,6 +9298,7 @@ reconstruct_tables_from_log() {
                     AUDIT_TABLE_SYS+="Systemd failed (system) | PASS ✔\n"
                 else
                     local count="${details#count=}"
+                    count="${count%% *}"
                     AUDIT_TABLE_SYS+="Systemd failed (system) | WARN ⚠ (${count:-$val} failed)\n"
                 fi
                 ;;
