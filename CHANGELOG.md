@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.52] - 2026-10-23
+
+### Fixed & Hardened (SRE Architectural Audit - Wayland Compositor GPU Telemetry Hardening / PATCH-043 / ARGON-20261023-MOD-005)
+- **MOD-05 Hardware & GPU Diagnostics (`check_gpu_errors`)**:
+  - Extended `check_gpu_errors()` with active Wayland compositor telemetry (`kwin_wayland`, `gnome-shell`, `Hyprland`).
+  - Added dynamic DPMS modeset jitter filtering (`Modeset failed: Invalid argument` / `Atomic commit failed`), preventing false-positive warnings during DisplayPort 1.2 MST display wakeups while logging telemetry notes.
+  - Added immediate detection of critical Wayland GPU failures (`Page flip timed out`, `EGL_CONTEXT_LOST`, `Failed to create framebuffer`, `plasma-kwin_wayland` segfaults).
+  - Preserved legacy Xorg fliplock inspection for X11 sessions.
+  - Added Fixtures 5.8, 5.9, and 5.10 to `dev-tools/test-suite.sh`.
+  - All 82/82 regression tests passing (100% PASS).
+
+---
+
+## [2.51] - 2026-10-23
+
+### Fixed & Hardened (SRE Architectural Audit - Wayland Modernization & Gaming Suite / PATCH-042 / ARGON-20261023-MOD-012)
+- **MOD-12 Gaming & Steam Readiness Suite (`check_gaming`, `detect_gaming_system`, line 213)**:
+  - Eliminated legacy rig-bias for Maxwell GTX 970 under Wayland, harmonizing with universal modern GPU architecture.
+  - Added deterministic Wayland protocol probing: verified explicit sync (`wp_linux_drm_syncobj_manager_v1`), low-latency tearing (`wp_tearing_control_v1`), and `xorg-xwayland` readiness.
+  - Added NVIDIA KMS modeset audit (`nvidia_drm.modeset=1`) for Wayland sessions inspecting sysfs (0400 readable/mock), cmdline, and modprobe.d to prevent silent display stalls.
+  - Fixed root elevation defect in line 213: exempted unprivileged CLI `--gaming` (`-g`) from triggering interactive `sudo -v` authentication.
+  - Hardened `detect_gaming_system()` to honor `SYS_HEALTH_ROOT` hermetic root trees.
+  - Expanded regression test suite (`dev-tools/test-suite.sh` Part 13) with fixtures 13.6, 13.7, and 13.8.
+  - All 79/79 regression tests passing (100% PASS).
+
 ## [2.50] - 2026-10-22
 
 ### Fixed & Hardened (SRE Architectural Audit - System Health & Services Hardening / ARGON-20261022-MOD-07-HARDENING)
