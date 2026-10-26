@@ -7,14 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.56] - 2026-10-24
+## [2.56] - 2026-10-25
 
-### Fixed & Hardened (EOS-SRE Architectural Audit - Hardware & Wayland Modesetting / PATCH-044)
+### Added & Hardened (SRE Architectural Audit - Guarded System Upgrade Hardening / PATCH-045, PATCH-046, PATCH-047)
+- **Guarded System Upgrade (MOD-03) Pre-Flight Safety & Reversibility (`PATCH-045`–`047`)**:
+  - **PATCH-045 (`_classify_pacman_lock`):** Authoritative ALPM database lock classification using open file descriptors (`fuser`/`lsof`) with `(( EUID == 0 ))` and `sudo -n` privilege detection. Closed the unprivileged `fuser` gap by routing unprivileged checks with active resident background daemons (`packagekitd`/`pamac-daemon`) to `UNDETERMINED` (forbidding manual `db.lck` deletion), while segregating idle resident daemons from active CLI installers (`pacman`, `yay`, `paru`, `pikaur`, `makepkg`, `eos-update`).
+  - **PATCH-046 (`_extract_pending_keyrings`):** Dynamic multi-distro `*-keyring` discovery (`archlinux-keyring`, `endeavouros-keyring`, `cachyos-keyring`, `chaotic-keyring`, etc.) from pending repository manifests, executing upfront trustdb synchronization strictly after user confirmation and immediately before the main upgrade transaction.
+  - **PATCH-047 (`_detect_snapshot_provider`, `_create_preupgrade_snapshot`):** Pre-Flight Snapshot Safety Net inspecting filesystem and snapshot state in Gate 1 (with a 5 GiB free-space advisory on Btrfs) and creating the snapshot only after user confirmation. Includes ALPM hook deduplication (`*snap-pac-pre.hook`, `*timeshift-autosnap*.hook`), exact `SUBVOLUME="/"` Snapper config matching with unprivileged `sudo -n snapper list-configs` fallback, unconfigured `snap-pac` detection (`SNAP_PAC_UNCONFIGURED`), Timeshift `On-demand` (`O`) retention pruning (max 3 snapshots), and clean `no-op` on `ext4` / non-Btrfs roots.
+  - **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`):** Added non-tautological Fixtures 9.6, 9.7, and 9.8 directly invoking the new helper functions in isolated mock roots (`101/101 PASS`).
+
+### Fixed & Hardened (SRE Architectural Audit - Hardware & Wayland Modesetting / PATCH-044)
 * **Hardware & GPU (MOD-05):** Implemented two-stage temporal windowing in `check_gpu_errors` (`journalctl --since '-10 min'`) eliminating false-positive `WARN ⚠` alerts during EDID/MST mode-probing bursts at Wayland startup (startup burst filter).
 * **Universal Wayland Compositor Telemetry:** Extended modesetting error detection regex to cover wlroots-based compositors (`Hyprland`, `Sway`).
 * **Test Suite:** Added hermetic Fixture 5.8b to `dev-tools/test-suite.sh` verifying seamless degradation of the startup burst to `PASS ✔` status (11/11 tests in Part 5, 98/98 overall suite).
 
-### Added & Hardened (EOS-SRE Architectural Audit - Selective Evidence AI-Context & CI Workflow / BUNDLE 3 / PATCH-015 & PATCH-016)
+### Added & Hardened (SRE Architectural Audit - Selective Evidence AI-Context & CI Workflow / BUNDLE 3 / PATCH-015 & PATCH-016)
 - **MOD-08 AI Telemetry & Selective Evidence Routing (`sys-health --ai-context`, PATCH-015)**:
   - Added dedicated CLI option `sys-health --ai-context` producing an ultra-compact, token-lean diagnostic envelope (<800 tokens, 100% ANSI-free JSON) specifically tailored for LLM agents (Goose, SysPilot, Claude Code, Cursor).
   - Implemented dynamic cache freshness and staleness detection (`cache_stale: true/false`, `age_seconds: N`) with a 300-second (5-minute) TTL gate.
@@ -38,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.54] - 2026-10-24
 
-### Added & Hardened (EOS-SRE Architectural Audit - Network Topology Mock-Suite & 4-State Determinism / BUNDLE 2 / PATCH-033 & PATCH-017)
+### Added & Hardened (SRE Architectural Audit - Network Topology Mock-Suite & 4-State Determinism / BUNDLE 2 / PATCH-033 & PATCH-017)
 - **MOD-11 Network & Topology Resilience Mock-Suite (PATCH-033)**:
   - Hermetic routing and topology test suite in `dev-tools/test-suite.sh` (Part 18): test fixtures for default gateway absence, resilience against false-positive `metered connection` alerts on virtual interfaces/bridges, and support for stealth routers (pfSense ICMP drop).
   - Hardened NetworkManager metered connection detection. Virtual interfaces, bridges, and tunnels (`virbr*`, `docker*`, `br-*`, `tailscale*`, `tun*`, `wg*`, `tap*`, `veth*`, `zt*`) are ignored, restricting `WARN ⚠` alerts strictly to physical Ethernet interfaces (`^(en[a-z0-9]+|eth[0-9]+)$`).
@@ -55,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.53] - 2026-10-24
 
-### Added & Hardened (SRE Architectural Audit - Context-Aware Services Triage & Mirror Telemetry / PAKIET 1 / PATCH-035 & PATCH-044)
+### Added & Hardened (SRE Architectural Audit - Context-Aware Services Triage & Mirror Telemetry / BUNDLE 1 / PATCH-035 & PATCH-044)
 - **MOD-07 System Health & Services (`check_failed_services`, Issue #5)**:
   - Extracted primary failed unit name (`unit=$first_svc` for system units, `unit=$first_user_svc` for user units) in `HEALTH` log lines.
   - Implemented contextual, unit-specific actionable remediations in `generate_summary_json()` with direct `journalctl` inspection and `reset-failed` commands.
