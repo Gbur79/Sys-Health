@@ -11408,7 +11408,248 @@ sys.exit(0)
 # Hardened according to Gemini Pro, ChatGPT & GPT-5.6 Luna SRE Reviews
 # ------------------------------------------------------------------------------
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.45 | PATCH-028/PATCH-037 | Fixtures: test-suite.sh Part 9]
+# ==============================================================================
+# SRE ARCHITECTURAL HELPERS: GUARDED UPGRADE SUB-ENGINE (MOD-03)
+# ==============================================================================
+
+# [SRE-AUDIT: CERTIFIED | Argon/Opus v2.56 | PATCH-045 | Fixtures: test-suite.sh Part 9.6]
+_classify_pacman_lock() {
+    local lockfile="${1:-}"
+    if [[ -z "$lockfile" ]]; then
+        local db_path
+        db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
+        lockfile="${db_path%/}/db.lck"
+    fi
+
+    [[ -f "$lockfile" ]] || { echo "CLEAR"; return 0; }
+
+    local lock_pids="" is_root_privileged=false
+    if (( EUID == 0 )) || sudo -n true 2>/dev/null; then
+        is_root_privileged=true
+    fi
+
+    # 1. Authoritative check: open file descriptor on lockfile
+    if $is_root_privileged; then
+        if (( EUID == 0 )); then
+            lock_pids="$(fuser "$lockfile" 2>/dev/null || true)"
+        else
+            lock_pids="$(sudo -n fuser "$lockfile" 2>/dev/null || true)"
+        fi
+    else
+        lock_pids="$(fuser "$lockfile" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$lock_pids" ]]; then
+        echo "ACTIVE $lock_pids"
+        return 1
+    fi
+
+    if command -v lsof &>/dev/null && lsof "$lockfile" &>/dev/null; then
+        echo "ACTIVE lsof"
+        return 1
+    fi
+
+    # 2. Check active CLI mutation tools (never idle daemons)
+    if pgrep -x "pacman|yay|paru|pikaur|makepkg|eos-update" &>/dev/null; then
+        echo "ACTIVE_CLI"
+        return 1
+    fi
+
+    # 3. Handle unprivileged gap: unprivileged user cannot inspect root FDs while daemon lives
+    local daemon_alive=false
+    pgrep -x "packagekitd|pamac-daemon" &>/dev/null && daemon_alive=true
+
+    if ! $is_root_privileged && $daemon_alive; then
+        echo "UNDETERMINED"
+        return 2
+    fi
+
+    if $daemon_alive; then
+        echo "STALE_WITH_DAEMON"
+        return 3
+    fi
+
+    echo "STALE"
+    return 4
+}
+
+# [SRE-AUDIT: CERTIFIED | Argon/Opus v2.56 | PATCH-046 | Fixtures: test-suite.sh Part 9.7]
+_extract_pending_keyrings() {
+    local manifest="${1:-}"
+    local line pkg
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        pkg="${line%% *}"
+        if [[ "$pkg" =~ ^[a-zA-Z0-9@._+-]+-keyring$ ]]; then
+            printf "%s\n" "$pkg"
+        fi
+    done <<< "$manifest"
+}
+
+# [SRE-AUDIT: CERTIFIED | Argon/Opus v2.56 | PATCH-047 | Fixtures: test-suite.sh Part 9.8]
+_detect_snapshot_provider() {
+    local root="${SYS_HEALTH_ROOT:-}"
+    local fstype=""
+    if [[ -z "$root" ]] && command -v findmnt &>/dev/null; then
+        fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    fi
+    if [[ -z "$fstype" && -f "${root}/etc/fstab" ]]; then
+        fstype="$(awk '!/^[[:space:]]*#/ && $2 == "/" {print $3; exit}' "${root}/etc/fstab" 2>/dev/null || true)"
+    fi
+
+    # Karol's physical rig & non-Btrfs dual lens: clean no-op
+    if [[ "$fstype" != "btrfs" ]]; then
+        echo "NONE_NON_BTRFS"
+        return 0
+    fi
+
+    # 1. Inspect Snapper root configuration existence (with unprivileged fallback)
+    local has_snapper_root_cfg=false cfg_name="root"
+    if compgen -G "${root}/etc/snapper/configs/*" >/dev/null 2>&1; then
+        local f
+        for f in "${root}"/etc/snapper/configs/*; do
+            if grep -qE '^[[:space:]]*SUBVOLUME=["'\'']?/["'\'']?[[:space:]]*$' "$f" 2>/dev/null; then
+                has_snapper_root_cfg=true
+                cfg_name="$(basename "$f")"
+                break
+            fi
+        done
+    fi
+    if ! $has_snapper_root_cfg && [[ -z "$root" ]] && command -v snapper &>/dev/null; then
+        local detected_cfg
+        detected_cfg="$(sudo -n snapper list-configs 2>/dev/null | awk '$2 == "/" || $3 == "/" {print $1; exit}' || true)"
+        if [[ -n "$detected_cfg" ]]; then
+            has_snapper_root_cfg=true
+            cfg_name="$detected_cfg"
+        fi
+    fi
+
+    # 2. ALPM hook deduplication
+    local has_snap_pac_hook=false
+    if compgen -G "${root}/usr/share/libalpm/hooks/*snap-pac-pre.hook" >/dev/null 2>&1 || \
+       compgen -G "${root}/etc/pacman.d/hooks/*snap-pac-pre.hook" >/dev/null 2>&1 || \
+       ([[ -z "$root" ]] && pacman -Qq snap-pac &>/dev/null); then
+        has_snap_pac_hook=true
+    fi
+
+    if $has_snap_pac_hook; then
+        if $has_snapper_root_cfg; then
+            echo "HOOK_SNAP_PAC"
+            return 0
+        else
+            echo "SNAP_PAC_UNCONFIGURED"
+            return 0
+        fi
+    fi
+
+    if compgen -G "${root}/usr/share/libalpm/hooks/*timeshift-autosnap*.hook" >/dev/null 2>&1 || \
+       compgen -G "${root}/etc/pacman.d/hooks/*timeshift-autosnap*.hook" >/dev/null 2>&1 || \
+       ([[ -z "$root" ]] && pacman -Qq timeshift-autosnap &>/dev/null); then
+        echo "HOOK_TIMESHIFT"
+        return 0
+    fi
+
+    # 3. Standalone Snapper
+    if $has_snapper_root_cfg; then
+        echo "SNAPPER $cfg_name"
+        return 0
+    fi
+
+    # 4. Standalone Timeshift
+    local ts_cfg="${root}/etc/timeshift/timeshift.json"
+    [[ ! -f "$ts_cfg" && -f "${root}/etc/timeshift.json" ]] && ts_cfg="${root}/etc/timeshift.json"
+    if [[ -f "$ts_cfg" ]] || ([[ -z "$root" ]] && command -v timeshift &>/dev/null); then
+        if [[ -f "$ts_cfg" ]] && grep -qiE '"btrfs_mode"[[:space:]]*:[[:space:]]*"?true"?' "$ts_cfg" 2>/dev/null; then
+            echo "TIMESHIFT_BTRFS"
+            return 0
+        elif [[ -f "$ts_cfg" ]]; then
+            echo "TIMESHIFT_RSYNC"
+            return 0
+        fi
+    fi
+
+    echo "BTRFS_NO_MANAGER"
+    return 0
+}
+
+# [SRE-AUDIT: CERTIFIED | Argon/Opus v2.56 | PATCH-047 | Fixtures: test-suite.sh Part 9.8]
+_create_preupgrade_snapshot() {
+    local provider="${1:-}"
+    local p_type="${provider%% *}"
+    local p_arg="${provider#* }"
+
+    case "$p_type" in
+        HOOK_*)
+            ok "Pre-Flight: Filesystem snapshot safety net active (handled automatically by ALPM hook)."
+            return 0
+            ;;
+        SNAPPER)
+            info "Pre-Flight: Creating pre-upgrade Btrfs snapshot via Snapper (config: $p_arg)..."
+            local snap_num
+            if snap_num="$(sudo snapper -c "$p_arg" create --type single --cleanup-algorithm number --description "sys-health pre-upgrade $(date +'%Y-%m-%d %H:%M')" --print-number)"; then
+                ok "Pre-Flight: Snapper snapshot #${snap_num} created successfully."
+                return 0
+            else
+                fail "Pre-Flight: Snapper snapshot creation failed!"
+                if [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
+                    return 1
+                fi
+                if [[ -t 0 ]]; then
+                    local s_ans
+                    read -r -p "Proceed with upgrade anyway without safety snapshot? [y/N]: " s_ans
+                    [[ "$s_ans" =~ ^[Yy]$ ]] && return 0
+                fi
+                return 1
+            fi
+            ;;
+        TIMESHIFT_BTRFS)
+            # Prune ancient sys-health on-demand snapshots to prevent accumulation (retain last 3)
+            local -a old_snaps=()
+            mapfile -t old_snaps < <(sudo timeshift --list 2>/dev/null | awk '/sys-health pre-upgrade/ {print $3}' || true)
+            if (( ${#old_snaps[@]} >= 4 )); then
+                info "Pre-Flight: Pruning oldest sys-health on-demand snapshot (${old_snaps[0]})..."
+                sudo timeshift --delete --snapshot "${old_snaps[0]}" 2>/dev/null || true
+            fi
+
+            info "Pre-Flight: Creating pre-upgrade Btrfs snapshot via Timeshift..."
+            if sudo timeshift --create --comments "sys-health pre-upgrade $(date +'%Y-%m-%d %H:%M')" --tags O; then
+                ok "Pre-Flight: Timeshift snapshot created successfully (tag: On-demand)."
+                return 0
+            else
+                fail "Pre-Flight: Timeshift snapshot failed!"
+                if [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
+                    return 1
+                fi
+                if [[ -t 0 ]]; then
+                    local t_ans
+                    read -r -p "Proceed with upgrade anyway without safety snapshot? [y/N]: " t_ans
+                    [[ "$t_ans" =~ ^[Yy]$ ]] && return 0
+                fi
+                return 1
+            fi
+            ;;
+        TIMESHIFT_RSYNC)
+            if [[ -n "${SYS_HEALTH_UNATTENDED:-}" ]]; then
+                info "Pre-Flight: Timeshift is in RSYNC mode; automatic snapshot omitted in unattended mode."
+                return 0
+            elif [[ -t 0 ]]; then
+                warn "Pre-Flight: Timeshift is configured in RSYNC mode (may take several minutes)."
+                local rsync_ans
+                read -r -p "Create RSYNC snapshot before upgrade? [y/N]: " rsync_ans
+                if [[ "$rsync_ans" =~ ^[Yy]$ ]]; then
+                    info "Creating Timeshift RSYNC snapshot..."
+                    sudo timeshift --create --comments "sys-health pre-upgrade $(date +'%Y-%m-%d %H:%M')" --tags O || true
+                fi
+            fi
+            return 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# [SRE-AUDIT: CERTIFIED | Argon/Opus v2.56 | PATCH-028/037/045-047 | Fixtures: test-suite.sh Part 9]
 run_guarded_upgrade() {
     section "GUARDED SYSTEM UPGRADE"
     info "Initiating Pre-Flight Safety Verification..."
@@ -11571,24 +11812,72 @@ run_guarded_upgrade() {
         ok "Pre-Flight Gate 1: Pacman cache space verified ($((cache_free_kb / 1048576)) GiB free)."
     fi
 
+    # Pre-Flight Gate 1b: Filesystem Snapshot Safety Net Inspection
+    local snapshot_provider
+    snapshot_provider="$(_detect_snapshot_provider)"
+    case "${snapshot_provider%% *}" in
+        HOOK_*)
+            ok "Pre-Flight Gate 1: Filesystem snapshot safety net verified (ALPM hook active)."
+            ;;
+        SNAPPER|TIMESHIFT_BTRFS)
+            if (( root_free_kb < 5242880 )); then
+                warn "Pre-Flight Gate 1: Free space for Btrfs snapshots is tight ($((root_free_kb / 1048576)) GiB free; recommended >=5 GiB)."
+            else
+                ok "Pre-Flight Gate 1: Snapshot provider detected ($snapshot_provider) — snapshot scheduled upon confirmation."
+            fi
+            ;;
+        SNAP_PAC_UNCONFIGURED)
+            warn "Pre-Flight Gate 1: 'snap-pac' is installed, but no Snapper configuration exists for root ('/')."
+            info "  › Tip: Create root configuration with: sudo snapper -c root create-config /"
+            ;;
+        BTRFS_NO_MANAGER)
+            info "Pre-Flight Gate 1: Btrfs root detected without active snapshot manager."
+            info "  › Tip: Install 'snap-pac' or 'btrfs-assistant' for automatic rollback protection."
+            ;;
+        NONE_NON_BTRFS)
+            ;;
+    esac
+
     # --------------------------------------------------------------------------
     # Gate 2: Package Manager Safety, Database Lock & Orphan Advisory
     # --------------------------------------------------------------------------
     local db_path
     db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
     local lockfile="${db_path%/}/db.lck"
-    if [[ -f "$lockfile" ]]; then
-        if sudo -n fuser "$lockfile" &>/dev/null || pgrep -x pacman &>/dev/null || pgrep -x yay &>/dev/null || pgrep -x paru &>/dev/null || pgrep -x eos-update &>/dev/null; then
+    local lock_classification
+    lock_classification="$(_classify_pacman_lock "$lockfile")" || true
+    case "$lock_classification" in
+        CLEAR)
+            ok "Pre-Flight Gate 2: Pacman database lock is clear."
+            ;;
+        ACTIVE_CLI|ACTIVE*)
             fail "Pre-Flight Gate 2: Pacman database is actively locked by an open process."
-        else
+            [[ "$lock_classification" =~ ^ACTIVE[[:space:]]+(.+) ]] && info "Active lock holder PID(s): ${BASH_REMATCH[1]}"
+            preflight_passed=false
+            ;;
+        UNDETERMINED)
+            fail "Pre-Flight Gate 2: Lockfile present ($lockfile) and background updater daemon is active."
+            info "Unprivileged inspection cannot rule out active lock ownership. Do NOT remove lockfile."
+            info "Wait for background daemon to complete or authenticate sudo to inspect."
+            preflight_passed=false
+            ;;
+        STALE_WITH_DAEMON)
+            fail "Pre-Flight Gate 2: Stale-looking pacman lockfile found at $lockfile."
+            warn "Notice: Resident updater daemon (packagekitd/pamac-daemon) is active in background."
+            info "Ensure desktop app stores (Discover/Pamac) are closed before manual removal: sudo rm $lockfile"
+            preflight_passed=false
+            ;;
+        STALE)
             fail "Pre-Flight Gate 2: Stale-looking pacman lockfile found at $lockfile."
             info "Per SRE safety standards, automatic deletion is disabled to eliminate TOCTOU race conditions."
             info "Inspect with 'sudo fuser $lockfile', then remove manually if safe: sudo rm $lockfile"
-        fi
-        preflight_passed=false
-    else
-        ok "Pre-Flight Gate 2: Pacman database lock is clear."
-    fi
+            preflight_passed=false
+            ;;
+        *)
+            fail "Pre-Flight Gate 2: Unknown pacman lock status ($lock_classification). Aborting for safety."
+            preflight_passed=false
+            ;;
+    esac
 
     if command -v pacman &>/dev/null; then
         if ! pacman -Dk &>/dev/null; then
@@ -11953,6 +12242,8 @@ run_guarded_upgrade() {
 
     [[ -n "$repo_raw" ]] && repo_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$repo_raw")"
     [[ -n "$aur_raw" ]] && aur_count="$(awk '/^[a-zA-Z0-9@._+-]/ {count++} END {print count+0}' <<< "$aur_raw")"
+    local -a pending_keyrings=()
+    mapfile -t pending_keyrings < <(_extract_pending_keyrings "$repo_raw")
 
     # Edge-case: System is fully up to date
     if (( repo_count == 0 && aur_count == 0 )); then
@@ -12155,6 +12446,26 @@ run_guarded_upgrade() {
         fi
     else
         up_cmd=(sudo pacman "$sync_flag")
+    fi
+
+    # Pre-Flight Gate 1b Realization: Execute filesystem snapshot after user confirmation
+    if ! _create_preupgrade_snapshot "$snapshot_provider"; then
+        fail "Pre-Flight: Snapshot safety net creation aborted upgrade."
+        return 1
+    fi
+
+    # Pre-Flight Keyring Synchronization Guard (PGP trustdb protection)
+    # Executed strictly AFTER transaction confirmation, immediately preceding bulk upgrade
+    if (( ${#pending_keyrings[@]} > 0 )); then
+        info "Pre-Flight: Synchronizing cryptographic trust keyrings (${pending_keyrings[*]}) to prevent PGP errors..."
+        info "Notice: Standalone keyring updates refresh trust keys only (safe). If you cancel the subsequent upgrade prompt, complete full upgrade with 'pacman -Syu' when ready."
+        local -a k_cmd=(sudo pacman -Sy --needed --noconfirm "${pending_keyrings[@]}")
+        if "${k_cmd[@]}"; then
+            ok "Pre-Flight: Cryptographic keyring(s) synchronized successfully."
+        else
+            warn "Pre-Flight: Keyring pre-synchronization reported warnings; proceeding to main upgrade transaction."
+        fi
+        echo ""
     fi
 
     info "Executing: ${up_cmd[*]}"
