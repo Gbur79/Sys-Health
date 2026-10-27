@@ -1,8 +1,8 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.44](https://img.shields.io/badge/Version-2.44-orange.svg)](CHANGELOG.md)
-[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-58%2F58%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
+[![Version: 2.57](https://img.shields.io/badge/Version-2.57-orange.svg)](CHANGELOG.md)
+[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-107%2F107%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -76,7 +76,8 @@ sys-health AI Session:
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
 * **Crash & Unclean Shutdown Forensics:** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, or hard system freezes.
 * **Runtime CPU Early Microcode Verification (`check_cpu_microcode`):** Interrogates `/sys/devices/system/cpu/cpu0/microcode/version` and early kernel logs (`journalctl -b 0 -k`), detecting runtime early microcode injection (e.g. `Intel early update: 0x1e ➔ 0x28`) and unpatched BIOS states. Gracefully accommodates virtual machines (`KVM`, `QEMU`, `Proxmox`, `VMware`) and containers (`PASS ✔ [VM guest - host managed]`).
-* **Hardened Hardware, Thermals & GPU Diagnostics (`check_gpu`, `check_gpu_errors`, `check_dkms`, `check_smart`, `check_power`, `check_fstrim`):**
+* **Hardened Hardware, Thermals & GPU Diagnostics (`check_gpu`, `check_gpu_errors`, `check_dkms`, `check_smart`, `check_power`, `check_cpu_governor`, `check_fstrim`):**
+  * Proactive CPU scaling governor and power daemon verification across all online cores (`check_cpu_governor`), detecting legacy configuration drift (`/etc/default/cpupower` vs `cpupower-service.conf`), inactive enabled services, runtime desync, and conflicting power managers (`power-profiles-daemon`, `tlp`, `auto-cpufreq`).
   * Universal 4-digit PCI domain delimitation (`0000:xx:xx.x`), preventing audio/network controller leakage into GPU driver states.
   * Real-time GPU driver telemetry (NVIDIA proprietary/legacy, AMD RADV, Intel Arc Xe with GuC initialization noise immunity).
   * Freshness-guarded Xorg fliplock inspection validated against current system boot time (`btime`).
