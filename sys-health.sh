@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.55
+# Arch System Health & Diagnostics v2.57
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.55"
+VERSION="2.57"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -280,7 +280,7 @@ EOF
         while IFS= read -r item; do
             [[ -z "$item" ]] && continue
             case "$item" in
-                systemd_failed|systemd_user_failed)
+                systemd_failed|systemd_user_failed|cpu_governor)
                     has_systemd=true
                     ;;
                 gpu|gpu_errors|dkms|vulkan_32bit|gtx970_vram|gpu_vram)
@@ -6202,6 +6202,172 @@ check_power() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.57 / Argon | PATCH-048 | Fixtures: test-suite.sh Part 20]
+check_cpu_governor() {
+    local root="${SYS_HEALTH_ROOT:-}"
+
+    # 1. Virtualization & Container Isolation
+    local virt_type=""
+    if command -v systemd-detect-virt &>/dev/null && [[ -z "$root" ]]; then
+        virt_type="$(systemd-detect-virt 2>/dev/null || true)"
+    fi
+    if [[ -z "$virt_type" ]] && grep -qiE 'hypervisor|qemu|kvm' "${root}/proc/cpuinfo" 2>/dev/null; then
+        virt_type="virtualized"
+    fi
+
+    # 2. Discover Runtime Scaling Governors Across Online Cores
+    local -a gov_files=()
+    for gf in "${root}"/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -r "$gf" ]] && gov_files+=("$gf")
+    done
+
+    if (( ${#gov_files[@]} == 0 )); then
+        if [[ -n "$virt_type" && "$virt_type" != "none" ]]; then
+            add_row "CPU power governor" "PASS ✔ (VM guest [$virt_type] - host managed)" "HW"
+            log "HEALTH cpu_governor=PASS virt=$virt_type"
+            return 0
+        else
+            add_row "CPU power governor" "INFO ℹ (no cpufreq driver active)" "HW"
+            ((INFO_COUNT++))
+            log "HEALTH cpu_governor=INFO reason=no_cpufreq"
+            return 0
+        fi
+    fi
+
+    local -a govs=()
+    for gf in "${gov_files[@]}"; do
+        local g=""
+        g="$(< "$gf")"
+        g="${g//[[:space:]]/}"
+        [[ -n "$g" ]] && govs+=("$g")
+    done
+
+    local active_gov="unknown"
+    if (( ${#govs[@]} > 0 )); then
+        local -a uniq_govs=()
+        while IFS= read -r ug; do
+            [[ -n "$ug" ]] && uniq_govs+=("$ug")
+        done < <(printf '%s\n' "${govs[@]}" | sort -u)
+
+        if (( ${#uniq_govs[@]} == 1 )); then
+            active_gov="${uniq_govs[0]}"
+        else
+            local old_ifs="$IFS"
+            IFS=','
+            active_gov="mixed (${uniq_govs[*]})"
+            IFS="$old_ifs"
+        fi
+    fi
+
+    # 3. Detect Power Management Services
+    local cpupower_enabled=false
+    if command -v systemctl &>/dev/null && [[ -z "$root" ]]; then
+        if systemctl is-enabled cpupower.service &>/dev/null; then
+            cpupower_enabled=true
+        fi
+    elif [[ -L "${root}/etc/systemd/system/multi-user.target.wants/cpupower.service" ]] || \
+         [[ -f "${root}/etc/systemd/system/multi-user.target.wants/cpupower.service" ]] || \
+         [[ -f "${root}/etc/systemd/system/cpupower.service" ]]; then
+        cpupower_enabled=true
+    fi
+
+    local ppd_active=false tlp_active=false autocpu_active=false
+    if command -v systemctl &>/dev/null && [[ -z "$root" ]]; then
+        systemctl is-active power-profiles-daemon.service &>/dev/null && ppd_active=true
+        systemctl is-active tlp.service &>/dev/null && tlp_active=true
+        systemctl is-active auto-cpufreq.service &>/dev/null && autocpu_active=true
+    fi
+
+    # 4. Conflict Detection
+    local -a active_daemons=()
+    $cpupower_enabled && active_daemons+=("cpupower")
+    $ppd_active && active_daemons+=("power-profiles-daemon")
+    $tlp_active && active_daemons+=("tlp")
+    $autocpu_active && active_daemons+=("auto-cpufreq")
+
+    if (( ${#active_daemons[@]} > 1 )); then
+        local old_ifs="$IFS"
+        IFS=', '
+        local d_list="${active_daemons[*]}"
+        IFS="$old_ifs"
+        add_row "CPU power governor" "WARN ⚠ (Conflicting power daemons active: $d_list)" "HW"
+        ((WARNINGS++))
+        log "HEALTH cpu_governor=WARN reason=conflicting_services services='$d_list'"
+        return 0
+    fi
+
+    # 5. cpupower Service Verification & Drift Audit
+    if $cpupower_enabled; then
+        local modern_conf="${root}/etc/default/cpupower-service.conf"
+        local legacy_conf="${root}/etc/default/cpupower"
+        local conf_gov="" has_active_directives=false
+
+        if [[ -f "$modern_conf" ]]; then
+            conf_gov="$(grep -E '^[[:space:]]*GOVERNOR=' "$modern_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\'\"" | tr -d '[:space:]' || true)"
+            if grep -q -E '^[[:space:]]*(GOVERNOR|FREQ|MIN_FREQ|MAX_FREQ|PERF_BIAS|EPP)=' "$modern_conf" 2>/dev/null; then
+                has_active_directives=true
+            fi
+        fi
+
+        local legacy_gov=""
+        if [[ -f "$legacy_conf" ]]; then
+            legacy_gov="$(grep -iE '^[[:space:]]*governor=' "$legacy_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\'\"" | tr -d '[:space:]' || true)"
+        fi
+
+        # Defect A: Legacy Config Drift
+        if ! $has_active_directives && [[ -n "$legacy_gov" ]]; then
+            add_row "CPU power governor" "WARN ⚠ (cpupower drift: legacy /etc/default/cpupower ignored; configure cpupower-service.conf)" "HW"
+            ((WARNINGS++))
+            log "HEALTH cpu_governor=WARN reason=legacy_config_drift legacy_gov=$legacy_gov active_gov=$active_gov"
+            return 0
+        fi
+
+        # Defect B: Unconfigured Service (No-op)
+        if ! $has_active_directives; then
+            add_row "CPU power governor" "WARN ⚠ (cpupower.service enabled but no active directives in cpupower-service.conf)" "HW"
+            ((WARNINGS++))
+            log "HEALTH cpu_governor=WARN reason=unconfigured_service active_gov=$active_gov"
+            return 0
+        fi
+
+        # Defect C: Configured Governor Mismatch
+        if [[ -n "$conf_gov" && "$active_gov" != "$conf_gov" ]]; then
+            add_row "CPU power governor" "WARN ⚠ (cpupower desync: configured '$conf_gov', running '$active_gov')" "HW"
+            ((WARNINGS++))
+            log "HEALTH cpu_governor=WARN reason=governor_mismatch configured=$conf_gov active=$active_gov"
+            return 0
+        fi
+
+        add_row "CPU power governor" "PASS ✔ (${active_gov} [cpupower])" "HW"
+        log "HEALTH cpu_governor=PASS governor=$active_gov manager=cpupower"
+        return 0
+    fi
+
+    # 6. Alternative Power Managers (PPD / TLP / auto-cpufreq)
+    if $ppd_active; then
+        local ppd_profile="active"
+        if command -v powerprofilesctl &>/dev/null && [[ -z "$root" ]]; then
+            ppd_profile="$(powerprofilesctl get 2>/dev/null || echo "active")"
+        fi
+        add_row "CPU power governor" "PASS ✔ (${active_gov} [power-profiles-daemon: ${ppd_profile}])" "HW"
+        log "HEALTH cpu_governor=PASS governor=$active_gov manager=power-profiles-daemon profile=$ppd_profile"
+        return 0
+    elif $tlp_active; then
+        add_row "CPU power governor" "PASS ✔ (${active_gov} [TLP])" "HW"
+        log "HEALTH cpu_governor=PASS governor=$active_gov manager=tlp"
+        return 0
+    elif $autocpu_active; then
+        add_row "CPU power governor" "PASS ✔ (${active_gov} [auto-cpufreq])" "HW"
+        log "HEALTH cpu_governor=PASS governor=$active_gov manager=auto-cpufreq"
+        return 0
+    fi
+
+    # 7. Unmanaged Kernel Governance Default
+    add_row "CPU power governor" "PASS ✔ (${active_gov} [kernel default])" "HW"
+    log "HEALTH cpu_governor=PASS governor=$active_gov manager=kernel"
+    return 0
+}
+
 # [SRE-AUDIT: CERTIFIED | Sol v2.54 | PATCH-017 | Fixtures: test-suite.sh Part 18]
 check_fstrim() {
     if ! command -v systemctl &>/dev/null; then
@@ -8522,6 +8688,29 @@ generate_summary_json() {
                     fix="Connect AC power adapter before performing upgrades"
                     risk="HIGH"
                     ;;
+                cpu_governor)
+                    if [[ "$rest" =~ reason=legacy_config_drift ]]; then
+                        code="CPU_GOVERNOR_LEGACY_CONFIG_DRIFT"
+                        summary="cpupower.service is enabled but ignores legacy /etc/default/cpupower"
+                        fix="Migrate GOVERNOR setting to /etc/default/cpupower-service.conf and restart cpupower.service"
+                        risk="LOW"
+                    elif [[ "$rest" =~ reason=unconfigured_service ]]; then
+                        code="CPU_GOVERNOR_SERVICE_UNCONFIGURED"
+                        summary="cpupower.service is enabled but has no active directives set"
+                        fix="Define GOVERNOR in /etc/default/cpupower-service.conf and restart cpupower.service"
+                        risk="LOW"
+                    elif [[ "$rest" =~ reason=conflicting_services ]]; then
+                        code="POWER_SERVICES_CONFLICT"
+                        summary="Multiple conflicting power management services are concurrently active"
+                        fix="Disable redundant power management services (keep only cpupower or power-profiles-daemon)"
+                        risk="MEDIUM"
+                    else
+                        code="CPU_GOVERNOR_DESYNC"
+                        summary="Active CPU scaling governor does not match configured service governor"
+                        fix="Restart cpupower.service (sudo systemctl restart cpupower) and check kernel driver support"
+                        risk="LOW"
+                    fi
+                    ;;
                 root_space)
                     if [[ "$details" =~ status=read_only ]]; then
                         code="STORAGE_ROOT_READ_ONLY"
@@ -8953,6 +9142,7 @@ run_health_check() {
     check_smart
     check_audio
     check_power
+    check_cpu_governor
     check_fstrim
     render_audit_section "HARDWARE & DRIVERS" "$AUDIT_TABLE_HW"
 
