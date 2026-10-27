@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.57] - 2026-10-27
+
+### Added & Hardened (EOS-SRE Architectural Audit - CPU Power Governance & Drift Detection / PATCH-048)
+- **Hardware & Drivers (MOD-05) - CPU Power Governor & Drift Audit (`check_cpu_governor`, `PATCH-048`)**:
+  - Implemented proactive verification of CPU power management and governor enforcement across online cores (`/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`).
+  - **Legacy Config Drift Detection:** Detects `cpupower.service` enabled with deprecated `/etc/default/cpupower` configurations ignored by upstream cpupower 7.3+ (`/etc/default/cpupower-service.conf`), averting silent failure and performance degradation.
+  - **Silent No-op Service Detection:** Detects enabled `cpupower.service` with no active directives defined in `cpupower-service.conf`.
+  - **Runtime Desync Detection:** Warns when active scaling governor does not match configured service governor (`governor_mismatch`).
+  - **Conflicting Daemons Detection:** Detects concurrent activation of conflicting power daemons (`cpupower`, `power-profiles-daemon`, `tlp`, `auto-cpufreq`).
+  - **Universalism & Virtualization:** Transparent handling of host-managed virtual guests (KVM/QEMU) and unmanaged kernel defaults (`PASS ✔`), preserving battery and server profiles without hardcoding performance bias.
+- **Machine Telemetry & AI Context (MOD-08, Schema 2.0)**:
+  - Added structured tags `HEALTH cpu_governor=(WARN|PASS|INFO)` in telemetry log and `generate_summary_json()`.
+  - Added actionable remediation entries (`CPU_GOVERNOR_LEGACY_CONFIG_DRIFT`, `CPU_GOVERNOR_SERVICE_UNCONFIGURED`, `POWER_SERVICES_CONFLICT`, `CPU_GOVERNOR_DESYNC`) in `summary.json`.
+  - Linked `cpu_governor` flagged events to systemd evidence routing in `show_ai_context()`.
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Added Part 20 with 6 new test fixtures (Fixtures 20.1 - 20.6) covering legacy config drift, unconfigured service, governor desync, cpupower pass, kernel default pass, and VM guest host management (`107/107 PASS`).
+
 ## [2.56] - 2026-10-25
 
 ### Added & Hardened (SRE Architectural Audit - Guarded System Upgrade Hardening / PATCH-045, PATCH-046, PATCH-047)
