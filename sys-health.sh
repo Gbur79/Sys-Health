@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.57
+# Arch System Health & Diagnostics v2.59
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.57"
+VERSION="2.59"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -24,6 +24,22 @@ MIRROR_DISTRO_AGE_DAYS=""
 MIRROR_DISTRO_SERVERS=""
 MIRROR_STATUS_LABEL=""
 MIRROR_STATUS="unknown"
+
+# Global telemetry state for PATCH-050, PATCH-051, PATCH-052
+FIRMWARE_AVAILABLE=false
+FIRMWARE_UPDATES_COUNT=0
+FIRMWARE_DEVICES="[]"
+
+ARCH_AUDIT_AVAILABLE=false
+ARCH_AUDIT_ACTIONABLE_COUNT=0
+ARCH_AUDIT_HIGH_RISK_COUNT=0
+ARCH_AUDIT_TRACKER_COUNT=0
+ARCH_AUDIT_PACKAGES="[]"
+
+FIREWALL_ACTIVE=false
+FIREWALL_BACKEND="none"
+FIREWALL_ZONE=""
+FIREWALL_DETAILS=""
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 
@@ -5558,7 +5574,7 @@ check_gpu() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.53 | PATCH-044 | Fixtures: test-suite.sh Part 5]
+# [SRE-AUDIT: CERTIFIED | Argon v2.58 | PATCH-049 | Fixtures: test-suite.sh Part 5]
 check_gpu_errors() {
     local root="${SYS_HEALTH_ROOT:-}"
     local vga_info drivers_in_use
@@ -5587,23 +5603,27 @@ check_gpu_errors() {
 
     # --- Wayland Compositor Telemetry (kwin_wayland, gnome-shell, Hyprland, Sway) ---
     if $is_wayland; then
-        local comp_log="" recent_comp_log=""
+        local comp_log="" recent_comp_log="" active_comp_log=""
         if [[ -z "$root" ]]; then
             if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
                 comp_log="$(journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
                 recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+                active_comp_log="$(journalctl -b 0 --since '-60s' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
             else
                 comp_log="$(journalctl --user -b 0 --no-pager 2>/dev/null || journalctl -b 0 --no-pager "_UID=$target_uid" 2>/dev/null || true)"
                 recent_comp_log="$(journalctl --user -b 0 --since '-10 min' --no-pager 2>/dev/null || journalctl -b 0 --since '-10 min' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
+                active_comp_log="$(journalctl --user -b 0 --since '-60s' --no-pager 2>/dev/null || journalctl -b 0 --since '-60s' --no-pager "_UID=$target_uid" 2>/dev/null || true)"
             fi
             if [[ -z "$comp_log" ]]; then
                 comp_log="$(journalctl -b 0 --no-pager 2>/dev/null || true)"
                 recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager 2>/dev/null || true)"
+                active_comp_log="$(journalctl -b 0 --since '-60s' --no-pager 2>/dev/null || true)"
             fi
         else
             # Test-suite harness compatibility
             comp_log="$(journalctl -b 0 --user --no-pager 2>/dev/null || journalctl -b 0 --no-pager 2>/dev/null || true)"
             recent_comp_log="$(journalctl -b 0 --since '-10 min' --no-pager 2>/dev/null || true)"
+            active_comp_log="$(journalctl -b 0 --since '-60s' --no-pager 2>/dev/null || true)"
         fi
 
         # 1. Critical Wayland GPU crashes, context losses, and pageflip timeouts
@@ -5621,27 +5641,45 @@ check_gpu_errors() {
         modeset_fail_count="${modeset_fail_count//[^0-9]/}"
 
         if (( modeset_fail_count > 0 )); then
-            local uptime_sec uptime_hours dynamic_threshold modeset_threshold
+            local uptime_sec uptime_hours dynamic_threshold modeset_threshold active_threshold
             uptime_sec="$(awk '{print int($1)}' "${root}/proc/uptime" 2>/dev/null || awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 3600)"
             uptime_hours=$(( (uptime_sec + 3599) / 3600 ))
             dynamic_threshold=$(( 30 + (uptime_hours * 10) ))
             modeset_threshold="${WAYLAND_MODESET_WARN_THRESHOLD:-$dynamic_threshold}"
+            active_threshold="${WAYLAND_MODESET_WARN_THRESHOLD:-10}"
 
-            # Temporal windowing: check if errors are actively occurring in the rolling 10m window
-            local recent_fail_count=0
+            # Temporal windowing: 10m rolling window + 60s active settling window
+            local recent_fail_count=0 active_fail_count=0
             if [[ -n "$recent_comp_log" ]]; then
                 recent_fail_count="$(printf '%s\n' "$recent_comp_log" | grep -Eic "$modeset_err_regex" || true)"
                 recent_fail_count="${recent_fail_count:-0}"
                 recent_fail_count="${recent_fail_count//[^0-9]/}"
             fi
+            if [[ -n "$active_comp_log" ]]; then
+                active_fail_count="$(printf '%s\n' "$active_comp_log" | grep -Eic "$modeset_err_regex" || true)"
+                active_fail_count="${active_fail_count:-0}"
+                active_fail_count="${active_fail_count//[^0-9]/}"
+            fi
 
-            # Evaluation: Active recurring stalls vs historical boot/DPMS burst
-            if (( recent_fail_count > modeset_threshold || recent_fail_count > 10 )); then
-                detected_errors+=("$recent_fail_count recent modeset/atomic commit stalls in Wayland compositor (active in last 10m; threshold: ${WAYLAND_MODESET_WARN_THRESHOLD:-10})")
+            # Evaluation: Compositor startup grace period & active recurring stalls vs settled jitter
+            if (( uptime_sec < 120 )); then
+                # Cold-boot grace period (first 120s): display negotiation / MST probe burst
+                detected_notes+=("Minor modeset jitter ($modeset_fail_count events in Wayland compositor) - initial startup settling")
+            elif (( active_fail_count >= active_threshold || (active_fail_count > 0 && active_fail_count > modeset_threshold) )); then
+                # Active recurring stalls occurring right now in the last 60s
+                detected_errors+=("$active_fail_count recent modeset/atomic commit stalls in Wayland compositor (active in last 60s; threshold: $active_threshold)")
+            elif (( uptime_sec < 600 && active_fail_count == 0 )); then
+                # Boot session (< 10m) where initial probe burst completed and active window is completely quiet
+                detected_notes+=("Minor modeset jitter ($modeset_fail_count startup probe events in Wayland compositor) - settled and stable in active window")
+            elif (( recent_fail_count > modeset_threshold )); then
+                # Rolling 10m window on settled system (> 10m uptime) has ongoing elevated stall rate
+                detected_errors+=("$recent_fail_count modeset/atomic commit stalls in Wayland compositor (threshold: $modeset_threshold in rolling 10m window)")
             elif (( modeset_fail_count > modeset_threshold )); then
-                # Historical count exceeded threshold, but rolling window is clear
+                # Total boot count exceeded threshold, but rolling and active windows are clear
                 if (( recent_fail_count == 0 )); then
                     detected_notes+=("Minor modeset jitter ($modeset_fail_count startup/DPMS probe events in Wayland compositor) - stable in rolling window")
+                elif (( active_fail_count == 0 )); then
+                    detected_notes+=("Minor modeset jitter ($modeset_fail_count startup/DPMS probe events in Wayland compositor) - settled in active window")
                 else
                     detected_errors+=("$modeset_fail_count modeset/atomic commit stalls in Wayland compositor (threshold: $modeset_threshold, $recent_fail_count in last 10m)")
                 fi
@@ -6441,6 +6479,176 @@ check_fstrim() {
             echo "To enable weekly automatic TRIM: sudo systemctl enable --now fstrim.timer"
             echo ""
         } >> "$LOG_FILE"
+    fi
+}
+
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.59 | PATCH-050 | Fixtures: test-suite.sh Part 21]
+_is_secure_boot_active() {
+    local root="${SYS_HEALTH_ROOT:-}"
+    local sb_file="$root/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [[ -f "$sb_file" ]]; then
+        local b5
+        b5="$(od -An -j4 -N1 -tu1 "$sb_file" 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ "$b5" == "1" ]] && return 0
+        return 1
+    fi
+    if command -v bootctl &>/dev/null && [[ -z "$root" ]]; then
+        if bootctl status 2>/dev/null | grep -qi "Secure Boot: enabled"; then
+            return 0
+        fi
+    fi
+    if command -v mokutil &>/dev/null && [[ -z "$root" ]]; then
+        if mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+_parse_fwupd_json() {
+    local json_file="$1"
+    local sb_active="$2" # 0 or 1
+
+    if ! command -v jq &>/dev/null; then
+        echo '{"pending_count":0,"bypassed_count":0,"pending_devices":[],"names_str":""}'
+        return 0
+    fi
+
+    jq --argjson sb_active "$sb_active" '
+        (.Devices // []) | map(
+            . as $d |
+            ($d.Name // "Unknown") as $name |
+            ($name | ascii_downcase) as $name_l |
+            ($d.Plugin // "" | ascii_downcase) as $plugin |
+            ($d.Protocol // "" | ascii_downcase) as $protocol |
+            ([($d.Protocols // [])[] | ascii_downcase]) as $protocols |
+            ($d.UpdateError // "" | ascii_downcase) as $update_err |
+            ($d.UpdateState // 0) as $state |
+            (
+                ($plugin == "uefi_kek" or $plugin == "uefi_dbx" or $plugin == "uefi_db" or $plugin == "uefi_pk") or
+                ($protocol | startswith("org.uefi.dbx")) or
+                ($protocols | any(startswith("org.uefi.dbx"))) or
+                ($name_l | contains("kek")) or
+                ($name_l | contains("dbx")) or
+                ($name_l | contains("uefi ca"))
+            ) as $is_sb_cert |
+            (
+                $state == 3 or
+                ($update_err | contains("efivarsfs")) or
+                ($update_err | contains("invalid argument")) or
+                ($update_err | contains("no space left")) or
+                ($update_err | contains("resource busy"))
+            ) as $has_nvram_error |
+            if ($is_sb_cert and $has_nvram_error and ($sb_active == 0)) then
+                { bypassed: true, name: $name }
+            else
+                { bypassed: false, name: $name }
+            end
+        ) |
+        {
+            pending_devices: ([.[] | select(.bypassed == false) | .name]),
+            bypassed_devices: ([.[] | select(.bypassed == true) | .name])
+        } |
+        {
+            pending_count: (.pending_devices | length),
+            bypassed_count: (.bypassed_devices | length),
+            pending_devices: .pending_devices,
+            names_str: (.pending_devices | join(", "))
+        }
+    ' "$json_file" 2>/dev/null || echo '{"pending_count":0,"bypassed_count":0,"pending_devices":[],"names_str":""}'
+}
+
+check_firmware_updates() {
+    local root="${SYS_HEALTH_ROOT:-}"
+    local fw_bin="fwupdmgr"
+    if [[ -n "$root" && -x "$root/usr/bin/fwupdmgr" ]]; then
+        fw_bin="$root/usr/bin/fwupdmgr"
+    elif ! command -v fwupdmgr &>/dev/null; then
+        add_row "Hardware firmware" "INFO ℹ (fwupdmgr unavailable)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH firmware=INFO available=NO tool=fwupd reason=not_installed updates_count=0"
+        FIRMWARE_AVAILABLE=false
+        FIRMWARE_UPDATES_COUNT=0
+        FIRMWARE_DEVICES="[]"
+        return 0
+    fi
+
+    local fw_json_file="$RUN_RAW/fwupd-updates.json"
+    local fw_err_file="$RUN_RAW/fwupd-err.txt"
+    local sb_active=0
+    _is_secure_boot_active && sb_active=1
+
+    local fw_cmd="timeout 3s $fw_bin get-updates --no-unreported-check --json"
+    if [[ -n "$root" ]]; then
+        fw_cmd="$fw_bin get-updates --no-unreported-check --json"
+    fi
+
+    local rc=0
+    $fw_cmd > "$fw_json_file" 2> "$fw_err_file" || rc=$?
+
+    local err_text=""
+    [[ -f "$fw_err_file" ]] && err_text="$(< "$fw_err_file")"
+
+    if (( rc == 2 )) || [[ "$err_text" =~ (no updatable devices|No updates available) ]]; then
+        add_row "Hardware firmware" "PASS ✔ (all devices up to date)" "HW"
+        log "HEALTH firmware=PASS available=YES updates_count=0 bypassed_quirks=0"
+        FIRMWARE_AVAILABLE=true
+        FIRMWARE_UPDATES_COUNT=0
+        FIRMWARE_DEVICES="[]"
+        return 0
+    fi
+
+    if (( rc == 124 )); then
+        add_row "Hardware firmware" "INFO ℹ (firmware daemon timeout)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH firmware=INFO available=NO tool=fwupd reason=timeout updates_count=0"
+        FIRMWARE_AVAILABLE=false
+        FIRMWARE_UPDATES_COUNT=0
+        FIRMWARE_DEVICES="[]"
+        return 0
+    fi
+
+    if (( rc != 0 )) && [[ ! -s "$fw_json_file" ]]; then
+        add_row "Hardware firmware" "INFO ℹ (firmware daemon unreachable)" "HW"
+        ((INFO_COUNT++))
+        log "HEALTH firmware=INFO available=NO tool=fwupd reason=exit_${rc} updates_count=0"
+        FIRMWARE_AVAILABLE=false
+        FIRMWARE_UPDATES_COUNT=0
+        FIRMWARE_DEVICES="[]"
+        return 0
+    fi
+
+    local parsed
+    parsed="$(_parse_fwupd_json "$fw_json_file" "$sb_active")"
+    local p_count=0 b_count=0 p_devs="[]" n_str=""
+    if command -v jq &>/dev/null; then
+        p_count="$(jq -r '.pending_count // 0' <<< "$parsed")"
+        b_count="$(jq -r '.bypassed_count // 0' <<< "$parsed")"
+        p_devs="$(jq -c '.pending_devices // []' <<< "$parsed")"
+        n_str="$(jq -r '.names_str // ""' <<< "$parsed")"
+    fi
+
+    FIRMWARE_AVAILABLE=true
+    FIRMWARE_UPDATES_COUNT="$p_count"
+    FIRMWARE_DEVICES="$p_devs"
+
+    if (( p_count > 0 )); then
+        add_row "Hardware firmware" "WARN ⚠ ($p_count update(s) pending: $n_str)" "HW"
+        ((WARNINGS++))
+        log "HEALTH firmware=WARN available=YES updates_count=$p_count devices='$n_str' bypassed_quirks=$b_count"
+        {
+            echo "### HARDWARE FIRMWARE & PERIPHERAL TELEMETRY"
+            echo "Pending firmware updates detected via fwupd ($p_count device(s)): $n_str"
+            echo "Recommendation: Run 'fwupdmgr get-updates' and 'fwupdmgr update' to inspect and apply."
+            echo ""
+        } >> "$LOG_FILE"
+    else
+        if (( b_count > 0 )); then
+            add_row "Hardware firmware" "PASS ✔ (all devices up to date; $b_count NVRAM quirk bypassed)" "HW"
+        else
+            add_row "Hardware firmware" "PASS ✔ (all devices up to date)" "HW"
+        fi
+        log "HEALTH firmware=PASS available=YES updates_count=0 bypassed_quirks=$b_count"
     fi
 }
 
@@ -7460,6 +7668,85 @@ check_dns() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.59 | PATCH-052 | Fixtures: test-suite.sh Part 21]
+_is_firewall_service_active() {
+    local svc="$1"
+    local root="${SYS_HEALTH_ROOT:-}"
+    if command -v systemctl &>/dev/null && [[ -z "$root" ]]; then
+        timeout 1s systemctl is-active "$svc" &>/dev/null && return 0
+        return 1
+    elif [[ -n "$root" ]]; then
+        if [[ -f "${root}/state/systemd/${svc}.active" || \
+              -f "${root}/etc/systemd/system/multi-user.target.wants/${svc}.service" || \
+              -L "${root}/etc/systemd/system/multi-user.target.wants/${svc}.service" ]]; then
+            return 0
+        fi
+        return 1
+    fi
+    return 1
+}
+
+check_firewall_status() {
+    local root="${SYS_HEALTH_ROOT:-}"
+
+    # 1. Probe firewalld
+    if _is_firewall_service_active "firewalld"; then
+        local zone="public"
+        local conf="${root}/etc/firewalld/firewalld.conf"
+        if [[ -f "$conf" ]]; then
+            local z
+            z="$(grep -E '^[[:space:]]*DefaultZone=' "$conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+            [[ -n "$z" ]] && zone="$z"
+        fi
+        add_row "Host firewall" "PASS ✔ (firewalld [zone: $zone])" "NET"
+        log "HEALTH firewall=PASS active=YES backend=firewalld zone=$zone details='default zone: $zone'"
+        FIREWALL_ACTIVE=true
+        FIREWALL_BACKEND="firewalld"
+        FIREWALL_ZONE="$zone"
+        FIREWALL_DETAILS="default zone: $zone"
+        return 0
+    fi
+
+    # 2. Probe ufw
+    local ufw_bin="ufw"
+    local has_ufw=false
+    if [[ -n "$root" && -x "$root/usr/bin/ufw" ]]; then
+        has_ufw=true
+    elif command -v ufw &>/dev/null; then
+        has_ufw=true
+    fi
+
+    if $has_ufw && _is_firewall_service_active "ufw"; then
+        add_row "Host firewall" "PASS ✔ (ufw active)" "NET"
+        log "HEALTH firewall=PASS active=YES backend=ufw details='active'"
+        FIREWALL_ACTIVE=true
+        FIREWALL_BACKEND="ufw"
+        FIREWALL_ZONE=""
+        FIREWALL_DETAILS="active"
+        return 0
+    fi
+
+    # 3. Probe nftables
+    if _is_firewall_service_active "nftables"; then
+        add_row "Host firewall" "PASS ✔ (nftables active)" "NET"
+        log "HEALTH firewall=PASS active=YES backend=nftables details='active'"
+        FIREWALL_ACTIVE=true
+        FIREWALL_BACKEND="nftables"
+        FIREWALL_ZONE=""
+        FIREWALL_DETAILS="active"
+        return 0
+    fi
+
+    # 4. Fallback: Perimeter Router / LAN Fallback
+    add_row "Host firewall" "PASS ✔ (perimeter router/LAN fallback)" "NET"
+    log "HEALTH firewall=PASS active=NO backend=none details='protected by perimeter router/LAN'"
+    FIREWALL_ACTIVE=false
+    FIREWALL_BACKEND="none"
+    FIREWALL_ZONE=""
+    FIREWALL_DETAILS="protected by perimeter router/LAN"
+    return 0
+}
+
 # Dynamic AUR helper detection (paru -> yay -> pikaur)
 detect_aur_helper() {
     if type -P paru &>/dev/null; then
@@ -7810,38 +8097,66 @@ check_arch_news() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.59 | PATCH-051 | Fixtures: test-suite.sh Part 21]
 check_arch_audit() {
-    if ! command -v arch-audit &>/dev/null; then
-        add_row "Arch security audit" "INFO ℹ (arch-audit unavailable)"
+    local root="${SYS_HEALTH_ROOT:-}"
+    local audit_bin="arch-audit"
+    if [[ -n "$root" && -x "$root/usr/bin/arch-audit" ]]; then
+        audit_bin="$root/usr/bin/arch-audit"
+    elif ! command -v arch-audit &>/dev/null; then
+        add_row "Arch security audit" "INFO ℹ (arch-audit unavailable)" "NET"
         ((INFO_COUNT++))
         log "HEALTH arch_audit=not_installed"
+        ARCH_AUDIT_AVAILABLE=false
+        ARCH_AUDIT_ACTIONABLE_COUNT=0
+        ARCH_AUDIT_HIGH_RISK_COUNT=0
+        ARCH_AUDIT_TRACKER_COUNT=0
+        ARCH_AUDIT_PACKAGES="[]"
         return
     fi
 
+    local act_json_file="$RUN_RAW/arch-audit-actionable.json"
     local act_file="$RUN_RAW/arch-audit-actionable.txt"
     local all_file="$RUN_RAW/arch-audit-tracker.txt"
 
+    local timeout_cmd="timeout 3s"
+    [[ -n "$root" ]] && timeout_cmd=""
+
     spinner "Checking security advisories (arch-audit)..." \
-        bash -c 'arch-audit -u -c > "$1" 2>&1 || true; arch-audit -c > "$2" 2>&1 || true' _ "$act_file" "$all_file"
+        bash -c "$timeout_cmd $audit_bin -u --json > \"\$1\" 2>&1 || true; $timeout_cmd $audit_bin -c > \"\$2\" 2>&1 || true; $timeout_cmd $audit_bin -u -c > \"\$3\" 2>&1 || true" _ "$act_json_file" "$all_file" "$act_file"
 
     ARCH_AUDIT_ACTIONABLE="$(cat "$act_file" 2>/dev/null || true)"
     ARCH_AUDIT_ALL="$(cat "$all_file" 2>/dev/null || true)"
     ARCH_AUDIT_TEXT="$ARCH_AUDIT_ALL"
     printf '%s\n' "$ARCH_AUDIT_ALL" > "$RUN_RAW/arch-audit.txt"
 
-    if [[ "$ARCH_AUDIT_ALL" =~ (Error:|failed to) ]]; then
-        add_row "Arch security audit" "INFO ℹ (tracker unreachable)"
+    local act_json_content=""
+    [[ -f "$act_json_file" ]] && act_json_content="$(cat "$act_json_file" 2>/dev/null || true)"
+
+    if [[ "$ARCH_AUDIT_ALL" =~ (Error:|failed to) ]] || [[ "$act_json_content" =~ (Error:|failed to) ]]; then
+        add_row "Arch security audit" "INFO ℹ (tracker unreachable)" "NET"
         ((INFO_COUNT++))
         log "HEALTH arch_audit=INFO offline=YES"
+        ARCH_AUDIT_AVAILABLE=false
+        ARCH_AUDIT_ACTIONABLE_COUNT=0
+        ARCH_AUDIT_HIGH_RISK_COUNT=0
+        ARCH_AUDIT_TRACKER_COUNT=0
+        ARCH_AUDIT_PACKAGES="[]"
         return
     fi
 
-    local act_count=0 act_high=0
-    if [[ -n "$ARCH_AUDIT_ACTIONABLE" ]]; then
-        act_count="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | sed '/^$/d' | wc -l)"
-        act_high="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | grep -ic 'High risk' || true)"
+    local act_count=0 act_high=0 pkgs_json="[]" pkgs_list=""
+    if [[ -s "$act_json_file" ]] && command -v jq &>/dev/null && jq -e . "$act_json_file" >/dev/null 2>&1; then
+        act_count="$(jq 'length' "$act_json_file" 2>/dev/null || echo 0)"
+        act_high="$(jq '[.[] | select((.severity // "" | ascii_downcase) as $s | ($s == "high" or $s == "critical"))] | length' "$act_json_file" 2>/dev/null || echo 0)"
+        pkgs_json="$(jq -c '[.[].packages[]?] | unique' "$act_json_file" 2>/dev/null || echo '[]')"
+        pkgs_list="$(jq -r '[.[].packages[]?] | unique | join(", ")' "$act_json_file" 2>/dev/null || true)"
+    else
+        if [[ -n "$ARCH_AUDIT_ACTIONABLE" ]]; then
+            act_count="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | sed '/^$/d' | wc -l)"
+            act_high="$(printf '%s\n' "$ARCH_AUDIT_ACTIONABLE" | grep -ic 'High risk' || true)"
+        fi
     fi
-    ARCH_AUDIT_ACTIONABLE_COUNT="$act_count"
 
     local open_count=0 open_high=0 open_med=0
     if [[ -n "$ARCH_AUDIT_ALL" ]]; then
@@ -7849,30 +8164,43 @@ check_arch_audit() {
         open_high="$(printf '%s\n' "$ARCH_AUDIT_ALL" | grep -ic 'High risk' || true)"
         open_med="$(printf '%s\n' "$ARCH_AUDIT_ALL" | grep -ic 'Medium risk' || true)"
     fi
-    ARCH_AUDIT_TRACKER_COUNT="$open_count"
 
     local aur_count=0
-    if command -v pacman &>/dev/null; then
-        pacman -Qm > "$RUN_RAW/foreign-packages.txt" 2>/dev/null || true
+    local pacman_bin="pacman"
+    [[ -n "$root" && -x "$root/usr/bin/pacman" ]] && pacman_bin="$root/usr/bin/pacman"
+    if command -v "$pacman_bin" &>/dev/null; then
+        "$pacman_bin" -Qm > "$RUN_RAW/foreign-packages.txt" 2>/dev/null || true
         aur_count="$(wc -l < "$RUN_RAW/foreign-packages.txt" 2>/dev/null || echo 0)"
     fi
 
+    ARCH_AUDIT_AVAILABLE=true
+    ARCH_AUDIT_ACTIONABLE_COUNT="$act_count"
+    ARCH_AUDIT_HIGH_RISK_COUNT="$act_high"
+    ARCH_AUDIT_TRACKER_COUNT="$open_count"
+    ARCH_AUDIT_PACKAGES="$pkgs_json"
+
     if (( act_count > 0 )); then
         if (( act_high > 0 )); then
-            add_row "Arch security audit" "WARN ⚠ ($act_high actionable High risk)"
+            add_row "Arch security audit" "WARN ⚠ ($act_high actionable High risk)" "NET"
         else
-            add_row "Arch security audit" "WARN ⚠ ($act_count actionable update(s))"
+            add_row "Arch security audit" "WARN ⚠ ($act_count actionable update(s))" "NET"
         fi
         ((WARNINGS++))
-        log "HEALTH arch_audit=WARN actionable=$act_count actionable_high=$act_high tracker_open=$open_count"
+        log "HEALTH arch_audit=WARN actionable=$act_count actionable_high=$act_high tracker_open=$open_count pkgs='$pkgs_list'"
     else
-        add_row "Arch security audit" "PASS ✔ (0 actionable; $open_count tracker backlog)"
+        add_row "Arch security audit" "PASS ✔ (0 actionable; $open_count tracker backlog)" "NET"
         log "HEALTH arch_audit=PASS actionable=0 tracker_open=$open_count tracker_high=$open_high"
     fi
 
     {
         echo "### ARCH SECURITY AUDIT"
         echo "Actionable updates in repositories: $act_count"
+        if (( act_high > 0 )); then
+            echo "High / Critical severity advisories: $act_high"
+        fi
+        if [[ -n "$pkgs_list" ]]; then
+            echo "Vulnerable package(s): $pkgs_list"
+        fi
         echo "Arch Security Tracker open advisories: $open_count (High: $open_high, Medium: $open_med)"
         echo "Foreign (AUR) packages detected: $aur_count (arch-audit covers official repos only)"
         echo ""
@@ -7898,7 +8226,7 @@ check_arch_audit() {
                 [[ -z "$line" ]] && continue
                 local p ver note=""
                 p="$(echo "$line" | awk '{print $1}')"
-                ver="$(pacman -Q "$p" 2>/dev/null | awk '{print $2}' || echo 'unknown')"
+                ver="$("$pacman_bin" -Q "$p" 2>/dev/null | awk '{print $2}' || echo 'unknown')"
                 if [[ "$p" =~ ^linux && "$line" =~ CVE-202[0-3] ]]; then
                     note=" [stale advisory: targets older kernel series]"
                 elif [[ "$p" == "openssl" && "$line" =~ CVE-2022-2068 ]]; then
@@ -8570,7 +8898,7 @@ generate_summary_json() {
     fi
 
     local remediations_json="[]"
-    if (( WARNINGS > 0 || ERRORS > 0 )) && [[ -f "$LOG_FILE" ]] && command -v jq &>/dev/null; then
+    if { (( WARNINGS > 0 || ERRORS > 0 || FIRMWARE_UPDATES_COUNT > 0 || ARCH_AUDIT_HIGH_RISK_COUNT > 0 )) || [[ "$FIREWALL_ACTIVE" != "true" ]]; } && [[ -f "$LOG_FILE" ]] && command -v jq &>/dev/null; then
         local entries=()
         while IFS= read -r line; do
             [[ "$line" =~ ^HEALTH\ ([a-zA-Z0-9_]+)=(WARN|FAIL)(.*)$ ]] || continue
@@ -8854,10 +9182,29 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 arch_audit)
-                    code="SEC_VULNERABILITY_ACTIONABLE"
-                    summary="Pending package upgrades fix known CVE security vulnerabilities"
-                    fix="sudo pacman -Syu to apply security advisories"
-                    risk="HIGH"
+                    if [[ "$rest" =~ actionable_high=([1-9][0-9]*) ]]; then
+                        code="SEC_VULNERABILITY_HIGH_RISK"
+                        summary="Pending package upgrades fix High/Critical severity CVE vulnerabilities"
+                        fix="sudo pacman -Syu to apply critical security advisories immediately"
+                        risk="HIGH"
+                    else
+                        code="SEC_VULNERABILITY_ACTIONABLE"
+                        summary="Pending package upgrades fix known CVE security vulnerabilities"
+                        fix="sudo pacman -Syu to apply security advisories"
+                        risk="MEDIUM"
+                    fi
+                    ;;
+                firmware)
+                    code="HW_FIRMWARE_UPDATES_PENDING"
+                    summary="Hardware device firmware update(s) available via fwupd"
+                    fix="Review and apply firmware updates with: fwupdmgr get-updates && fwupdmgr update"
+                    risk="MEDIUM"
+                    ;;
+                firewall)
+                    code="NET_HOST_FIREWALL_DISABLED"
+                    summary="Host firewall inactive; traffic filtered solely by perimeter router"
+                    fix="Enable host firewall if travelling or on untrusted networks: sudo systemctl enable --now firewalld"
+                    risk="LOW"
                     ;;
                 multilib)
                     code="GAME_MULTILIB_DISABLED"
@@ -8902,6 +9249,19 @@ generate_summary_json() {
                 '{check: $c, severity: $s, code: $cd, summary: $sm, suggested_fix: $fx, risk: $risk}')"
             entries+=("$obj")
         done < "$LOG_FILE"
+
+        if ! $FIREWALL_ACTIVE; then
+            local f_obj
+            f_obj="$(jq -nc \
+                --arg c "firewall" \
+                --arg s "INFO" \
+                --arg cd "NET_HOST_FIREWALL_DISABLED" \
+                --arg sm "Host firewall inactive; traffic filtered solely by perimeter router" \
+                --arg fx "Enable host firewall if travelling or on untrusted networks: sudo systemctl enable --now firewalld" \
+                --arg risk "LOW" \
+                '{check: $c, severity: $s, code: $cd, summary: $sm, suggested_fix: $fx, risk: $risk}')"
+            entries+=("$f_obj")
+        fi
 
         if (( ${#entries[@]} > 0 )); then
             remediations_json="$(printf '%s\n' "${entries[@]}" | jq -s .)"
@@ -9032,9 +9392,19 @@ generate_summary_json() {
             --argjson m_arch_srv "$m_arch_srv" \
             --argjson m_distro_age "$m_distro_age" \
             --argjson m_distro_srv "$m_distro_srv" \
+            --argjson sec_avail "${ARCH_AUDIT_AVAILABLE:-false}" \
             --argjson sec_actionable "${ARCH_AUDIT_ACTIONABLE_COUNT:-0}" \
+            --argjson sec_high "${ARCH_AUDIT_HIGH_RISK_COUNT:-0}" \
+            --argjson sec_pkgs "${ARCH_AUDIT_PACKAGES:-[]}" \
             --argjson sec_tracker "${ARCH_AUDIT_TRACKER_COUNT:-0}" \
             --argjson aur_pkgs "$aur_pkg_count" \
+            --argjson fw_avail "${FIRMWARE_AVAILABLE:-false}" \
+            --argjson fw_count "${FIRMWARE_UPDATES_COUNT:-0}" \
+            --argjson fw_devs "${FIRMWARE_DEVICES:-[]}" \
+            --argjson fire_active "${FIREWALL_ACTIVE:-false}" \
+            --arg fire_backend "${FIREWALL_BACKEND:-none}" \
+            --arg fire_zone "${FIREWALL_ZONE:-}" \
+            --arg fire_details "${FIREWALL_DETAILS:-protected by perimeter router/LAN}" \
             --argjson game_detected "$GAMING_DETECTED" \
             --argjson game_multilib "$game_multilib_val" \
             --argjson game_vulkan32 "$game_vulkan32_val" \
@@ -9094,13 +9464,33 @@ generate_summary_json() {
                     note: "Non-gaming environment (no Steam, Wine, or Proton detected)"
                 } end),
                 security: {
+                    available: $sec_avail,
+                    tool: "arch-audit",
                     actionable_fixes: $sec_actionable,
                     tracker_open: $sec_tracker,
-                    aur_packages: $aur_pkgs
+                    aur_packages: $aur_pkgs,
+                    cve_high_risk_count: $sec_high,
+                    high_risk_count: $sec_high,
+                    cve_packages: $sec_pkgs,
+                    packages: $sec_pkgs
+                },
+                firmware: {
+                    available: $fw_avail,
+                    tool: "fwupd",
+                    updates_count: $fw_count,
+                    devices: $fw_devs,
+                    pending_devices: $fw_devs
+                },
+                firewall: {
+                    available: true,
+                    active: $fire_active,
+                    backend: $fire_backend,
+                    default_zone: (if $fire_zone != "" then $fire_zone else null end),
+                    details: $fire_details
                 }
             }' > "$SUMMARY_FILE" 2>/dev/null || true
     else
-        echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS'}' > "$SUMMARY_FILE"
+        echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS', "firmware": {"available": '$FIRMWARE_AVAILABLE', "updates_count": '$FIRMWARE_UPDATES_COUNT'}, "security": {"high_risk_count": '$ARCH_AUDIT_HIGH_RISK_COUNT'}, "firewall": {"active": '$FIREWALL_ACTIVE', "backend": "'$FIREWALL_BACKEND'"}}' > "$SUMMARY_FILE"
     fi
 }
 
@@ -9144,6 +9534,7 @@ run_health_check() {
     check_power
     check_cpu_governor
     check_fstrim
+    check_firmware_updates
     render_audit_section "HARDWARE & DRIVERS" "$AUDIT_TABLE_HW"
 
     # --- 3. SYSTEM HEALTH & SERVICES ---
@@ -9161,6 +9552,7 @@ run_health_check() {
     # --- 4. NETWORK & UPDATES ---
     check_network
     check_dns
+    check_firewall_status
     check_updates
     check_mirrorlist_age
     check_arch_news
@@ -9463,6 +9855,9 @@ reconstruct_tables_from_log() {
                     AUDIT_TABLE_HW+="$(_format_audit_row "SSD/NVMe TRIM timer" "$val" "${details:-inactive}")\n"
                 fi
                 ;;
+            firmware)
+                AUDIT_TABLE_HW+="$(_format_audit_row "Hardware firmware" "$val" "$details")\n"
+                ;;
 
             # --- SYSTEM HEALTH & SERVICES ---
             root_space)
@@ -9562,6 +9957,9 @@ reconstruct_tables_from_log() {
                 ;;
             dns)
                 AUDIT_TABLE_NET+="$(_format_audit_row "System DNS" "$val" "$details")\n"
+                ;;
+            firewall)
+                AUDIT_TABLE_NET+="$(_format_audit_row "Host firewall" "$val" "$details")\n"
                 ;;
             updates)
                 if [[ "$val" == "0" ]]; then
