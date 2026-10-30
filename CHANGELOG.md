@@ -7,9 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.59] - 2026-10-30
+
+### Added & Hardened (SRE Architectural Audit - Hardware Firmware, Security Advisories & Host Firewall / PATCH-050, PATCH-051, PATCH-052)
+- **Hardware, Firmware & Peripherals (MOD-05) - Hardware Device Firmware Telemetry (`check_firmware_updates`, `PATCH-050`)**:
+  - Implemented proactive firmware inspection via `fwupdmgr get-updates --json` (`timeout 3s`) probing pending device updates across SSDs, USB peripherals, and system boards.
+  - **Secure Boot NVRAM Quirk Bypass:** Inspects `/sys/firmware/efi/efivars/SecureBoot-*` (byte 5) and gracefully detects disabled Secure Boot workstations, bypassing KEK/dbx NVRAM write failures as recognized quirks (`PASS ✔ (all devices up to date; N NVRAM quirk bypassed)`).
+  - Clean degradation to `INFO ℹ (fwupdmgr unavailable)` when `fwupd` is not installed or unreachable.
+- **Security & Vulnerability Audits (MOD-01, MOD-11) - Arch Security Tracker Telemetry (`check_arch_audit`, `PATCH-051`)**:
+  - Upgraded `check_arch_audit` to leverage `arch-audit -u --json` (`timeout 3s`), exporting structured High/Critical severity CVE counts and affected package lists into Schema 2.0 JSON.
+  - Enhanced degradation to `INFO ℹ (tracker unreachable)` on network or tracker timeouts.
+- **Network & Zero-Trust Defense Depth (MOD-06, MOD-11) - Host Firewall Inspection (`check_firewall_status`, `PATCH-052`)**:
+  - Multi-backend discovery supporting `firewalld`, `ufw`, and `nftables` with local `/etc/firewalld/firewalld.conf` default zone parsing.
+  - Zero false-positive design with bounded 1s systemd checks, gracefully recognizing perimeter-protected LAN workstations (`PASS ✔ (perimeter router/LAN fallback)`).
+- **Machine Telemetry & AI Context (MOD-08, Schema 2.0)**:
+  - Added `firmware` block (`available`, `tool`, `updates_count`, `devices`, `pending_devices`).
+  - Added `firewall` block (`available`, `active`, `backend`, `default_zone`, `details`).
+  - Enriched `security` block with `cve_high_risk_count`, `cve_packages`, and actionable remediations (`HW_FIRMWARE_UPDATES_PENDING`, `SEC_VULNERABILITY_HIGH_RISK`, `NET_HOST_FIREWALL_DISABLED`).
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Added Part 21 with 10 test fixtures (Fixtures 21.1 to 21.10) covering firmware zero-updates pass, pending updates warn, NVRAM quirk bypass, missing tool fallback, arch-audit JSON high-risk warnings, tracker offline fallback, firewalld zone pass, ufw active pass, nftables pass, and perimeter fallback (`119/119 PASS`).
+
+## [2.58] - 2026-10-28
+
+### Fixed & Hardened (SRE Architectural Audit - Wayland Cold-Boot Modeset Jitter & Active Settling / PATCH-049)
+- **Hardware, GPU & Silikon (MOD-05) - Wayland Compositor Telemetry Hardening (`check_gpu_errors`, `PATCH-049`)**:
+  - **Cold-Boot False-Alarm Elimination:** Resolved the logic flaw in PATCH-043 where the 10-minute rolling window (`--since '-10 min'`) on cold boots (`uptime_sec < 600`) enveloped the initial DRM modeset negotiation burst (t=0s..2s), causing benign probe retries (such as 69 MST daisy-chain G-Sync rejections on proprietary NVIDIA) to falsely alert with `REVIEW_WARNINGS`.
+  - **Three-Tier Temporal Windowing & Startup Grace Period:**
+    - Explicit 120-second compositor startup grace period (`uptime_sec < 120`) allowing multi-monitor and MST link handshakes to settle without false warnings.
+    - Added tight 60-second active settling window (`--since '-60s'`) probing real-time recurring stalls. Completed startup bursts with a quiet active window (`active_fail_count == 0`) cleanly degrade to `PASS ✔` notes.
+    - True ongoing stalls actively incrementing in the last 60 seconds (`active_fail_count >= threshold`) trigger immediate `WARN ⚠`.
+    - Removed arbitrary short-circuiting threshold `recent_fail_count > 10` that previously bypassed user-configured and dynamic thresholds.
+- **Hermetic Regression Test Suite (`dev-tools/test-suite.sh`)**:
+  - Added Fixture 5.8c verifying seamless pass of cold-boot probe bursts (69 events) with a quiet active settling window.
+  - Added Fixture 5.9b verifying deterministic alerting on active recurring stalls during cold-boot (`109/109 PASS`).
+
 ## [2.57] - 2026-10-27
 
-### Added & Hardened (EOS-SRE Architectural Audit - CPU Power Governance & Drift Detection / PATCH-048)
+### Added & Hardened (SRE Architectural Audit - CPU Power Governance & Drift Detection / PATCH-048)
 - **Hardware & Drivers (MOD-05) - CPU Power Governor & Drift Audit (`check_cpu_governor`, `PATCH-048`)**:
   - Implemented proactive verification of CPU power management and governor enforcement across online cores (`/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`).
   - **Legacy Config Drift Detection:** Detects `cpupower.service` enabled with deprecated `/etc/default/cpupower` configurations ignored by upstream cpupower 7.3+ (`/etc/default/cpupower-service.conf`), averting silent failure and performance degradation.
