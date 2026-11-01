@@ -74,7 +74,7 @@ sys-health AI Session:
 * **ESP & Mount Topology Integrity:** Inspects `/etc/fstab` and `findmnt` to ensure the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable, with sufficient free headroom (> 100 MB).
 * **Multi-Kernel & DKMS Synchronization:** Audits every installed kernel series (`linux`, `linux-lts`, `linux-zen`), ensuring matching kernel headers, module directories, and compiled DKMS modules exist for each.
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
-* **Crash & Unclean Shutdown Forensics:** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, or hard system freezes.
+* **Crash, Unclean Shutdown & ACPI S5 Spurious Wakeup Forensics (`check_previous_boot`):** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, kernel panics, or hard system freezes. Employs a zero-false-positive *Gated Forensic Trigger* model to detect spurious power-on loops (near-instant wakeups $\le 30$s occurring after clean `System Power Off`), capturing contextual drill-down forensics on armed `/proc/acpi/wakeup` devices (USB XHC, PCIe PME), unprivileged sysfs Wake-on-LAN states, and Dual-Boot Windows Fast Startup collisions.
 * **Runtime CPU Early Microcode Verification (`check_cpu_microcode`):** Interrogates `/sys/devices/system/cpu/cpu0/microcode/version` and early kernel logs (`journalctl -b 0 -k`), detecting runtime early microcode injection (e.g. `Intel early update: 0x1e ➔ 0x28`) and unpatched BIOS states. Gracefully accommodates virtual machines (`KVM`, `QEMU`, `Proxmox`, `VMware`) and containers (`PASS ✔ [VM guest - host managed]`).
 * **Hardened Hardware, Thermals & GPU Diagnostics (`check_gpu`, `check_gpu_errors`, `check_dkms`, `check_smart`, `check_power`, `check_cpu_governor`, `check_fstrim`):**
   * Proactive CPU scaling governor and power daemon verification across all online cores (`check_cpu_governor`), detecting legacy configuration drift (`/etc/default/cpupower` vs `cpupower-service.conf`), inactive enabled services, runtime desync, and conflicting power managers (`power-profiles-daemon`, `tlp`, `auto-cpufreq`).
@@ -290,7 +290,7 @@ Every release, bugfix, and patch blueprint must pass the hermetic test suite bef
 ./dev-tools/test-suite.sh
 ```
 * **100% Mocked Roots:** Executes in isolated sandboxes (`SYS_HEALTH_ROOT`) without host mutations.
-* **Coverage:** 58 deterministic assertions across 13 test suites covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, ALPM Orphan Cascade Protection, checkupdates error resilience & core package parity, and Universal Multi-GPU Gaming Readiness.
+* **Coverage:** 123 deterministic assertions across 22 test suites covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, ALPM Orphan Cascade Protection, checkupdates error resilience & core package parity, Universal Multi-GPU Gaming Readiness, Host Firewall detection, Arch Audit CVEs, Hardware Firmware (fwupd) updates, and Previous Session Shutdown & Spurious ACPI S5 Wakeup Forensics.
 
 ---
 
