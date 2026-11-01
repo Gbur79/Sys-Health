@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.60] - 2026-11-01
+
+### Added & Hardened (EOS-SRE Architectural Audit - ACPI S5 Wakeup Forensics, WoL & Windows Fast Startup / PATCH-053)
+- **Previous Session Shutdown & ACPI S5 Wakeup Forensics (MOD-01, `PATCH-053`)**:
+  - Implemented `_previous_boot_audit_wakeup` in `check_previous_boot()` detecting near-instant power-on loops ($\le 30$s) occurring after explicit `System Power Off` shutdown targets.
+  - **Drill-Down Forensics & Remediation:** Contextual drill-down capture into `$LOG_FILE` inspecting active `/proc/acpi/wakeup` devices (USB XHC, PCIe PME), unprivileged sysfs Wake-on-LAN state, and Windows Dual-Boot / Fast Startup collision indicators.
+  - Zero false-positive design: preserves clean pass for intentional restarts (`PASS ✔ (clean reboot)`) and standard poweroffs.
+- **Machine Telemetry & AI Context (MOD-08, Schema 2.0)**:
+  - Added `ACPI_SPURIOUS_POWEROFF_LOOP` actionable remediation code in `summary.json`.
+- **Hermetic Regression Test Suite (Part 22)**:
+  - Added Part 22 (Fixtures 22.1–22.4) in `dev-tools/test-suite.sh` validating clean reboots, normal power-offs, spurious S5 wakeups, and crash isolation (123/123 tests passing).
+
 ## [2.59] - 2026-10-30
 
 ### Added & Hardened (SRE Architectural Audit - Hardware Firmware, Security Advisories & Host Firewall / PATCH-050, PATCH-051, PATCH-052)
