@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.61] - 2026-11-01
+
+### Added & Hardened (EOS-SRE Architectural Audit - Desktop Session Hygiene & Display Manager Login Loop Forensics / PATCH-054)
+- **Desktop Session Hygiene & Login Loop Forensics (MOD-07, `PATCH-054`)**:
+  - Implemented `check_desktop_session_hygiene()` detecting root-owned session authority files (`~/.Xauthority`, `~/.ICEauthority`, `~/.cache`), unmerged Display Manager PAM configuration conflicts (`/etc/pam.d/*.pacnew`), and deprecated legacy Xorg DDX driver `xf86-video-intel`.
+  - Machine Telemetry & Remediation (MOD-08): Added structured actionable remediation codes `DESKTOP_SESSION_AUTHORITY_ROOT`, `PAM_PACNEW_DISPLAY_MANAGER_CONFLICT`, and `XORG_INTEL_DRIVER_DEPRECATED`.
+  - Hermetic Regression Test Suite (Part 23): Added Fixtures 23.1–23.4 covering authority root ownership, PAM pacnew conflicts, deprecated DDX detection, and clean desktop session baseline (127/127 tests passing).
+
 ## [2.60] - 2026-11-01
 
 ### Added & Hardened (SRE Architectural Audit - ACPI S5 Wakeup Forensics, WoL & Windows Fast Startup / PATCH-053)
