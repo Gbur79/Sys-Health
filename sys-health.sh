@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.60
+# Arch System Health & Diagnostics v2.61
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.60"
+VERSION="2.61"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -6986,6 +6986,180 @@ _patch041_tree_bytes() {
     printf '%s\n' "$bytes"
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.61 | PATCH-054 | Fixtures: test-suite.sh Part 23]
+_check_session_authority_ownership() {
+    local sys_root="${SYS_HEALTH_ROOT:-}"
+    local -a bad_files=()
+    local bad_uname=""
+
+    local -a user_entries=()
+    if [[ -n "$sys_root" && -f "${sys_root}/etc/passwd" ]]; then
+        while IFS=: read -r u _ u_id _ _ h sh; do
+            if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
+                [[ "$h" == /* ]] && h="${sys_root%/}${h}"
+                user_entries+=("${u_id}:${u}:${h}")
+            fi
+        done < "${sys_root}/etc/passwd"
+    else
+        while IFS=$'\t' read -r uid uname home; do
+            [[ -n "$uid" && -n "$home" ]] && user_entries+=("${uid}:${uname}:${home}")
+        done < <(_patch041_user_contexts 2>/dev/null || true)
+    fi
+
+    if (( ${#user_entries[@]} == 0 )); then
+        if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+            local s_uid s_home
+            s_uid="$(id -u "$SUDO_USER" 2>/dev/null || echo 1000)"
+            s_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "/home/$SUDO_USER")"
+            [[ -n "$sys_root" && "$s_home" == /* ]] && s_home="${sys_root%/}${s_home}"
+            user_entries+=("${s_uid}:${SUDO_USER}:${s_home}")
+        else
+            local passwd_file="${sys_root}/etc/passwd"
+            if [[ -f "$passwd_file" ]]; then
+                while IFS=: read -r u _ u_id _ _ h sh; do
+                    if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
+                        [[ -n "$sys_root" && "$h" == /* ]] && h="${sys_root%/}${h}"
+                        user_entries+=("${u_id}:${u}:${h}")
+                    fi
+                done < "$passwd_file"
+            fi
+        fi
+    fi
+
+    local entry u_id u_name u_home
+    for entry in "${user_entries[@]}"; do
+        IFS=: read -r u_id u_name u_home <<< "$entry"
+        [[ -d "$u_home" ]] || continue
+
+        local auth_file
+        for auth_file in "$u_home/.Xauthority" "$u_home/.ICEauthority"; do
+            if [[ -e "$auth_file" ]]; then
+                local owner_uid
+                owner_uid="$(stat -c '%u' "$auth_file" 2>/dev/null || true)"
+                if [[ "$owner_uid" == "0" && "$u_id" != "0" ]]; then
+                    bad_files+=("${auth_file##*/}")
+                    bad_uname="$u_name"
+                fi
+            fi
+        done
+
+        if [[ -d "$u_home/.cache" ]]; then
+            local cache_uid
+            cache_uid="$(stat -c '%u' "$u_home/.cache" 2>/dev/null || true)"
+            if [[ "$cache_uid" == "0" && "$u_id" != "0" ]]; then
+                bad_files+=(".cache")
+                bad_uname="$u_name"
+            fi
+        fi
+    done
+
+    if (( ${#bad_files[@]} > 0 )); then
+        printf '%s:%s\n' "$bad_uname" "${bad_files[*]}"
+        return 0
+    fi
+    return 1
+}
+
+_check_pam_display_manager_conflicts() {
+    local sys_root="${SYS_HEALTH_ROOT:-}"
+    local pam_dir="${sys_root}/etc/pam.d"
+    [[ -d "$pam_dir" ]] || return 1
+
+    local dm_detected=false
+    if systemctl is-active --quiet display-manager 2>/dev/null || \
+       systemctl is-active --quiet lightdm 2>/dev/null || \
+       systemctl is-active --quiet sddm 2>/dev/null || \
+       systemctl is-active --quiet gdm 2>/dev/null || \
+       systemctl is-active --quiet ly 2>/dev/null || \
+       systemctl is-active --quiet greetd 2>/dev/null; then
+        dm_detected=true
+    elif [[ -L "${sys_root}/etc/systemd/system/display-manager.service" ]] || \
+         [[ -f "${sys_root}/etc/lightdm/lightdm.conf" ]] || \
+         [[ -f "${sys_root}/etc/sddm.conf" ]] || \
+         [[ -d "${sys_root}/etc/sddm.conf.d" ]] || \
+         [[ -d "${sys_root}/etc/gdm" ]]; then
+        dm_detected=true
+    fi
+
+    $dm_detected || return 1
+
+    local p
+    local -a conflicts=()
+    for p in "$pam_dir"/system-login.pacnew "$pam_dir"/lightdm*.pacnew "$pam_dir"/sddm*.pacnew "$pam_dir"/gdm*.pacnew; do
+        [[ -f "$p" ]] && conflicts+=("${p##*/}")
+    done
+
+    if (( ${#conflicts[@]} > 0 )); then
+        printf '%s\n' "${conflicts[*]}"
+        return 0
+    fi
+    return 1
+}
+
+_check_deprecated_intel_xorg_driver() {
+    local sys_root="${SYS_HEALTH_ROOT:-}"
+    local is_installed=false
+
+    local db_path="${sys_root%/}$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman)"
+    db_path="${db_path%/}"
+    if [[ -d "$db_path/local" ]] && compgen -G "$db_path/local/xf86-video-intel-*" >/dev/null; then
+        is_installed=true
+    elif [[ -z "$sys_root" ]] && command -v pacman &>/dev/null && pacman -Q xf86-video-intel &>/dev/null; then
+        is_installed=true
+    fi
+
+    $is_installed || return 1
+
+    local lspci_out
+    lspci_out="$(lspci -nn 2>/dev/null || true)"
+    if [[ "$lspci_out" =~ \[030[0-2]\].*8086: ]] || \
+       ( [[ "$lspci_out" =~ (VGA|3D|Display) ]] && [[ "$lspci_out" =~ [Ii]ntel ]] ) || \
+       ( [[ -z "$lspci_out" ]] && lspci 2>/dev/null | grep -E 'VGA|3D|Display' | grep -qi 'Intel' ); then
+        return 0
+    fi
+    return 1
+}
+
+check_desktop_session_hygiene() {
+    local auth_result="" pam_result=""
+    local has_issue=false
+    local -a issues=()
+
+    if auth_result="$(_check_session_authority_ownership)"; then
+        has_issue=true
+        local bad_user="${auth_result%%:*}"
+        local bad_files="${auth_result#*:}"
+        issues+=("authority root: $bad_user ($bad_files)")
+        log "HEALTH desktop_session_hygiene=WARN authority_root user=$bad_user files='$bad_files'"
+    fi
+
+    if pam_result="$(_check_pam_display_manager_conflicts)"; then
+        has_issue=true
+        issues+=("PAM .pacnew conflict: $pam_result")
+        log "HEALTH desktop_session_hygiene=WARN pam_conflict file='$pam_result'"
+    fi
+
+    if _check_deprecated_intel_xorg_driver; then
+        has_issue=true
+        issues+=("deprecated xf86-video-intel installed")
+        log "HEALTH desktop_session_hygiene=WARN deprecated_intel_ddx pkg=xf86-video-intel"
+    fi
+
+    if $has_issue; then
+        local summary_msg
+        summary_msg="$(IFS='; '; echo "${issues[*]}")"
+        add_row "Desktop session hygiene" "WARN ⚠ ($summary_msg)" "SYS"
+        ((WARNINGS++))
+        {
+            echo "### DESKTOP SESSION HYGIENE ISSUES"
+            printf '%s\n' "$summary_msg"
+        } >> "$LOG_FILE"
+    else
+        add_row "Desktop session hygiene" "PASS ✔" "SYS"
+        log "HEALTH desktop_session_hygiene=PASS"
+    fi
+}
+
 check_desktop_indexers() {
     # MOD-08 consumes these globals in its existing one-shot JSON serializer.
     DESKTOP_INDEXER_STATUS="info"
@@ -9186,6 +9360,29 @@ generate_summary_json() {
                     fi
                     risk="LOW"
                     ;;
+                desktop_session_hygiene)
+                    if [[ "$rest" =~ authority_root ]]; then
+                        code="DESKTOP_SESSION_AUTHORITY_ROOT"
+                        local bad_u="user" bad_f="~/.Xauthority"
+                        [[ "$rest" =~ user=([^[:space:]]+) ]] && bad_u="${BASH_REMATCH[1]}"
+                        [[ "$rest" =~ files=([^[:space:]]+) ]] && bad_f="${BASH_REMATCH[1]}"
+                        summary="Display manager authority file (${bad_f}) owned by root for user ${bad_u}; causes login loop"
+                        fix="sudo chown ${bad_u}:${bad_u} ~/${bad_f}"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ pam_conflict ]]; then
+                        code="PAM_PACNEW_DISPLAY_MANAGER_CONFLICT"
+                        local p_file=""
+                        [[ "$rest" =~ file=([^[:space:]]+) ]] && p_file="${BASH_REMATCH[1]}"
+                        summary="Unmerged PAM .pacnew configuration (${p_file:-/etc/pam.d/*.pacnew}) may abort Display Manager user session"
+                        fix="Audit and merge /etc/pam.d/*.pacnew with pacdiff or meld"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ deprecated_intel_ddx ]]; then
+                        code="XORG_INTEL_DRIVER_DEPRECATED"
+                        summary="xf86-video-intel package installed; causes window manager crashes and login loops on modern Intel GPUs"
+                        fix="sudo pacman -R xf86-video-intel (modesetting driver is built into xorg-server)"
+                        risk="MEDIUM"
+                    fi
+                    ;;
                 desktop_indexers)
                     code="SYS_DESKTOP_INDEXER_LOOP"
                     summary="Desktop file indexer (Baloo/LocalSearch/Tracker) restart or corruption loop detected"
@@ -9630,6 +9827,7 @@ run_health_check() {
     # --- 3. SYSTEM HEALTH & SERVICES ---
     check_root_space
     check_failed_services
+    check_desktop_session_hygiene
     check_desktop_indexers
     check_journal_flood
     check_sysrq
@@ -9986,6 +10184,13 @@ reconstruct_tables_from_log() {
                     local ucount="${details#count=}"
                     ucount="${ucount%% *}"
                     AUDIT_TABLE_SYS+="Systemd failed (user) | WARN ⚠ (${ucount:-$val} failed)\n"
+                fi
+                ;;
+            desktop_session_hygiene)
+                if [[ "$val" == "PASS" ]]; then
+                    AUDIT_TABLE_SYS+="Desktop session hygiene | PASS ✔\n"
+                else
+                    AUDIT_TABLE_SYS+="$(_format_audit_row "Desktop session hygiene" "$val" "$details")\n"
                 fi
                 ;;
             desktop_indexers)
