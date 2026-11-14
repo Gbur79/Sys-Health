@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.62] - 2026-11-14
+
+### Fixed & Hardened (SRE Architectural Audit - Journald Binary Export Sanitization, Systemd UUID Contract & Verification Tooling / PATCH-055)
+- **Journal Rate-Limit Contract & Binary Export Hygiene (`check_journal_flood`, MOD-07, `PATCH-055`)**:
+  - Corrected `dropped_message_id` from `fc2e22bc6ee647b6b90729ab34a250b1` (`SD_MESSAGE_COREDUMP`) to `a596d6fe7bfa4994828e72309e95d61e` (`SD_MESSAGE_JOURNAL_DROPPED` per `/usr/include/systemd/sd-messages.h`).
+  - Sanitized `journalctl -o export` command substitution pipeline with `| tr -d '\0'` to prevent Bash `ignored null byte in input` warnings on little-endian binary journal fields.
+- **SRE Verification Tooling & Hermetic Tests (`dev-tools/`)**:
+  - Added `dev-tools/lint-universalism.sh` (systemd `SD_MESSAGE_*` contract validation, null-byte pipeline hygiene, rig-bias checks, version sync, and OPSEC `.gitignore`/git tracking gates) and `dev-tools/verify-bash.sh -q` (`bash -n`, `shellcheck`, linter, and `test-suite.sh -q`).
+  - Hardened Fixture 16.4 with strict `MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e` CLI contract assertion, added Fixture 16.6 for binary `-o export` null-byte resilience, and added Part 24 adversarial tooling tests (134/134 tests passing).
+
 ## [2.61] - 2026-11-01
 
 ### Added & Hardened (EOS-SRE Architectural Audit - Desktop Session Hygiene & Display Manager Login Loop Forensics / PATCH-054)
