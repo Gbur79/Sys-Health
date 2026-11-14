@@ -15,9 +15,9 @@ SUMMARY_FILE="$STATE_DIR/summary.json"
 STATE_SNAPSHOT="$STATE_DIR/software-state.txt"
 RAW_DIR="$STATE_DIR/runs"
 
-# Global mirror telemetry state (PATCH-044 / SysPilot ISSUE-DDE9)
+# Global mirror telemetry state (PATCH-044 / PATCH-057 / SysPilot ISSUE-DDE9)
 MIRROR_PRIMARY_DEAD=false
-MIRROR_PRIMARY_ALIVE=false
+MIRROR_PRIMARY_ALIVE=""
 MIRROR_ARCH_AGE_DAYS=""
 MIRROR_ARCH_SERVERS=""
 MIRROR_DISTRO_AGE_DAYS=""
@@ -40,6 +40,11 @@ FIREWALL_ACTIVE=false
 FIREWALL_BACKEND="none"
 FIREWALL_ZONE=""
 FIREWALL_DETAILS=""
+
+# Global standalone software telemetry state (PATCH-058)
+STANDALONE_STATUS="unknown"
+STANDALONE_PENDING_COUNT=0
+STANDALONE_PENDING_TOOLS="[]"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 
@@ -659,7 +664,7 @@ add_row() {
             "Root disk space"|"Systemd failed"*|"Pacman DB lock"|"Package file integrity"|".pacnew"*|"Magic SysRq keys"|"Desktop Indexers"*|"Journal Rate Limit"*|"Orphan packages"*)
                 sec="SYS"
                 ;;
-            "Network link & Gateway"*|"System DNS"|"Available updates"|"Arch News"*|"Arch security audit"|"Mirrorlist"*)
+            "Network link & Gateway"*|"System DNS"|"Available updates"|"Standalone & 3rd-party"*|"Arch News"*|"Arch security audit"|"Mirrorlist"*)
                 sec="NET"
                 ;;
             "Multilib repository"*|"Vulkan & 32-bit"*|"Proton memory limits"*|"CPU governor"*|"Desktop session & GPU"*|"Proton & Steam tools"*|"Kernel sync"*|"Kernel split-lock"*|"GTX 970 VRAM"*)
@@ -4328,6 +4333,7 @@ _resolve_kernel_and_initramfs() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol/Argon v2.60 | MOD-01 PATCH-021/022 | Fixtures: test-suite.sh Part 2, Part 3]
 check_kernel() {
     local running_k
     running_k="$(uname -r)"
@@ -4448,6 +4454,7 @@ check_kernel() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.35 | MOD-01 PATCH-022/026 | Fixtures: test-suite.sh Part 3, Part 7]
 check_initramfs() {
     # Maintained for backwards compatibility / specific sub-checks
     local running="${1:-$(uname -r)}"
@@ -4578,6 +4585,7 @@ check_initramfs() {
     fi
 }
 
+# [SRE-AUDIT: HARDENED | Sol v2.35 | MOD-01 | Fixtures: indirect Part 2, Part 3]
 check_efi_mount() {
     if [[ ! -d /sys/firmware/efi ]]; then
         add_row "EFI partition (ESP)" "INFO ℹ (BIOS / Legacy system)"
@@ -4643,6 +4651,7 @@ check_efi_mount() {
     fi
 }
 
+# [SRE-AUDIT: HARDENED | Sol v2.35 | MOD-01 | Fixtures: none]
 check_reboot_pending() {
     local running_k
     running_k="$(uname -r)"
@@ -5385,6 +5394,7 @@ _boot_sync_audit() {
     return 0
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.41 | PATCH-030 | Fixtures: test-suite.sh Part 2, Part 7]
 check_bootloader_sync() {
     _boot_sync_audit 1
 }
@@ -5877,6 +5887,7 @@ check_gpu_errors() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.35 | PATCH-024 | Fixtures: test-suite.sh Part 5]
 check_dkms() {
     if ! command -v dkms &>/dev/null; then
         add_row "DKMS modules" "INFO ℹ (not installed)" "HW"
@@ -5942,6 +5953,7 @@ check_dkms() {
     log "HEALTH dkms=PASS"
 }
 
+# [SRE-AUDIT: LEGACY | Luna/ChatGPT | MOD-05 | Fixtures: none]
 check_temperature() {
     local cpu_temp=""
     local max_temp=0
@@ -6037,6 +6049,7 @@ check_temperature() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.35 | PATCH-024 | Fixtures: test-suite.sh Part 5]
 check_smart() {
     if ! command -v smartctl &>/dev/null; then
         add_row "SMART disk health" "INFO ℹ (smartmontools not installed)" "HW"
@@ -7196,6 +7209,7 @@ check_desktop_session_hygiene() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.48 | PATCH-041 | Fixtures: test-suite.sh Part 16]
 check_desktop_indexers() {
     # MOD-08 consumes these globals in its existing one-shot JSON serializer.
     DESKTOP_INDEXER_STATUS="info"
@@ -7434,6 +7448,7 @@ check_journal_flood() {
     fi
 }
 
+# [SRE-AUDIT: HARDENED | Argon v2.50 | ARGON-20261022-MOD-07 | Fixtures: none]
 check_sysrq() {
     local sysrq_val="?"
     if [[ -f /proc/sys/kernel/sysrq ]]; then
@@ -7471,6 +7486,7 @@ check_sysrq() {
     fi
 }
 
+# [SRE-AUDIT: LEGACY | Luna/ChatGPT | MOD-07 | Fixtures: none]
 check_pacman_lock() {
     local db_path
     db_path="$(pacman-conf DBPath 2>/dev/null || echo "/var/lib/pacman")"
@@ -7496,6 +7512,7 @@ check_pacman_lock() {
     fi
 }
 
+# [SRE-AUDIT: LEGACY | Luna/ChatGPT | MOD-07 | Fixtures: none]
 check_package_integrity() {
     if [[ "${SKIP_INTEGRITY:-0}" == "1" ]]; then
         add_row "Package file integrity" "INFO ℹ (skipped via config)"
@@ -7562,6 +7579,7 @@ check_package_integrity() {
     fi
 }
 
+# [SRE-AUDIT: HARDENED | Sol v2.34 | MOD-07 | Fixtures: _find_pacnew_files Part 4]
 check_pacnew() {
     PACNEWS="$(_find_pacnew_files)"
 
@@ -7581,6 +7599,7 @@ check_pacnew() {
     fi
 }
 
+# [SRE-AUDIT: CERTIFIED | Sol v2.34 | PATCH-023 | Fixtures: test-suite.sh Part 4]
 check_orphan_packages() {
     local tmp err rc orphan_count=0 p
     local -a orphans=()
@@ -7879,6 +7898,7 @@ check_network() {
     log "HEALTH network=PASS iface=$dev speed=${speed:-auto} gateway=$gw ping=${ping_ms} errors=0 metered=${metered_status:-no}"
 }
 
+# [SRE-AUDIT: LEGACY | Luna/ChatGPT | MOD-11 | Fixtures: none]
 check_dns() {
     local test_host="${DNS_TEST_HOST:-archlinux.org}"
     local qtime_num="" server_note=""
@@ -8180,7 +8200,42 @@ check_updates() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.53 | PATCH-044 | Fixtures: test-suite.sh Part 1, Part 12]
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-058 | Fixtures: test-suite.sh Part 1, Part 8, Part 12]
+check_standalone_updates() {
+    _probe_standalone_software_updates
+
+    if [[ "$STANDALONE_STATUS" == "skipped" ]]; then
+        add_row "Standalone & 3rd-party" "INFO ℹ (skipped: running as root)" "NET"
+        ((INFO_COUNT++)) || true
+        log "HEALTH standalone_software=SKIPPED reason=euid0"
+        return 0
+    fi
+
+    if (( STANDALONE_PENDING_COUNT == 0 )); then
+        if (( STANDALONE_CHECKED_COUNT == 0 )); then
+            add_row "Standalone & 3rd-party" "PASS ✔ (none installed)" "NET"
+        else
+            add_row "Standalone & 3rd-party" "PASS ✔ (all checked tools up to date)" "NET"
+        fi
+        log "HEALTH standalone_software=PASS pending=0 checked=$STANDALONE_CHECKED_COUNT"
+        return 0
+    fi
+
+    if [[ -n "${LOG_FILE:-}" && -n "${STANDALONE_DETAILS_LOG:-}" ]]; then
+        {
+            echo ""
+            echo "### AVAILABLE STANDALONE UPDATES"
+            printf '%s\n' "$STANDALONE_DETAILS_LOG"
+        } >> "$LOG_FILE"
+    fi
+
+    add_row "Standalone & 3rd-party" \
+        "INFO ℹ (${STANDALONE_PENDING_COUNT} pending: ${STANDALONE_PENDING_CSV} — run --software)" "NET"
+    ((INFO_COUNT++)) || true
+    log "HEALTH standalone_software=INFO pending=$STANDALONE_PENDING_COUNT tools=${STANDALONE_PENDING_CSV// /}"
+}
+
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-044/PATCH-057 | Fixtures: test-suite.sh Part 1, Part 12]
 check_mirrorlist_age() {
     local now
     now=$(date +%s)
@@ -8188,7 +8243,7 @@ check_mirrorlist_age() {
     mapfile -t mirror_files < <(discover_active_mirrorlists)
 
     MIRROR_PRIMARY_DEAD=false
-    MIRROR_PRIMARY_ALIVE=false
+    MIRROR_PRIMARY_ALIVE=""
     MIRROR_ARCH_AGE_DAYS=""
     MIRROR_ARCH_SERVERS=""
     MIRROR_DISTRO_AGE_DAYS=""
@@ -8231,6 +8286,7 @@ check_mirrorlist_age() {
         if _probe_network_control_plane; then
             primary_dead=true
             MIRROR_PRIMARY_DEAD=true
+            MIRROR_PRIMARY_ALIVE=false
             primary_info="primary DEAD"
         fi
     fi
@@ -9670,14 +9726,17 @@ generate_summary_json() {
         j_source_group_json="$(jq -nc --arg sg "$JOURNAL_RATE_SOURCE_GROUP" '$sg')"
     fi
 
-    # Mirrors telemetry payload for schema 2.0 (PATCH-044 / SysPilot ISSUE-DDE9)
+    # Mirrors telemetry payload for schema 2.0 (PATCH-044 / PATCH-057 / SysPilot ISSUE-DDE9)
     local m_status="${MIRROR_STATUS:-unknown}"
     local m_msg="${MIRROR_STATUS_LABEL:-unknown}"
     local m_arch_age="null" m_arch_srv="null"
     local m_distro_age="null" m_distro_srv="null"
-    local m_primary_alive=false
+    local m_primary_alive="null"
 
-    [[ "${MIRROR_PRIMARY_ALIVE:-}" == "true" ]] && m_primary_alive=true
+    case "${MIRROR_PRIMARY_ALIVE:-}" in
+        true)  m_primary_alive=true ;;
+        false) m_primary_alive=false ;;
+    esac
     [[ "${MIRROR_ARCH_AGE_DAYS:-}" =~ ^[0-9]+$ ]] && m_arch_age="${MIRROR_ARCH_AGE_DAYS}"
     [[ "${MIRROR_ARCH_SERVERS:-}" =~ ^[0-9]+$ ]] && m_arch_srv="${MIRROR_ARCH_SERVERS}"
     [[ "${MIRROR_DISTRO_AGE_DAYS:-}" =~ ^[0-9]+$ ]] && m_distro_age="${MIRROR_DISTRO_AGE_DAYS}"
@@ -9718,6 +9777,9 @@ generate_summary_json() {
             --argjson m_arch_srv "$m_arch_srv" \
             --argjson m_distro_age "$m_distro_age" \
             --argjson m_distro_srv "$m_distro_srv" \
+            --arg sa_status "${STANDALONE_STATUS:-unknown}" \
+            --argjson sa_count "${STANDALONE_PENDING_COUNT:-0}" \
+            --argjson sa_tools "${STANDALONE_PENDING_TOOLS:-[]}" \
             --argjson sec_avail "${ARCH_AUDIT_AVAILABLE:-false}" \
             --argjson sec_actionable "${ARCH_AUDIT_ACTIONABLE_COUNT:-0}" \
             --argjson sec_high "${ARCH_AUDIT_HIGH_RISK_COUNT:-0}" \
@@ -9768,6 +9830,11 @@ generate_summary_json() {
                         arch_servers: $m_arch_srv,
                         distro_age_days: $m_distro_age,
                         distro_servers: $m_distro_srv
+                    },
+                    standalone_software: {
+                        status: $sa_status,
+                        pending_count: $sa_count,
+                        pending_tools: $sa_tools
                     }
                 },
                 environment: {
@@ -9881,6 +9948,7 @@ run_health_check() {
     check_dns
     check_firewall_status
     check_updates
+    check_standalone_updates
     check_mirrorlist_age
     check_arch_news
     check_arch_audit
@@ -11245,6 +11313,7 @@ detect_aur_helper() {
 }
 
 # Rigorous package ownership check hardened against aliases, shims, language runtimes and multi-distro managers
+# [SRE-AUDIT: CERTIFIED | Sol v2.38 | PATCH-027 | Fixtures: test-suite.sh Part 8]
 check_binary_ownership() {
     # Returns via stdout: "pacman" | "shim" | "cargo" | "foreign" | "standalone" | "missing"
     local bin="$1"
@@ -11324,6 +11393,7 @@ can_self_update_binary() {
 }
 
 # Guardrail checking whether official repo updates are pending before AUR upgrade
+# [SRE-AUDIT: HARDENED | Sol v2.38 | PATCH-027 | Fixtures: none]
 check_partial_upgrade_risk() {
     # Returns:
     # 0 = No official updates pending (SAFE)
@@ -11362,6 +11432,211 @@ check_partial_upgrade_risk() {
     return 2
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-058 | Fixtures: test-suite.sh Part 1, Part 8, Part 12]
+_probe_standalone_software_updates() {
+    STANDALONE_STATUS="pass"
+    STANDALONE_PENDING_COUNT=0
+    STANDALONE_PENDING_TOOLS="[]"
+    STANDALONE_PENDING_CSV=""
+    STANDALONE_DETAILS_LOG=""
+    STANDALONE_CHECKED_COUNT=0
+
+    STANDALONE_UV_INSTALLED=false
+    STANDALONE_UV_CUR="not installed"
+    STANDALONE_UV_LATEST="unknown"
+    STANDALONE_UV_STAT=""
+    STANDALONE_UV_UP_NEEDED=false
+
+    STANDALONE_GOOSE_INSTALLED=false
+    STANDALONE_GOOSE_CUR="not installed"
+    STANDALONE_GOOSE_LATEST="unknown"
+    STANDALONE_GOOSE_STAT=""
+    STANDALONE_GOOSE_UP_NEEDED=false
+
+    STANDALONE_FLATPAK_INSTALLED=false
+    STANDALONE_FLATPAK_COUNT=0
+    STANDALONE_FLATPAK_UP_COUNT=0
+    STANDALONE_FLATPAK_STAT=""
+    STANDALONE_FLATPAK_UP_NEEDED=false
+
+    STANDALONE_RUSTUP_INSTALLED=false
+    STANDALONE_RUSTUP_STAT=""
+    STANDALONE_RUSTUP_UP_NEEDED=false
+
+    local effective_euid="${_TEST_EUID:-$EUID}"
+    if (( effective_euid == 0 )); then
+        STANDALONE_STATUS="skipped"
+        return 0
+    fi
+
+    # 1. UV Python Toolchain (Silent-if-Absent)
+    if type -P uv &>/dev/null; then
+        ((STANDALONE_CHECKED_COUNT++)) || true
+        STANDALONE_UV_INSTALLED=true
+        STANDALONE_UV_CUR="$(uv --version 2>/dev/null | awk '{print $2}' || echo "unknown")"
+        local uv_owner
+        uv_owner="$(check_binary_ownership uv)"
+        if [[ "$uv_owner" == "pacman" ]]; then
+            STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - pacman managed)"
+        elif [[ "$uv_owner" == "shim" ]]; then
+            STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - runtime/shim managed)"
+        elif [[ "$uv_owner" == "cargo" ]]; then
+            STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - cargo managed)"
+        elif [[ "$uv_owner" == "foreign" ]]; then
+            STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - foreign manager)"
+        else
+            local uv_dry
+            uv_dry="$(timeout 4 uv self update --dry-run 2>&1 || true)"
+            if [[ "$uv_dry" =~ to\ v([0-9]+\.[0-9]+\.[0-9a-zA-Z._-]+) ]]; then
+                STANDALONE_UV_LATEST="${BASH_REMATCH[1]}"
+                if [[ "$STANDALONE_UV_CUR" != "$STANDALONE_UV_LATEST" ]]; then
+                    STANDALONE_UV_STAT="UPDATE ⚠ (v${STANDALONE_UV_CUR} -> v${STANDALONE_UV_LATEST} available)"
+                    STANDALONE_UV_UP_NEEDED=true
+                else
+                    STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - up to date)"
+                fi
+            elif [[ "$STANDALONE_UV_CUR" != "unknown" ]]; then
+                STANDALONE_UV_LATEST="$STANDALONE_UV_CUR"
+                STANDALONE_UV_STAT="PASS ✔ (v${STANDALONE_UV_CUR} - up to date)"
+            fi
+        fi
+    fi
+
+    # 2. Goose AI Assistant (Silent-if-Absent)
+    if type -P goose &>/dev/null; then
+        ((STANDALONE_CHECKED_COUNT++)) || true
+        STANDALONE_GOOSE_INSTALLED=true
+        STANDALONE_GOOSE_CUR="$(goose --version 2>/dev/null | awk '{print $1}' | tr -d 'v' || echo "unknown")"
+        local g_owner
+        g_owner="$(check_binary_ownership goose)"
+        if [[ "$g_owner" == "pacman" ]]; then
+            STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - pacman managed)"
+        elif [[ "$g_owner" == "shim" ]]; then
+            STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - runtime/shim managed)"
+        elif [[ "$g_owner" == "cargo" ]]; then
+            STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - cargo managed)"
+        elif [[ "$g_owner" == "foreign" ]]; then
+            STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - foreign manager)"
+        else
+            local goose_tag
+            # Strip both \r and \n (RFC 9110 HTTP CRLF fix verified by o3-mini & Gemini Pro)
+            goose_tag="$(
+                timeout 5 curl -fsIL --connect-timeout 2 --max-time 4 https://github.com/aaif-goose/goose/releases/latest 2>/dev/null |
+                awk -F'/tag/v?' '/[Ll]ocation:.*\/tag\// {print $2}' |
+                tr -d '\r\n'
+            )" || true
+
+            if [[ "$goose_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                STANDALONE_GOOSE_LATEST="$goose_tag"
+                if [[ "$STANDALONE_GOOSE_CUR" != "unknown" && "$STANDALONE_GOOSE_CUR" != "$STANDALONE_GOOSE_LATEST" ]]; then
+                    STANDALONE_GOOSE_STAT="UPDATE ⚠ (v${STANDALONE_GOOSE_CUR} -> v${STANDALONE_GOOSE_LATEST} available)"
+                    STANDALONE_GOOSE_UP_NEEDED=true
+                else
+                    STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - up to date)"
+                fi
+            elif [[ "$STANDALONE_GOOSE_CUR" != "unknown" ]]; then
+                STANDALONE_GOOSE_STAT="PASS ✔ (v${STANDALONE_GOOSE_CUR} - remote check offline)"
+            else
+                STANDALONE_GOOSE_STAT="INFO ℹ (v${STANDALONE_GOOSE_CUR} - version unknown)"
+            fi
+        fi
+    fi
+
+    # 3. Flatpak Applications (Silent-if-Absent)
+    if type -P flatpak &>/dev/null; then
+        local fp_list_out
+        if fp_list_out="$(timeout 4 flatpak list 2>/dev/null)"; then
+            STANDALONE_FLATPAK_COUNT="$(awk 'NF {c++} END {print c+0}' <<< "$fp_list_out")"
+            if (( STANDALONE_FLATPAK_COUNT > 0 )); then
+                STANDALONE_FLATPAK_INSTALLED=true
+                ((STANDALONE_CHECKED_COUNT++)) || true
+                local fp_up_out
+                if fp_up_out="$(timeout 5 flatpak remote-ls --updates 2>/dev/null)"; then
+                    STANDALONE_FLATPAK_UP_COUNT="$(awk 'NF {c++} END {print c+0}' <<< "$fp_up_out")"
+                    if (( STANDALONE_FLATPAK_UP_COUNT > 0 )); then
+                        STANDALONE_FLATPAK_STAT="UPDATE ⚠ (${STANDALONE_FLATPAK_UP_COUNT} app updates available)"
+                        STANDALONE_FLATPAK_UP_NEEDED=true
+                    else
+                        STANDALONE_FLATPAK_STAT="PASS ✔ (all Flatpaks up to date)"
+                    fi
+                else
+                    STANDALONE_FLATPAK_STAT="PASS ✔ (all Flatpaks up to date)"
+                fi
+            fi
+        fi
+    fi
+
+    # 4. Rustup Toolchain (Silent-if-Absent)
+    if type -P rustup &>/dev/null; then
+        STANDALONE_RUSTUP_INSTALLED=true
+        ((STANDALONE_CHECKED_COUNT++)) || true
+        local r_check
+        r_check="$(timeout 5 rustup check 2>/dev/null || true)"
+        if [[ "$r_check" =~ (Update\ available|outdated) ]]; then
+            STANDALONE_RUSTUP_STAT="UPDATE ⚠ (toolchain update available)"
+            STANDALONE_RUSTUP_UP_NEEDED=true
+        else
+            STANDALONE_RUSTUP_STAT="PASS ✔ (Rust toolchains up to date)"
+        fi
+    fi
+
+    # Aggregate telemetry & logs
+    local -a pending_tools=()
+    local -a log_lines=()
+
+    if $STANDALONE_UV_UP_NEEDED; then
+        pending_tools+=("uv")
+        log_lines+=("uv: v${STANDALONE_UV_CUR} -> v${STANDALONE_UV_LATEST}")
+    fi
+    if $STANDALONE_GOOSE_UP_NEEDED; then
+        pending_tools+=("goose")
+        log_lines+=("goose: v${STANDALONE_GOOSE_CUR} -> v${STANDALONE_GOOSE_LATEST}")
+    fi
+    if $STANDALONE_FLATPAK_UP_NEEDED; then
+        pending_tools+=("flatpak")
+        log_lines+=("flatpak: ${STANDALONE_FLATPAK_UP_COUNT} app update(s) available")
+    fi
+    if $STANDALONE_RUSTUP_UP_NEEDED; then
+        pending_tools+=("rustup")
+        log_lines+=("rustup: toolchain update available")
+    fi
+
+    STANDALONE_PENDING_COUNT=${#pending_tools[@]}
+    if (( STANDALONE_PENDING_COUNT > 0 )); then
+        STANDALONE_STATUS="info"
+        local csv=""
+        for t in "${pending_tools[@]}"; do
+            [[ -n "$csv" ]] && csv+=", "
+            csv+="$t"
+        done
+        STANDALONE_PENDING_CSV="$csv"
+
+        if command -v jq &>/dev/null; then
+            STANDALONE_PENDING_TOOLS="$(jq -n -c '$ARGS.positional' --args "${pending_tools[@]}")"
+        else
+            local j_tools="["
+            for i in "${!pending_tools[@]}"; do
+                (( i > 0 )) && j_tools+=","
+                j_tools+="\"${pending_tools[$i]}\""
+            done
+            j_tools+="]"
+            STANDALONE_PENDING_TOOLS="$j_tools"
+        fi
+
+        local d_log=""
+        for l in "${log_lines[@]}"; do
+            [[ -n "$d_log" ]] && d_log+=$'\n'
+            d_log+="$l"
+        done
+        STANDALONE_DETAILS_LOG="$d_log"
+    else
+        STANDALONE_STATUS="pass"
+        STANDALONE_PENDING_TOOLS="[]"
+        STANDALONE_PENDING_CSV=""
+        STANDALONE_DETAILS_LOG=""
+    fi
+}
+
 # [SRE-AUDIT: CERTIFIED | Sol v2.38 | PATCH-027 | Fixtures: test-suite.sh Part 1, Part 8]
 run_software_updates() {
     local json_mode="${1:-0}"
@@ -11370,7 +11645,8 @@ run_software_updates() {
 
     # Security & Multi-User Isolation Guardrail:
     # Standalone tools (~/.local/bin, pipx, rustup, uv, goose) and AUR packages must NEVER be updated or scanned as root.
-    if [[ "$EUID" -eq 0 ]]; then
+    local effective_euid="${_TEST_EUID:-$EUID}"
+    if [[ "$effective_euid" -eq 0 ]]; then
         echo ""
         fail "SECURITY GUARDRAIL: Standalone & AUR updates cannot be executed as root!"
         info "Running user-space updates (AUR, ~/.local/bin, uv, goose, pipx, rustup) as root causes"
@@ -11410,93 +11686,28 @@ run_software_updates() {
             fi
         fi
 
-        # 2. UV Python Toolchain (Silent-if-Absent)
-        local uv_installed=false uv_cur="not installed" uv_latest="unknown" uv_stat=""
-        local uv_up_needed=false
-        if type -P uv &>/dev/null; then
-            uv_installed=true
-            uv_cur="$(uv --version 2>/dev/null | awk '{print $2}' || echo "unknown")"
-            local uv_owner
-            uv_owner="$(check_binary_ownership uv)"
-            if [[ "$uv_owner" == "pacman" ]]; then
-                uv_stat="PASS ✔ (v${uv_cur} - pacman managed)"
-            elif [[ "$uv_owner" == "shim" ]]; then
-                uv_stat="PASS ✔ (v${uv_cur} - runtime/shim managed)"
-            elif [[ "$uv_owner" == "cargo" ]]; then
-                uv_stat="PASS ✔ (v${uv_cur} - cargo managed)"
-            elif [[ "$uv_owner" == "foreign" ]]; then
-                uv_stat="PASS ✔ (v${uv_cur} - foreign manager)"
-            else
-                local uv_dry
-                uv_dry="$(uv self update --dry-run 2>&1 || true)"
-                if [[ "$uv_dry" =~ to\ v([0-9.]+) ]]; then
-                    uv_latest="${BASH_REMATCH[1]}"
-                    uv_stat="UPDATE ⚠ (v${uv_cur} -> v${uv_latest} available)"
-                    uv_up_needed=true
-                elif [[ "$uv_cur" != "unknown" ]]; then
-                    uv_latest="$uv_cur"
-                    uv_stat="PASS ✔ (v${uv_cur} - up to date)"
-                fi
-            fi
-        fi
+        # 2. Standalone & 3rd-party software probe (PATCH-058 unified engine)
+        _probe_standalone_software_updates
+        local uv_installed="$STANDALONE_UV_INSTALLED"
+        local uv_cur="$STANDALONE_UV_CUR"
+        local uv_latest="$STANDALONE_UV_LATEST"
+        local uv_stat="$STANDALONE_UV_STAT"
+        local uv_up_needed="$STANDALONE_UV_UP_NEEDED"
 
-        # 3. Goose AI Assistant (Silent-if-Absent)
-        local goose_installed=false goose_cur="not installed" goose_latest="unknown" goose_stat=""
-        local goose_up_needed=false
-        if type -P goose &>/dev/null; then
-            goose_installed=true
-            goose_cur="$(goose --version 2>/dev/null | awk '{print $1}' | tr -d 'v' || echo "unknown")"
-            local g_owner
-            g_owner="$(check_binary_ownership goose)"
-            if [[ "$g_owner" == "pacman" ]]; then
-                goose_stat="PASS ✔ (v${goose_cur} - pacman managed)"
-            elif [[ "$g_owner" == "shim" ]]; then
-                goose_stat="PASS ✔ (v${goose_cur} - runtime/shim managed)"
-            elif [[ "$g_owner" == "cargo" ]]; then
-                goose_stat="PASS ✔ (v${goose_cur} - cargo managed)"
-            elif [[ "$g_owner" == "foreign" ]]; then
-                goose_stat="PASS ✔ (v${goose_cur} - foreign manager)"
-            else
-                local goose_tag
-                # Strip both \r and \n (RFC 9110 HTTP CRLF fix verified by o3-mini & Gemini Pro)
-                goose_tag="$(
-                    curl -fsIL --connect-timeout 2 --max-time 4 https://github.com/aaif-goose/goose/releases/latest 2>/dev/null |
-                    awk -F'/tag/v?' '/[Ll]ocation:.*\/tag\// {print $2}' |
-                    tr -d '\r\n'
-                )" || true
+        local goose_installed="$STANDALONE_GOOSE_INSTALLED"
+        local goose_cur="$STANDALONE_GOOSE_CUR"
+        local goose_latest="$STANDALONE_GOOSE_LATEST"
+        local goose_stat="$STANDALONE_GOOSE_STAT"
+        local goose_up_needed="$STANDALONE_GOOSE_UP_NEEDED"
 
-                if [[ "$goose_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-                    goose_latest="$goose_tag"
-                    if [[ "$goose_cur" != "$goose_latest" ]]; then
-                        goose_stat="UPDATE ⚠ (v${goose_cur} -> v${goose_latest} available)"
-                        goose_up_needed=true
-                    else
-                        goose_stat="PASS ✔ (v${goose_cur} - up to date)"
-                    fi
-                elif [[ "$goose_cur" != "unknown" ]]; then
-                    goose_stat="PASS ✔ (v${goose_cur} - remote check offline)"
-                else
-                    goose_stat="INFO ℹ (v${goose_cur} - version unknown)"
-                fi
-            fi
-        fi
+        local flatpak_installed="$STANDALONE_FLATPAK_INSTALLED"
+        local flatpak_count="$STANDALONE_FLATPAK_COUNT"
+        local flatpak_stat="$STANDALONE_FLATPAK_STAT"
+        local flatpak_up_needed="$STANDALONE_FLATPAK_UP_NEEDED"
 
-        # 4. Flatpak Applications (Silent-if-Absent)
-        local flatpak_installed=false flatpak_up_needed=false flatpak_count=0 flatpak_stat=""
-        if type -P flatpak &>/dev/null; then
-            flatpak_count="$(flatpak list 2>/dev/null | wc -l || echo 0)"
-            if (( flatpak_count > 0 )); then
-                flatpak_installed=true
-                local fp_count
-                fp_count="$(timeout 5 flatpak remote-ls --updates 2>/dev/null | wc -l || echo 0)"
-                if (( fp_count > 0 )); then
-                    flatpak_stat="UPDATE ⚠ (${fp_count} app updates available)"
-                    flatpak_up_needed=true
-                else
-                    flatpak_stat="PASS ✔ (all Flatpaks up to date)"
-                fi
-            fi
-        fi
+        local rustup_installed="$STANDALONE_RUSTUP_INSTALLED"
+        local rustup_stat="$STANDALONE_RUSTUP_STAT"
+        local rustup_up_needed="$STANDALONE_RUSTUP_UP_NEEDED"
 
         # 5. Pipx Applications (Silent-if-Absent)
         local pipx_installed=false pipx_count=0 pipx_stat=""
@@ -11504,20 +11715,6 @@ run_software_updates() {
             pipx_installed=true
             pipx_count="$(pipx list --short 2>/dev/null | wc -l || echo 0)"
             pipx_stat="PASS ✔ (${pipx_count} app(s) managed via pipx)"
-        fi
-
-        # 6. Rustup Toolchain (Silent-if-Absent)
-        local rustup_installed=false rustup_stat="" rustup_up_needed=false
-        if type -P rustup &>/dev/null; then
-            rustup_installed=true
-            local r_check
-            r_check="$(rustup check 2>/dev/null || true)"
-            if [[ "$r_check" =~ (Update\ available|outdated) ]]; then
-                rustup_stat="UPDATE ⚠ (toolchain update available)"
-                rustup_up_needed=true
-            else
-                rustup_stat="PASS ✔ (Rust toolchains up to date)"
-            fi
         fi
 
         # 7. Steam Client & Proton (Silent-if-Absent)
@@ -12104,6 +12301,7 @@ print_bootloader_repair_hint() {
     esac
 }
 
+# [SRE-AUDIT: HARDENED | Sol v2.39 | PATCH-028 | Fixtures: none]
 check_laptop_battery_preflight() {
     # 1. Detect chassis type
     # Laptops/Notebooks: 8, 9, 10, 11, 14, 30, 31, 32
