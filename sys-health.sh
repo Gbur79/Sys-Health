@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.61
+# Arch System Health & Diagnostics v2.62
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.61"
+VERSION="2.62"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -6641,6 +6641,7 @@ _parse_fwupd_json() {
     ' "$json_file" 2>/dev/null || echo '{"pending_count":0,"bypassed_count":0,"pending_devices":[],"names_str":""}'
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.59 | PATCH-050 | Fixtures: test-suite.sh Part 21]
 check_firmware_updates() {
     local root="${SYS_HEALTH_ROOT:-}"
     local fw_bin="fwupdmgr"
@@ -6986,43 +6987,40 @@ _patch041_tree_bytes() {
     printf '%s\n' "$bytes"
 }
 
-# [SRE-AUDIT: CERTIFIED | Argon v2.61 | PATCH-054 | Fixtures: test-suite.sh Part 23]
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-054 | Fixtures: test-suite.sh Part 23]
 _check_session_authority_ownership() {
     local sys_root="${SYS_HEALTH_ROOT:-}"
     local -a bad_files=()
-    local bad_uname=""
+    local -a bad_users=()
 
     local -a user_entries=()
-    if [[ -n "$sys_root" && -f "${sys_root}/etc/passwd" ]]; then
-        while IFS=: read -r u _ u_id _ _ h sh; do
-            if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
-                [[ "$h" == /* ]] && h="${sys_root%/}${h}"
-                user_entries+=("${u_id}:${u}:${h}")
-            fi
-        done < "${sys_root}/etc/passwd"
+    if [[ -n "$sys_root" ]]; then
+        if [[ -f "${sys_root}/etc/passwd" ]]; then
+            while IFS=: read -r u _ u_id _ _ h sh; do
+                if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
+                    [[ "$h" == /* ]] && h="${sys_root%/}${h}"
+                    user_entries+=("${u_id}:${u}:${h}")
+                fi
+            done < "${sys_root}/etc/passwd"
+        fi
     else
         while IFS=$'\t' read -r uid uname home; do
             [[ -n "$uid" && -n "$home" ]] && user_entries+=("${uid}:${uname}:${home}")
         done < <(_patch041_user_contexts 2>/dev/null || true)
     fi
 
-    if (( ${#user_entries[@]} == 0 )); then
+    if (( ${#user_entries[@]} == 0 )) && [[ -z "$sys_root" ]]; then
         if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
             local s_uid s_home
             s_uid="$(id -u "$SUDO_USER" 2>/dev/null || echo 1000)"
             s_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "/home/$SUDO_USER")"
-            [[ -n "$sys_root" && "$s_home" == /* ]] && s_home="${sys_root%/}${s_home}"
             user_entries+=("${s_uid}:${SUDO_USER}:${s_home}")
-        else
-            local passwd_file="${sys_root}/etc/passwd"
-            if [[ -f "$passwd_file" ]]; then
-                while IFS=: read -r u _ u_id _ _ h sh; do
-                    if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
-                        [[ -n "$sys_root" && "$h" == /* ]] && h="${sys_root%/}${h}"
-                        user_entries+=("${u_id}:${u}:${h}")
-                    fi
-                done < "$passwd_file"
-            fi
+        elif [[ -f /etc/passwd ]]; then
+            while IFS=: read -r u _ u_id _ _ h sh; do
+                if [[ "$u_id" =~ ^[0-9]+$ ]] && (( u_id >= 1000 && u_id < 60000 )) && [[ "$sh" != */nologin && "$sh" != */false ]]; then
+                    user_entries+=("${u_id}:${u}:${h}")
+                fi
+            done < /etc/passwd
         fi
     fi
 
@@ -7031,14 +7029,18 @@ _check_session_authority_ownership() {
         IFS=: read -r u_id u_name u_home <<< "$entry"
         [[ -d "$u_home" ]] || continue
 
+        local user_bad=false
         local auth_file
         for auth_file in "$u_home/.Xauthority" "$u_home/.ICEauthority"; do
             if [[ -e "$auth_file" ]]; then
                 local owner_uid
                 owner_uid="$(stat -c '%u' "$auth_file" 2>/dev/null || true)"
                 if [[ "$owner_uid" == "0" && "$u_id" != "0" ]]; then
-                    bad_files+=("${auth_file##*/}")
-                    bad_uname="$u_name"
+                    local fname="${auth_file##*/}"
+                    if [[ " ${bad_files[*]} " != *" ${fname} "* ]]; then
+                        bad_files+=("$fname")
+                    fi
+                    user_bad=true
                 fi
             fi
         done
@@ -7047,37 +7049,45 @@ _check_session_authority_ownership() {
             local cache_uid
             cache_uid="$(stat -c '%u' "$u_home/.cache" 2>/dev/null || true)"
             if [[ "$cache_uid" == "0" && "$u_id" != "0" ]]; then
-                bad_files+=(".cache")
-                bad_uname="$u_name"
+                if [[ " ${bad_files[*]} " != *" .cache "* ]]; then
+                    bad_files+=(".cache")
+                fi
+                user_bad=true
             fi
+        fi
+
+        if $user_bad && [[ " ${bad_users[*]} " != *" ${u_name} "* ]]; then
+            bad_users+=("$u_name")
         fi
     done
 
     if (( ${#bad_files[@]} > 0 )); then
+        local bad_uname
+        bad_uname="$(IFS=,; echo "${bad_users[*]}")"
         printf '%s:%s\n' "$bad_uname" "${bad_files[*]}"
         return 0
     fi
     return 1
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-054 | Fixtures: test-suite.sh Part 23]
 _check_pam_display_manager_conflicts() {
     local sys_root="${SYS_HEALTH_ROOT:-}"
     local pam_dir="${sys_root}/etc/pam.d"
     [[ -d "$pam_dir" ]] || return 1
 
     local dm_detected=false
-    if systemctl is-active --quiet display-manager 2>/dev/null || \
-       systemctl is-active --quiet lightdm 2>/dev/null || \
-       systemctl is-active --quiet sddm 2>/dev/null || \
-       systemctl is-active --quiet gdm 2>/dev/null || \
-       systemctl is-active --quiet ly 2>/dev/null || \
-       systemctl is-active --quiet greetd 2>/dev/null; then
+    if [[ -z "$sys_root" ]] && command -v systemctl &>/dev/null && \
+       timeout 0.8s systemctl is-active --quiet display-manager lightdm sddm gdm ly greetd 2>/dev/null; then
         dm_detected=true
     elif [[ -L "${sys_root}/etc/systemd/system/display-manager.service" ]] || \
+         [[ -f "${sys_root}/etc/systemd/system/display-manager.service" ]] || \
          [[ -f "${sys_root}/etc/lightdm/lightdm.conf" ]] || \
          [[ -f "${sys_root}/etc/sddm.conf" ]] || \
          [[ -d "${sys_root}/etc/sddm.conf.d" ]] || \
-         [[ -d "${sys_root}/etc/gdm" ]]; then
+         [[ -d "${sys_root}/etc/gdm" ]] || \
+         [[ -d "${sys_root}/etc/ly" ]] || \
+         [[ -d "${sys_root}/etc/greetd" ]]; then
         dm_detected=true
     fi
 
@@ -7085,7 +7095,7 @@ _check_pam_display_manager_conflicts() {
 
     local p
     local -a conflicts=()
-    for p in "$pam_dir"/system-login.pacnew "$pam_dir"/lightdm*.pacnew "$pam_dir"/sddm*.pacnew "$pam_dir"/gdm*.pacnew; do
+    for p in "$pam_dir"/system-login.pacnew "$pam_dir"/system-auth.pacnew "$pam_dir"/lightdm*.pacnew "$pam_dir"/sddm*.pacnew "$pam_dir"/gdm*.pacnew "$pam_dir"/ly*.pacnew "$pam_dir"/greetd*.pacnew; do
         [[ -f "$p" ]] && conflicts+=("${p##*/}")
     done
 
@@ -7096,12 +7106,18 @@ _check_pam_display_manager_conflicts() {
     return 1
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-054 | Fixtures: test-suite.sh Part 23]
 _check_deprecated_intel_xorg_driver() {
     local sys_root="${SYS_HEALTH_ROOT:-}"
     local is_installed=false
 
-    local db_path="${sys_root%/}$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman)"
+    local raw_db="/var/lib/pacman"
+    if [[ -z "$sys_root" ]] && command -v pacman-conf &>/dev/null; then
+        raw_db="$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman)"
+    fi
+    local db_path="${sys_root%/}/${raw_db#/}"
     db_path="${db_path%/}"
+
     if [[ -d "$db_path/local" ]] && compgen -G "$db_path/local/xf86-video-intel-*" >/dev/null; then
         is_installed=true
     elif [[ -z "$sys_root" ]] && command -v pacman &>/dev/null && pacman -Q xf86-video-intel &>/dev/null; then
@@ -7110,16 +7126,33 @@ _check_deprecated_intel_xorg_driver() {
 
     $is_installed || return 1
 
-    local lspci_out
-    lspci_out="$(lspci -nn 2>/dev/null || true)"
-    if [[ "$lspci_out" =~ \[030[0-2]\].*8086: ]] || \
-       ( [[ "$lspci_out" =~ (VGA|3D|Display) ]] && [[ "$lspci_out" =~ [Ii]ntel ]] ) || \
-       ( [[ -z "$lspci_out" ]] && lspci 2>/dev/null | grep -E 'VGA|3D|Display' | grep -qi 'Intel' ); then
-        return 0
+    local lspci_out=""
+    if declare -F lspci &>/dev/null; then
+        lspci_out="$(lspci -nn 2>/dev/null || true)"
+    elif [[ -z "$sys_root" ]] && command -v lspci &>/dev/null; then
+        lspci_out="$(lspci -nn 2>/dev/null || true)"
+    elif [[ -n "$sys_root" && -x "${sys_root%/}/usr/bin/lspci" ]]; then
+        lspci_out="$("${sys_root%/}/usr/bin/lspci" -nn 2>/dev/null || true)"
+    else
+        return 1
     fi
+
+    local line
+    local legacy_pre_gen8_re='(Haswell|Ivy Bridge|Sandy Bridge|Ironlake|Arrandale|Clarkdale|ValleyView|Bay Trail|GMA|[234](nd|rd|th) Gen Core|HD Graphics (2000|2500|3000|4[0-9]{3}|5000)|Iris( Pro)? Graphics 5[12]00|8086:(004[26]|01[01256][26a]|04[012][26a]|0a[012][26e]|0d[12][26]|0f31|2[5789a][0-9a-f]{2}))'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ \[030[0-2]\] ]] || [[ "$line" =~ (VGA|3D|Display) ]]; then
+            if [[ "$line" =~ 8086: ]] || [[ "$line" =~ [Ii]ntel ]]; then
+                if ! [[ "$line" =~ $legacy_pre_gen8_re ]]; then
+                    return 0
+                fi
+            fi
+        fi
+    done <<< "$lspci_out"
     return 1
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-054 | Fixtures: test-suite.sh Part 23]
 check_desktop_session_hygiene() {
     local auth_result="" pam_result=""
     local has_issue=false
@@ -7146,14 +7179,17 @@ check_desktop_session_hygiene() {
     fi
 
     if $has_issue; then
-        local summary_msg
-        summary_msg="$(IFS='; '; echo "${issues[*]}")"
+        local summary_msg=""
+        printf -v summary_msg '%s; ' "${issues[@]}"
+        summary_msg="${summary_msg%; }"
         add_row "Desktop session hygiene" "WARN ⚠ ($summary_msg)" "SYS"
-        ((WARNINGS++))
-        {
-            echo "### DESKTOP SESSION HYGIENE ISSUES"
-            printf '%s\n' "$summary_msg"
-        } >> "$LOG_FILE"
+        ((WARNINGS++)) || true
+        if [[ -n "${LOG_FILE:-}" ]]; then
+            {
+                echo "### DESKTOP SESSION HYGIENE ISSUES"
+                printf '%s\n' "$summary_msg"
+            } >> "$LOG_FILE"
+        fi
     else
         add_row "Desktop session hygiene" "PASS ✔" "SYS"
         log "HEALTH desktop_session_hygiene=PASS"
@@ -7311,8 +7347,10 @@ _patch041_journal_usage() {
     return 1
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon/Hydrogen v2.62 | PATCH-055 | Fixtures: test-suite.sh Part 16]
 check_journal_flood() {
-    local readonly dropped_message_id="fc2e22bc6ee647b6b90729ab34a250b1"
+    # SD_MESSAGE_JOURNAL_DROPPED (/usr/include/systemd/sd-messages.h)
+    local readonly dropped_message_id="a596d6fe7bfa4994828e72309e95d61e"
     local usage record query_ok=1 line message="" dropped="" culprit="unknown"
     local groups
 
@@ -7339,7 +7377,7 @@ check_journal_flood() {
         record=""
     elif ! record="$(LC_ALL=C timeout 4s journalctl -q -b 0 --since '-15 min' \
         -r -n 1 "MESSAGE_ID=$dropped_message_id" --no-pager -o export \
-        --output-fields=MESSAGE,N_DROPPED 2>/dev/null)"; then
+        --output-fields=MESSAGE,N_DROPPED 2>/dev/null | tr -d '\0')"; then
         query_ok=0
         record=""
     fi
@@ -7943,6 +7981,7 @@ _is_firewall_service_active() {
     return 1
 }
 
+# [SRE-AUDIT: CERTIFIED | Argon v2.59 | PATCH-052 | Fixtures: test-suite.sh Part 21]
 check_firewall_status() {
     local root="${SYS_HEALTH_ROOT:-}"
 
