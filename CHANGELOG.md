@@ -16,10 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SRE Verification Tooling & Hermetic Tests (`dev-tools/`)**:
   - Added `dev-tools/lint-universalism.sh` (systemd `SD_MESSAGE_*` contract validation, null-byte pipeline hygiene, rig-bias checks, version sync, and OPSEC `.gitignore`/git tracking gates) and `dev-tools/verify-bash.sh -q` (`bash -n`, `shellcheck`, linter, and `test-suite.sh -q`).
   - Hardened Fixture 16.4 with strict `MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e` CLI contract assertion, added Fixture 16.6 for binary `-o export` null-byte resilience, and added Part 24 adversarial tooling tests (134/134 tests passing).
+- **Tri-State Mirror Reachability Telemetry (`check_mirrorlist_age`, `generate_summary_json`, MOD-08/MOD-11, `PATCH-057`)**:
+  - Replaced `false` default with semantic tri-state (`null` | `true` | `false`) for `checks.mirrors.arch_primary_alive` in `summary.json`, emitting `null` when mirror probing was not executed, `curl` is unavailable (`probe unavail`), no active mirrorlists exist, or the host is offline; `false` is emitted only when the primary mirror fails while internet control plane is verified online (`primary DEAD`).
+  - Added Test 1.7 (unprobed `null` contract) and Fixture 12.5 (5-state mirror probe matrix) in `dev-tools/test-suite.sh` (138/138 tests passing).
+- **Standalone Software Telemetry & Health Audit (`_probe_standalone_software_updates`, `check_standalone_updates`, `checks.standalone_software`, MOD-08/MOD-11, `PATCH-058`)**:
+  - Unified standalone 3rd-party software probing (`uv`, `goose`, `flatpak`, `rustup`) into reusable `_probe_standalone_software_updates()` with root execution guardrails (`_TEST_EUID`), ownership classification, and timeout resilience.
+  - Added `check_standalone_updates()` to health audit pipeline and structured telemetry contract `checks.standalone_software` (`status`, `pending_count`, `pending_tools`) in `summary.json`.
+  - Added Test 1.8 (`checks.standalone_software` schema & payload $\le 2000$ bytes) and Fixture 12.6 (5-case permutation matrix) in `dev-tools/test-suite.sh` (140/140 tests passing).
 
 ## [2.61] - 2026-11-01
 
-### Added & Hardened (EOS-SRE Architectural Audit - Desktop Session Hygiene & Display Manager Login Loop Forensics / PATCH-054)
+### Added & Hardened (SRE Architectural Audit - Desktop Session Hygiene & Display Manager Login Loop Forensics / PATCH-054)
 - **Desktop Session Hygiene & Login Loop Forensics (MOD-07, `PATCH-054`)**:
   - Implemented `check_desktop_session_hygiene()` detecting root-owned session authority files (`~/.Xauthority`, `~/.ICEauthority`, `~/.cache`), unmerged Display Manager PAM configuration conflicts (`/etc/pam.d/*.pacnew`), and deprecated legacy Xorg DDX driver `xf86-video-intel`.
   - Machine Telemetry & Remediation (MOD-08): Added structured actionable remediation codes `DESKTOP_SESSION_AUTHORITY_ROOT`, `PAM_PACNEW_DISPLAY_MANAGER_CONFLICT`, and `XORG_INTEL_DRIVER_DEPRECATED`.
