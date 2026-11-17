@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.63] - 2026-11-17
+
+### Fixed & Hardened (SRE Architectural Audit - Partial-Run Telemetry Protection & Selective Mirror Refresh / PATCH-059)
+- **Partial-Run `summary.json` Preservation & Atomic Write (`generate_summary_json`, `run_guarded_upgrade`, MOD-08, `PATCH-059`)**:
+  - Added per-probe execution flags (`*_CHECK_RAN`) and `_reset_partial_run_telemetry_state()` so partial workflows such as `run_guarded_upgrade()` update `timestamp`, `run_id`, `environment`, and `gpu` while preserving previously audited `checks.desktop_indexers`, `checks.journal_rate_limit`, `checks.mirrors`, `checks.standalone_software`, `security`, `firmware`, `firewall`, `gaming`, `status`/`counts`/`flagged`/`actionable_remediations`, and `dynamic_sample` instead of overwriting them with `"unknown"` / `false`.
+  - Replaced direct `> "$SUMMARY_FILE"` redirection with atomic temp-file writes (`${SUMMARY_FILE}.tmp.$$` + `mv -f`) to eliminate truncated JSON reads by external watchers.
+- **Selective `--mirrors` Telemetry Refresh (`run_mirrors_action`, MOD-11, `PATCH-059`)**:
+  - Extracted `run_mirrors_action()` for `ACTION == "mirrors"`: upon `refresh_and_rank_mirrors 1` exit codes `0` or `2`, re-runs `check_mirrorlist_age()` and updates `.checks.mirrors` plus `mirrorlist_age` entries in `flagged`, `actionable_remediations`, `counts`, and `status` without clobbering unrelated sections (exit code `1` leaves `summary.json` untouched).
+- **Hermetic Regression Tests (`dev-tools/test-suite.sh`)**:
+  - Added Test 1.9 (partial-run `summary.json` preservation & corrupt JSON recovery) and Fixture 12.7 (`run_mirrors_action` `rc=0`/`rc=2`/`rc=1` matrix) (`142/142` tests passing).
+
 ## [2.62] - 2026-11-14
 
 ### Fixed & Hardened (SRE Architectural Audit - Journald Binary Export Sanitization, Systemd UUID Contract & Verification Tooling / PATCH-055)
