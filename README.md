@@ -1,8 +1,8 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.61](https://img.shields.io/badge/Version-2.61-orange.svg)](CHANGELOG.md)
-[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-123%2F123%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
+[![Version: 2.63](https://img.shields.io/badge/Version-2.63-orange.svg)](CHANGELOG.md)
+[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-142%2F142%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
