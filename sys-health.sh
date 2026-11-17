@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.62
+# Arch System Health & Diagnostics v2.63
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.62"
+VERSION="2.63"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -45,6 +45,42 @@ FIREWALL_DETAILS=""
 STANDALONE_STATUS="unknown"
 STANDALONE_PENDING_COUNT=0
 STANDALONE_PENDING_TOOLS="[]"
+
+# Probe execution trackers for partial-run telemetry preservation (PATCH-059)
+AUDIT_FULL_RAN=false
+DESKTOP_INDEXER_CHECK_RAN=false
+JOURNAL_CHECK_RAN=false
+MIRROR_CHECK_RAN=false
+STANDALONE_CHECK_RAN=false
+ARCH_AUDIT_CHECK_RAN=false
+FIRMWARE_CHECK_RAN=false
+FIREWALL_CHECK_RAN=false
+GAMING_CHECK_RAN=false
+
+_reset_partial_run_telemetry_state() {
+    AUDIT_FULL_RAN=false
+    DESKTOP_INDEXER_CHECK_RAN=false
+    JOURNAL_CHECK_RAN=false
+    MIRROR_CHECK_RAN=false
+    STANDALONE_CHECK_RAN=false
+    ARCH_AUDIT_CHECK_RAN=false
+    FIRMWARE_CHECK_RAN=false
+    FIREWALL_CHECK_RAN=false
+    GAMING_CHECK_RAN=false
+    DESKTOP_INDEXER_STATUS=""
+    DESKTOP_INDEXER_OBSERVATIONS_TSV=""
+    JOURNAL_RATE_STATUS="unknown"
+    MIRROR_STATUS="unknown"
+    STANDALONE_STATUS="unknown"
+    ARCH_AUDIT_AVAILABLE=false
+    FIRMWARE_AVAILABLE=false
+    FIREWALL_ACTIVE=false
+    FIREWALL_BACKEND="none"
+    GAMING_DETECTED=false
+    ERRORS=0
+    WARNINGS=0
+    INFO_COUNT=0
+}
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
 
@@ -6656,6 +6692,7 @@ _parse_fwupd_json() {
 
 # [SRE-AUDIT: CERTIFIED | Argon v2.59 | PATCH-050 | Fixtures: test-suite.sh Part 21]
 check_firmware_updates() {
+    FIRMWARE_CHECK_RAN=true
     local root="${SYS_HEALTH_ROOT:-}"
     local fw_bin="fwupdmgr"
     if [[ -n "$root" && -x "$root/usr/bin/fwupdmgr" ]]; then
@@ -7212,6 +7249,7 @@ check_desktop_session_hygiene() {
 # [SRE-AUDIT: CERTIFIED | Sol v2.48 | PATCH-041 | Fixtures: test-suite.sh Part 16]
 check_desktop_indexers() {
     # MOD-08 consumes these globals in its existing one-shot JSON serializer.
+    DESKTOP_INDEXER_CHECK_RAN=true
     DESKTOP_INDEXER_STATUS="info"
     DESKTOP_INDEXER_COVERAGE="active_user_managers"
     DESKTOP_INDEXER_OBSERVATIONS_TSV=""
@@ -7368,6 +7406,7 @@ check_journal_flood() {
     local usage record query_ok=1 line message="" dropped="" culprit="unknown"
     local groups
 
+    JOURNAL_CHECK_RAN=true
     JOURNAL_RATE_STATUS="unknown"
     JOURNAL_RATE_COVERAGE="user"
     JOURNAL_RATE_WINDOW_SECONDS=900
@@ -8003,6 +8042,7 @@ _is_firewall_service_active() {
 
 # [SRE-AUDIT: CERTIFIED | Argon v2.59 | PATCH-052 | Fixtures: test-suite.sh Part 21]
 check_firewall_status() {
+    FIREWALL_CHECK_RAN=true
     local root="${SYS_HEALTH_ROOT:-}"
 
     # 1. Probe firewalld
@@ -8237,6 +8277,7 @@ check_standalone_updates() {
 
 # [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-044/PATCH-057 | Fixtures: test-suite.sh Part 1, Part 12]
 check_mirrorlist_age() {
+    MIRROR_CHECK_RAN=true
     local now
     now=$(date +%s)
     local -a mirror_files=()
@@ -8451,6 +8492,7 @@ check_arch_news() {
 
 # [SRE-AUDIT: CERTIFIED | Auditor Argon v2.59 | PATCH-051 | Fixtures: test-suite.sh Part 21]
 check_arch_audit() {
+    ARCH_AUDIT_CHECK_RAN=true
     local root="${SYS_HEALTH_ROOT:-}"
     local audit_bin="arch-audit"
     if [[ -n "$root" && -x "$root/usr/bin/arch-audit" ]]; then
@@ -8665,6 +8707,7 @@ detect_gaming_system() {
 
 # [SRE-AUDIT: CERTIFIED | Sol v2.44 | PATCH-032 | Fixtures: test-suite.sh Part 13]
 check_gaming() {
+    GAMING_CHECK_RAN=true
     local on_demand="${1:-0}"
     local root="${SYS_HEALTH_ROOT:-}"
     log "--- [GAMING] Checking Steam, Vulkan 32-bit & Gaming Readiness ---"
@@ -9229,12 +9272,39 @@ run_gaming_check() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.38 | PATCH-027 | Fixtures: test-suite.sh Part 1]
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.62 | PATCH-027/PATCH-059 | Fixtures: test-suite.sh Part 1, Part 12]
 generate_summary_json() {
     local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
 
     drivers="$(lspci -k 2>/dev/null | awk '/VGA|3D|Display/{f=1; next} /^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:/{f=0} f && /Kernel driver in use:/{print $5}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
+
+    # Partial-run preservation flags (PATCH-059): retain valid on-disk sections when probes did not execute
+    local jq_prev_input="null" has_prev=false
+    if [[ "${AUDIT_FULL_RAN:-false}" != "true" && -s "$SUMMARY_FILE" ]] && command -v jq &>/dev/null; then
+        if jq -e 'type == "object"' "$SUMMARY_FILE" >/dev/null 2>&1; then
+            jq_prev_input="$(< "$SUMMARY_FILE")"
+            has_prev=true
+        fi
+    fi
+
+    local keep_d_idx=false keep_journal=false keep_mirrors=false keep_standalone=false
+    local keep_security=false keep_firmware=false keep_firewall=false keep_gaming=false
+    local keep_audit_counts=false mirror_partial_ran=false
+    if $has_prev; then
+        [[ "${DESKTOP_INDEXER_CHECK_RAN:-false}" != "true" && -z "${DESKTOP_INDEXER_STATUS:-}" && -z "${DESKTOP_INDEXER_OBSERVATIONS_TSV:-}" ]] && keep_d_idx=true
+        [[ "${JOURNAL_CHECK_RAN:-false}" != "true" && "${JOURNAL_RATE_STATUS:-unknown}" == "unknown" ]] && keep_journal=true
+        [[ "${MIRROR_CHECK_RAN:-false}" != "true" && "${MIRROR_STATUS:-unknown}" == "unknown" ]] && keep_mirrors=true
+        [[ "${STANDALONE_CHECK_RAN:-false}" != "true" && "${STANDALONE_STATUS:-unknown}" == "unknown" ]] && keep_standalone=true
+        [[ "${ARCH_AUDIT_CHECK_RAN:-false}" != "true" && "${ARCH_AUDIT_AVAILABLE:-false}" != "true" ]] && keep_security=true
+        [[ "${FIRMWARE_CHECK_RAN:-false}" != "true" && "${FIRMWARE_AVAILABLE:-false}" != "true" ]] && keep_firmware=true
+        [[ "${FIREWALL_CHECK_RAN:-false}" != "true" && "${FIREWALL_ACTIVE:-false}" != "true" && "${FIREWALL_BACKEND:-none}" == "none" ]] && keep_firewall=true
+        [[ "${GAMING_CHECK_RAN:-false}" != "true" && "${GAMING_DETECTED:-false}" != "true" ]] && keep_gaming=true
+        [[ "${MIRROR_CHECK_RAN:-false}" == "true" ]] && mirror_partial_ran=true
+        if (( ERRORS == 0 && WARNINGS == 0 )) || $mirror_partial_ran; then
+            keep_audit_counts=true
+        fi
+    fi
 
     local status_str="ALL_CLEAR"
     if (( ERRORS > 0 )); then
@@ -9250,7 +9320,7 @@ generate_summary_json() {
     fi
 
     local remediations_json="[]"
-    if { (( WARNINGS > 0 || ERRORS > 0 || FIRMWARE_UPDATES_COUNT > 0 || ARCH_AUDIT_HIGH_RISK_COUNT > 0 )) || [[ "$FIREWALL_ACTIVE" != "true" ]]; } && [[ -f "$LOG_FILE" ]] && command -v jq &>/dev/null; then
+    if ! $keep_audit_counts && { (( WARNINGS > 0 || ERRORS > 0 || FIRMWARE_UPDATES_COUNT > 0 || ARCH_AUDIT_HIGH_RISK_COUNT > 0 )) || { ! $keep_firewall && [[ "$FIREWALL_ACTIVE" != "true" ]]; }; } && [[ -f "$LOG_FILE" ]] && command -v jq &>/dev/null; then
         local entries=()
         while IFS= read -r line; do
             [[ "$line" =~ ^HEALTH\ ([a-zA-Z0-9_]+)=(WARN|FAIL)(.*)$ ]] || continue
@@ -9632,7 +9702,7 @@ generate_summary_json() {
             entries+=("$obj")
         done < "$LOG_FILE"
 
-        if ! $FIREWALL_ACTIVE; then
+        if ! $keep_firewall && ! $FIREWALL_ACTIVE; then
             local f_obj
             f_obj="$(jq -nc \
                 --arg c "firewall" \
@@ -9743,7 +9813,8 @@ generate_summary_json() {
     [[ "${MIRROR_DISTRO_SERVERS:-}" =~ ^[0-9]+$ ]] && m_distro_srv="${MIRROR_DISTRO_SERVERS}"
 
     if command -v jq &>/dev/null; then
-        jq -n \
+        local tmp_summary="${SUMMARY_FILE}.tmp.$$"
+        if printf '%s\n' "$jq_prev_input" | jq \
             --arg schema "2.0" \
             --arg ts "$(date --iso-8601=seconds)" \
             --arg run_id "$RUN_ID" \
@@ -9798,21 +9869,84 @@ generate_summary_json() {
             --argjson game_vulkan32 "$game_vulkan32_val" \
             --argjson game_map_count "$game_map_val" \
             --arg game_proton "$game_proton_val" \
-            '{
+            --argjson has_prev "$has_prev" \
+            --argjson keep_d_idx "$keep_d_idx" \
+            --argjson keep_journal "$keep_journal" \
+            --argjson keep_mirrors "$keep_mirrors" \
+            --argjson keep_standalone "$keep_standalone" \
+            --argjson keep_security "$keep_security" \
+            --argjson keep_firmware "$keep_firmware" \
+            --argjson keep_firewall "$keep_firewall" \
+            --argjson keep_gaming "$keep_gaming" \
+            --argjson keep_audit_counts "$keep_audit_counts" \
+            --argjson mirror_partial_ran "$mirror_partial_ran" \
+            '. as $prev |
+            (if ($keep_audit_counts and ($prev | type) == "object") then
+                (if ($prev.flagged? | type) == "array" then $prev.flagged else [] end) as $pf |
+                (if ($prev.actionable_remediations? | type) == "array" then $prev.actionable_remediations else [] end) as $pr |
+                (if ($prev.counts.errors? | type) == "number" then $prev.counts.errors else 0 end) as $pe |
+                (if ($prev.counts.warnings? | type) == "number" then $prev.counts.warnings else 0 end) as $pw |
+                (($pf | index("mirrorlist_age")) != null) as $had_m |
+                (if $mirror_partial_ran then
+                    (if $m_status == "WARN" then
+                        (if $had_m then $pf else ($pf + ["mirrorlist_age"]) end) as $nf |
+                        ([ $pr[] | select(.check != "mirrorlist_age") ] + [{
+                            check: "mirrorlist_age",
+                            severity: "WARN",
+                            code: "PKG_MIRRORLIST_STALE",
+                            summary: "Pacman mirrorlist has stale mirrors, dead primary server, or high latency",
+                            suggested_fix: "Refresh mirrors with reflector, rate-mirrors, or eos-rankmirrors",
+                            risk: "LOW"
+                        }]) as $nr |
+                        (if $had_m then $pw else ($pw + 1) end) as $nw |
+                        {
+                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" else "ALL_CLEAR" end),
+                            counts: {errors: $pe, warnings: $nw},
+                            flagged: $nf,
+                            actionable_remediations: $nr
+                        }
+                    else
+                        ([ $pf[] | select(. != "mirrorlist_age") ]) as $nf |
+                        ([ $pr[] | select(.check != "mirrorlist_age") ]) as $nr |
+                        (if $had_m then (if $pw > 0 then ($pw - 1) else 0 end) else $pw end) as $nw |
+                        {
+                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" else "ALL_CLEAR" end),
+                            counts: {errors: $pe, warnings: $nw},
+                            flagged: $nf,
+                            actionable_remediations: $nr
+                        }
+                    end)
+                else
+                    {
+                        status: (if ($prev.status? | type) == "string" then $prev.status else $status end),
+                        counts: {errors: $pe, warnings: $pw},
+                        flagged: $pf,
+                        actionable_remediations: $pr
+                    }
+                end)
+            else
+                {
+                    status: $status,
+                    counts: {errors: $errors, warnings: $warnings},
+                    flagged: $flagged,
+                    actionable_remediations: $remediations
+                }
+            end) as $top_state |
+            {
                 schema_version: $schema,
                 timestamp: $ts,
                 run_id: $run_id,
-                status: $status,
-                counts: {errors: $errors, warnings: $warnings},
-                flagged: $flagged,
-                actionable_remediations: $remediations,
+                status: $top_state.status,
+                counts: $top_state.counts,
+                flagged: $top_state.flagged,
+                actionable_remediations: $top_state.actionable_remediations,
                 checks: {
-                    desktop_indexers: {
+                    desktop_indexers: (if ($keep_d_idx and (($prev.checks.desktop_indexers? | type) == "object")) then $prev.checks.desktop_indexers else {
                         status: $d_idx_status,
                         coverage: $d_idx_cov,
                         observations: $d_idx_obs
-                    },
-                    journal_rate_limit: {
+                    } end),
+                    journal_rate_limit: (if ($keep_journal and (($prev.checks.journal_rate_limit? | type) == "object")) then $prev.checks.journal_rate_limit else {
                         status: $j_status,
                         coverage: $j_cov,
                         window_seconds: $j_win,
@@ -9821,8 +9955,8 @@ generate_summary_json() {
                         source_group: $j_src,
                         disk_usage_bytes: $j_bytes,
                         disk_usage_human: $j_human
-                    },
-                    mirrors: {
+                    } end),
+                    mirrors: (if ($keep_mirrors and (($prev.checks.mirrors? | type) == "object")) then $prev.checks.mirrors else {
                         status: $m_status,
                         message: $m_msg,
                         arch_age_days: $m_arch_age,
@@ -9830,12 +9964,12 @@ generate_summary_json() {
                         arch_servers: $m_arch_srv,
                         distro_age_days: $m_distro_age,
                         distro_servers: $m_distro_srv
-                    },
-                    standalone_software: {
+                    } end),
+                    standalone_software: (if ($keep_standalone and (($prev.checks.standalone_software? | type) == "object")) then $prev.checks.standalone_software else {
                         status: $sa_status,
                         pending_count: $sa_count,
                         pending_tools: $sa_tools
-                    }
+                    } end)
                 },
                 environment: {
                     os: $os,
@@ -9846,7 +9980,7 @@ generate_summary_json() {
                     session: $session
                 },
                 gpu: {drivers_in_use: $drivers},
-                gaming: (if $game_detected then {
+                gaming: (if ($keep_gaming and (($prev.gaming? | type) == "object")) then $prev.gaming else (if $game_detected then {
                     detected: true,
                     multilib: $game_multilib,
                     vulkan_32bit: $game_vulkan32,
@@ -9855,8 +9989,8 @@ generate_summary_json() {
                 } else {
                     detected: false,
                     note: "Non-gaming environment (no Steam, Wine, or Proton detected)"
-                } end),
-                security: {
+                } end) end),
+                security: (if ($keep_security and (($prev.security? | type) == "object")) then $prev.security else {
                     available: $sec_avail,
                     tool: "arch-audit",
                     actionable_fixes: $sec_actionable,
@@ -9866,22 +10000,26 @@ generate_summary_json() {
                     high_risk_count: $sec_high,
                     cve_packages: $sec_pkgs,
                     packages: $sec_pkgs
-                },
-                firmware: {
+                } end),
+                firmware: (if ($keep_firmware and (($prev.firmware? | type) == "object")) then $prev.firmware else {
                     available: $fw_avail,
                     tool: "fwupd",
                     updates_count: $fw_count,
                     devices: $fw_devs,
                     pending_devices: $fw_devs
-                },
-                firewall: {
+                } end),
+                firewall: (if ($keep_firewall and (($prev.firewall? | type) == "object")) then $prev.firewall else {
                     available: true,
                     active: $fire_active,
                     backend: $fire_backend,
                     default_zone: (if $fire_zone != "" then $fire_zone else null end),
                     details: $fire_details
-                }
-            }' > "$SUMMARY_FILE" 2>/dev/null || true
+                } end)
+            } | (if ($has_prev and (($prev.dynamic_sample? | type) == "object")) then . + {dynamic_sample: $prev.dynamic_sample} else . end)' > "$tmp_summary" 2>/dev/null && [[ -s "$tmp_summary" ]]; then
+            mv -f "$tmp_summary" "$SUMMARY_FILE" 2>/dev/null || true
+        else
+            rm -f "$tmp_summary" 2>/dev/null || true
+        fi
     else
         echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS', "firmware": {"available": '$FIRMWARE_AVAILABLE', "updates_count": '$FIRMWARE_UPDATES_COUNT'}, "security": {"high_risk_count": '$ARCH_AUDIT_HIGH_RISK_COUNT'}, "firewall": {"active": '$FIREWALL_ACTIVE', "backend": "'$FIREWALL_BACKEND'"}}' > "$SUMMARY_FILE"
     fi
@@ -9892,6 +10030,7 @@ run_health_check() {
         section "SYS HEALTH AUDIT"
     fi
 
+    AUDIT_FULL_RAN=true
     AUDIT_TABLE=""
     AUDIT_TABLE_BOOT=""
     AUDIT_TABLE_HW=""
@@ -11434,6 +11573,7 @@ check_partial_upgrade_risk() {
 
 # [SRE-AUDIT: CERTIFIED | Argon v2.62 | PATCH-058 | Fixtures: test-suite.sh Part 1, Part 8, Part 12]
 _probe_standalone_software_updates() {
+    STANDALONE_CHECK_RAN=true
     STANDALONE_STATUS="pass"
     STANDALONE_PENDING_COUNT=0
     STANDALONE_PENDING_TOOLS="[]"
@@ -13789,7 +13929,8 @@ run_guarded_upgrade() {
         fi
     fi
 
-    # Refresh telemetry snapshots
+    # Refresh telemetry snapshots (preserving unprobed audit sections in summary.json - PATCH-059)
+    _reset_partial_run_telemetry_state
     refresh_state_snapshot
     collect_system_snapshot
     generate_summary_json
@@ -13909,6 +14050,18 @@ run_guarded_upgrade() {
 
 
 
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.62 | PATCH-059 | Fixtures: test-suite.sh Part 12]
+run_mirrors_action() {
+    local mirrors_rc=0
+    refresh_and_rank_mirrors 1 || mirrors_rc=$?
+    if (( mirrors_rc == 0 || mirrors_rc == 2 )); then
+        _reset_partial_run_telemetry_state
+        check_mirrorlist_age
+        generate_summary_json
+    fi
+    return "$mirrors_rc"
+}
+
 # Sourcing guard: allow sourcing as a library for test suites
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     return 0 2>/dev/null || exit 0
@@ -13955,7 +14108,7 @@ if [[ "$ACTION" == "orphans" ]]; then
 fi
 
 if [[ "$ACTION" == "mirrors" ]]; then
-    refresh_and_rank_mirrors 1
+    run_mirrors_action
     exit $?
 fi
 
