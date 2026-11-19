@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.63] - 2026-11-17
 
-### Fixed & Hardened (SRE Architectural Audit - Partial-Run Telemetry Protection & Selective Mirror Refresh / PATCH-059)
+### Fixed & Hardened (EOS-SRE Architectural Audit - Partial-Run Telemetry Protection & Selective Mirror Refresh / PATCH-059)
 - **Partial-Run `summary.json` Preservation & Atomic Write (`generate_summary_json`, `run_guarded_upgrade`, MOD-08, `PATCH-059`)**:
   - Added per-probe execution flags (`*_CHECK_RAN`) and `_reset_partial_run_telemetry_state()` so partial workflows such as `run_guarded_upgrade()` update `timestamp`, `run_id`, `environment`, and `gpu` while preserving previously audited `checks.desktop_indexers`, `checks.journal_rate_limit`, `checks.mirrors`, `checks.standalone_software`, `security`, `firmware`, `firewall`, `gaming`, `status`/`counts`/`flagged`/`actionable_remediations`, and `dynamic_sample` instead of overwriting them with `"unknown"` / `false`.
   - Replaced direct `> "$SUMMARY_FILE"` redirection with atomic temp-file writes (`${SUMMARY_FILE}.tmp.$$` + `mv -f`) to eliminate truncated JSON reads by external watchers.
@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Extracted `run_mirrors_action()` for `ACTION == "mirrors"`: upon `refresh_and_rank_mirrors 1` exit codes `0` or `2`, re-runs `check_mirrorlist_age()` and updates `.checks.mirrors` plus `mirrorlist_age` entries in `flagged`, `actionable_remediations`, `counts`, and `status` without clobbering unrelated sections (exit code `1` leaves `summary.json` untouched).
 - **Hermetic Regression Tests (`dev-tools/test-suite.sh`)**:
   - Added Test 1.9 (partial-run `summary.json` preservation & corrupt JSON recovery) and Fixture 12.7 (`run_mirrors_action` `rc=0`/`rc=2`/`rc=1` matrix) (`142/142` tests passing).
+- **Actionable Remediation Routing for GPU & Read-Only Root (`generate_summary_json`, MOD-08, `PATCH-060`)**:
+  - Fixed dead remediation branches in `generate_summary_json()` where `gpu|gpu_errors` (`phantom_driver`, `software_rendering`) and `root_space` (`status=read_only`) matched against undeclared `"$details"` instead of `"$rest"`, restoring emission of `GPU_PHANTOM_DRIVER`, `GPU_SOFTWARE_RENDERING_FALLBACK`, and `STORAGE_ROOT_READ_ONLY` (`risk: "CRITICAL"`).
+  - Added Test 1.10 (`test_remediation_code_routing_gpu_and_root_space`) in `dev-tools/test-suite.sh` covering all specific discriminators, fallback paths (`GPU_DRIVER_OR_LOG_STALL`, `STORAGE_ROOT_SPACE_CRITICAL`), and caller `$details` anti-poisoning (`143/143` tests passing).
+- **Full 52/52 Remediation Code Coverage, Axis 7 Guard & `SC2154` Gate (`dev-tools/`, MOD-08, `PATCH-062`)**:
+  - Added Test 1.11 (`test_remediation_code_matrix_all_remaining`) in `dev-tools/test-suite.sh` covering all 41 previously untested remediation codes (`52/52` total in `generate_summary_json()`), fallback arms, `FIREWALL_ACTIVE=false` `INFO` emission, and caller local-scope anti-poisoning assertions, plus initialized `local k_initrd=""` to clear `SC2154`, and added Fixture 24.9 (`145/145` tests passing).
+  - Added **Axis 7 (Remediation Code Coverage Guard)** to `dev-tools/lint-universalism.sh`, enforcing that every unique remediation `code` inside `generate_summary_json()` is referenced in `dev-tools/test-suite.sh`.
+  - Added a dedicated `shellcheck -x -s bash -i SC2154 -f gcc` gate in `dev-tools/verify-bash.sh` (without `-S error` warning suppression) covering `dev-tools/*.sh` and the extracted `generate_summary_json()` slice.
+- **Full-Monolith `SC2154` Gate, Axis 8 Duplicate Function Guard & CI Parity (`sys-health.sh`, `dev-tools/`, `.github/workflows/ci.yml`, `PATCH-063`)**:
+  - Removed duplicate `detect_aur_helper()` definition in `sys-health.sh` (keeping canonical definition at line 8107).
+  - Switched primary `shellcheck -S error` pass in `dev-tools/verify-bash.sh` to `-f gcc` for 1-line diagnostic errors and expanded `SC2154` checking across the entire `sys-health.sh` monolith plus `dev-tools/*.sh`.
+  - Added **Axis 8 (Duplicate Top-Level Function Definition Guard)** and multi-definition `generate_summary_json()` scanning to `dev-tools/lint-universalism.sh`, unified `.github/workflows/ci.yml` onto `./dev-tools/verify-bash.sh` with `libsystemd-dev`, and added Fixture 24.10 (`146/146` tests passing).
+- **Selective `--software` Telemetry Refresh & No-`jq` Atomic Fallback Protection (`run_software_updates`, `generate_summary_json`, MOD-04/MOD-08, `PATCH-061` / `PATCH-065`)**:
+  - Updated `run_software_updates()` to track standalone update mutations (`uv`, `goose`, `flatpak`, `rustup` in single or batch mode) and selectively refresh `.checks.standalone_software` in `summary.json` upon exit (as well as after non-interactive `sys-health --software` audits when `summary.json` exists on disk) without redundant double network probing or clobbering unrelated sections (`mirrors`, `security`, `firmware`, `firewall`, `gaming`, `flagged`, `counts`).
+  - Hardened the no-`jq` fallback path in `generate_summary_json()` to guard `warn_list_json` and `j_source_group_json` behind `command -v jq &>/dev/null` (eliminating `jq: command not found` on `stderr`), preserve existing non-empty `summary.json` during partial runs (`AUDIT_FULL_RAN != true`), and write via atomic temp-file rename (`${SUMMARY_FILE}.tmp.$$` + `mv -f`).
+  - Added Test 1.12 (no-`jq` fallback preservation, atomic write & zero `stderr` assertion) and Fixture 12.8 (5-state interactive & non-interactive `--software` refresh matrix).
+- **Parallel Full-Monolith `SC2154`/`SC2155` Gate, Deterministic CI Test Count & `README.md` Sync Guard (`dev-tools/verify-bash.sh`, `dev-tools/test-suite.sh`, `README.md`, `PATCH-064` / `PATCH-065`)**:
+  - Expanded the second `shellcheck` pass in `dev-tools/verify-bash.sh` from `-i SC2154` to `-i SC2154,SC2155` and parallelized both `shellcheck` passes (`-S error` and `-i SC2154,SC2155`) with deterministic error precedence and `trap` temp-file cleanup (cutting `shellcheck` wall-clock time from ~49.2s to ~29.4s).
+  - Closed the missing `else` branch in `Test 1.2` (`dev-tools/test-suite.sh`) for hosts/CI runners without `~/.local/state/system-health/summary.json`, added Step 5 (`readme_sync`) in `dev-tools/verify-bash.sh` enforcing `README.md` badge/Coverage parity with `pass_count`, removed dead links to `.gitignore`d local files in `README.md`, and added Fixtures 24.11 & 24.12 (`150/150` tests passing).
 
 ## [2.62] - 2026-11-14
 
