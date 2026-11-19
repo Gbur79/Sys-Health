@@ -9272,7 +9272,7 @@ run_gaming_check() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.62 | PATCH-027/PATCH-059 | Fixtures: test-suite.sh Part 1, Part 12]
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.63 | PATCH-027/PATCH-059/PATCH-060/PATCH-061/PATCH-065 | Fixtures: test-suite.sh Part 1, Part 12]
 generate_summary_json() {
     local running_k drivers=""
     running_k="$(uname -r 2>/dev/null || echo 'unknown')"
@@ -9314,7 +9314,7 @@ generate_summary_json() {
     fi
 
     local warn_list_json="[]"
-    if (( WARNINGS > 0 || ERRORS > 0 )); then
+    if (( WARNINGS > 0 || ERRORS > 0 )) && command -v jq &>/dev/null; then
         warn_list_json="$(grep -E '^HEALTH .*=(WARN|FAIL)' "$LOG_FILE" 2>/dev/null |
             awk '{print $2}' | cut -d= -f1 | sort -u | jq -R . | jq -s . 2>/dev/null || echo '[]')"
     fi
@@ -9378,12 +9378,12 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 gpu|gpu_errors)
-                    if [[ "$details" =~ phantom_driver ]]; then
+                    if [[ "$rest" =~ phantom_driver ]]; then
                         code="GPU_PHANTOM_DRIVER"
                         summary="GPU driver bound in PCI, but KMS/NVML is unresponsive"
                         fix="Review dmesg for DRM init failure (e.g. NvKmsKapiDevice), verify kernel/driver version match, and reinstall GPU drivers"
                         risk="HIGH"
-                    elif [[ "$details" =~ software_rendering ]]; then
+                    elif [[ "$rest" =~ software_rendering ]]; then
                         code="GPU_SOFTWARE_RENDERING_FALLBACK"
                         summary="Desktop session running on CPU software rasterizer (llvmpipe/swrast)"
                         fix="Check GPU driver stack, Vulkan ICD loader, and display server hardware acceleration"
@@ -9469,7 +9469,7 @@ generate_summary_json() {
                     fi
                     ;;
                 root_space)
-                    if [[ "$details" =~ status=read_only ]]; then
+                    if [[ "$rest" =~ status=read_only ]]; then
                         code="STORAGE_ROOT_READ_ONLY"
                         summary="Critical filesystem is mounted in emergency READ-ONLY mode"
                         fix="Inspect kernel logs (dmesg -T | grep -iE 'error|remount') and check filesystem integrity (fsck)"
@@ -9792,7 +9792,7 @@ generate_summary_json() {
     local j_disk_bytes_json="null"
     [[ "${JOURNAL_DISK_USAGE_BYTES:-}" =~ ^[0-9]+$ ]] && (( JOURNAL_DISK_USAGE_BYTES >= 0 )) && j_disk_bytes_json="$JOURNAL_DISK_USAGE_BYTES"
     local j_source_group_json="null"
-    if [[ -n "${JOURNAL_RATE_SOURCE_GROUP:-}" ]]; then
+    if [[ -n "${JOURNAL_RATE_SOURCE_GROUP:-}" ]] && command -v jq &>/dev/null; then
         j_source_group_json="$(jq -nc --arg sg "$JOURNAL_RATE_SOURCE_GROUP" '$sg')"
     fi
 
@@ -10021,7 +10021,16 @@ generate_summary_json() {
             rm -f "$tmp_summary" 2>/dev/null || true
         fi
     else
-        echo '{"status": "'$status_str'", "errors": '$ERRORS', "warnings": '$WARNINGS', "firmware": {"available": '$FIRMWARE_AVAILABLE', "updates_count": '$FIRMWARE_UPDATES_COUNT'}, "security": {"high_risk_count": '$ARCH_AUDIT_HIGH_RISK_COUNT'}, "firewall": {"active": '$FIREWALL_ACTIVE', "backend": "'$FIREWALL_BACKEND'"}}' > "$SUMMARY_FILE"
+        if [[ "${AUDIT_FULL_RAN:-false}" == "true" || ! -s "$SUMMARY_FILE" ]]; then
+            local tmp_summary="${SUMMARY_FILE}.tmp.$$"
+            if printf '{"status": "%s", "errors": %d, "warnings": %d, "firmware": {"available": %s, "updates_count": %d}, "security": {"high_risk_count": %d}, "firewall": {"active": %s, "backend": "%s"}}\n' \
+                "$status_str" "${ERRORS:-0}" "${WARNINGS:-0}" "${FIRMWARE_AVAILABLE:-false}" "${FIRMWARE_UPDATES_COUNT:-0}" \
+                "${ARCH_AUDIT_HIGH_RISK_COUNT:-0}" "${FIREWALL_ACTIVE:-false}" "${FIREWALL_BACKEND:-none}" > "$tmp_summary" 2>/dev/null && [[ -s "$tmp_summary" ]]; then
+                mv -f "$tmp_summary" "$SUMMARY_FILE" 2>/dev/null || true
+            else
+                rm -f "$tmp_summary" 2>/dev/null || true
+            fi
+        fi
     fi
 }
 
@@ -11438,19 +11447,6 @@ run_dynamic_sample() {
 # Hardened according to Luna SRE Audit & GitHub Open-Source Portability Mandate
 # ------------------------------------------------------------------------------
 
-# Dynamic AUR helper detection (paru -> yay -> pikaur)
-detect_aur_helper() {
-    if type -P paru &>/dev/null; then
-        echo "paru"
-    elif type -P yay &>/dev/null; then
-        echo "yay"
-    elif type -P pikaur &>/dev/null; then
-        echo "pikaur"
-    else
-        echo ""
-    fi
-}
-
 # Rigorous package ownership check hardened against aliases, shims, language runtimes and multi-distro managers
 # [SRE-AUDIT: CERTIFIED | Sol v2.38 | PATCH-027 | Fixtures: test-suite.sh Part 8]
 check_binary_ownership() {
@@ -11777,11 +11773,11 @@ _probe_standalone_software_updates() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.38 | PATCH-027 | Fixtures: test-suite.sh Part 1, Part 8]
+# [SRE-AUDIT: CERTIFIED | Auditor Argon v2.63 | PATCH-027/PATCH-061/PATCH-065 | Fixtures: test-suite.sh Part 1, Part 8, Part 12]
 run_software_updates() {
     local json_mode="${1:-0}"
     local is_interactive=false
-    [[ "$json_mode" -eq 0 && -t 0 ]] && is_interactive=true
+    [[ "$json_mode" -eq 0 && ( -t 0 || "${_TEST_INTERACTIVE:-0}" == "1" ) ]] && is_interactive=true
 
     # Security & Multi-User Isolation Guardrail:
     # Standalone tools (~/.local/bin, pipx, rustup, uv, goose) and AUR packages must NEVER be updated or scanned as root.
@@ -11796,8 +11792,10 @@ run_software_updates() {
         return 1
     fi
 
-    # State tracking persisted across interactive menu loops (Gemini Pro regression fix)
+    # State tracking persisted across interactive menu loops (Gemini Pro regression fix + PATCH-061 telemetry sync)
     local exit_summary=0
+    local standalone_mutated=false
+    local standalone_needs_reprobe=false
 
     while true; do
         # 1. AUR Packages (paru / yay / pikaur abstraction)
@@ -11828,6 +11826,7 @@ run_software_updates() {
 
         # 2. Standalone & 3rd-party software probe (PATCH-058 unified engine)
         _probe_standalone_software_updates
+        standalone_needs_reprobe=false
         local uv_installed="$STANDALONE_UV_INSTALLED"
         local uv_cur="$STANDALONE_UV_CUR"
         local uv_latest="$STANDALONE_UV_LATEST"
@@ -12067,13 +12066,13 @@ run_software_updates() {
                 continue
                 ;;
             *"Return to Main Menu"*|"")
-                return "$exit_summary"
+                break
                 ;;
         esac
 
         # Security & Multi-User Isolation Guardrail:
         # Standalone tools (~/.local/bin, pipx, rustup, uv, goose) and AUR packages must NEVER be updated as root.
-        if [[ "$EUID" -eq 0 ]]; then
+        if [[ "$effective_euid" -eq 0 ]]; then
             echo ""
             fail "SECURITY GUARDRAIL: Standalone & AUR updates cannot be executed as root!"
             info "Running user-space updates (AUR, ~/.local/bin, uv, goose, pipx, rustup) as root causes"
@@ -12165,6 +12164,8 @@ run_software_updates() {
                     continue
                 fi
                 info "Running: uv self update"
+                standalone_mutated=true
+                standalone_needs_reprobe=true
                 if uv self update; then
                     ok "UV Python Toolchain updated successfully."
                 else
@@ -12201,6 +12202,8 @@ run_software_updates() {
                     continue
                 fi
                 info "Running: goose update"
+                standalone_mutated=true
+                standalone_needs_reprobe=true
                 if goose update; then
                     ok "Goose AI Assistant updated successfully."
                 else
@@ -12211,6 +12214,8 @@ run_software_updates() {
                 ;;
             *"Update Flatpak Applications"*)
                 info "Running: flatpak update -y"
+                standalone_mutated=true
+                standalone_needs_reprobe=true
                 if flatpak update -y; then
                     ok "Flatpak applications updated successfully."
                 else
@@ -12221,6 +12226,8 @@ run_software_updates() {
                 ;;
             *"Update Rust Toolchain"*)
                 info "Running: rustup update"
+                standalone_mutated=true
+                standalone_needs_reprobe=true
                 if rustup update; then
                     ok "Rust toolchains updated successfully."
                 else
@@ -12284,6 +12291,8 @@ run_software_updates() {
                     if [[ "$(check_binary_ownership uv)" == "standalone" ]]; then
                         if can_self_update_binary uv; then
                             info "--- Updating UV Python Toolchain ---"
+                            standalone_mutated=true
+                            standalone_needs_reprobe=true
                             if ! uv self update; then
                                 fail "UV Python Toolchain update failed."
                                 exit_summary=1
@@ -12297,6 +12306,8 @@ run_software_updates() {
                     if [[ "$(check_binary_ownership goose)" == "standalone" ]]; then
                         if can_self_update_binary goose; then
                             info "--- Updating Goose AI Assistant ---"
+                            standalone_mutated=true
+                            standalone_needs_reprobe=true
                             if ! goose update; then
                                 fail "Goose AI Assistant update failed."
                                 exit_summary=1
@@ -12308,6 +12319,8 @@ run_software_updates() {
                 fi
                 if $flatpak_up_needed; then
                     info "--- Updating Flatpak Applications ---"
+                    standalone_mutated=true
+                    standalone_needs_reprobe=true
                     if ! flatpak update -y; then
                         fail "Flatpak update failed."
                         exit_summary=1
@@ -12315,6 +12328,8 @@ run_software_updates() {
                 fi
                 if $rustup_up_needed; then
                     info "--- Updating Rust Toolchain ---"
+                    standalone_mutated=true
+                    standalone_needs_reprobe=true
                     if ! rustup update; then
                         fail "Rustup update failed."
                         exit_summary=1
@@ -12334,10 +12349,29 @@ run_software_updates() {
                 continue
                 ;;
             *"Return to Main Menu"*|*)
-                return "$exit_summary"
+                break
                 ;;
         esac
     done
+
+    if (( json_mode == 0 )) && { $standalone_mutated || { ! $is_interactive && [[ -s "$SUMMARY_FILE" ]]; }; }; then
+        if $standalone_needs_reprobe; then
+            _reset_partial_run_telemetry_state
+            _probe_standalone_software_updates
+        else
+            local _sa_status="$STANDALONE_STATUS"
+            local _sa_count="$STANDALONE_PENDING_COUNT"
+            local _sa_tools="$STANDALONE_PENDING_TOOLS"
+            _reset_partial_run_telemetry_state
+            STANDALONE_CHECK_RAN=true
+            STANDALONE_STATUS="$_sa_status"
+            STANDALONE_PENDING_COUNT="$_sa_count"
+            STANDALONE_PENDING_TOOLS="$_sa_tools"
+        fi
+        generate_summary_json
+    fi
+
+    return "$exit_summary"
 }
 
 
