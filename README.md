@@ -12,9 +12,9 @@ An interactive TUI diagnostic suite, deterministic system health auditor, guarde
 
 ---
 
-<img width="720" height="412" alt="image" src="https://github.com/user-attachments/assets/eab489da-4362-4575-ba75-c3f07d832c9d" />
+<img width="716" height="427" alt="image" src="https://github.com/user-attachments/assets/0c02f7aa-67a2-4c55-93aa-683f84c0012f" />
 
-<img width="715" height="1203" alt="image" src="https://github.com/user-attachments/assets/460f1527-6a38-4808-a0de-1b53a3a30fd7" />
+<img width="717" height="1149" alt="image" src="https://github.com/user-attachments/assets/7eafa438-595e-4be8-b823-582bbb72ba3c" />
 
 <img width="1423" height="975" alt="image" src="https://github.com/user-attachments/assets/3bfc37b5-f376-4a52-94e4-c6e90171cc02" />
 
