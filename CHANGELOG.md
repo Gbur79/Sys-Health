@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.64] - 2026-11-26
+
+### Added & Hardened (SRE Architectural Audit - Cross-Boot GPU/PCIe Forensics, Xid/AER Classification & Multi-Kernel NVIDIA Coverage / PATCH-066 & PATCH-067)
+- **Cross-Boot GPU/PCIe Crash Forensics (`check_previous_boot`, `show_ai_context`, MOD-01/MOD-08, `PATCH-066`)**:
+  - Extended `check_previous_boot()` with a bounded `-b -1 -k` kernel log scan (`tail -n 200` / `tail -n 1`) and shared `_classify_gpu_pcie_fault()` classifier to capture `NVRM: Xid`, `GPU has fallen off the bus`, `pcieport` Uncorrected/Fatal AER, `amdgpu` ring/job timeouts, and `i915`/`xe` GPU hangs from the previous crashed boot.
+  - Emits dedicated `actionable_remediations` codes (`GPU_BUS_DROP_HW_SUSPECT`, `PCIE_AER_ERROR`, `PREV_BOOT_GPU_FAULT`) instead of collapsing GPU crash reboots into generic `SYS_UNCLEAN_SHUTDOWN`, and triggers `evidence.gpu_dkms` in `show_ai_context()` when `previous_boot` flags `gpu_crash=YES`.
+- **Xid Hardware-vs-Driver Decoder & Sysfs PCIe Link Audit (`check_gpu`, `check_gpu_errors`, `generate_summary_json`, MOD-05/MOD-08, `PATCH-066`)**:
+  - Added priority classification in `check_gpu_errors()` distinguishing hardware/bus-drop faults (`Xid 48/61/62/79`, `GPU has fallen off the bus`, `pcieport` Uncorrected/Fatal AER) from driver/shader faults (`Xid 13/31/43/109`) with slot-safe regex matching so PCI bus numbers such as `(PCI:0000:61:00)` never false-match `Xid 61`.
+  - Added unprivileged `sysfs` PCIe link width and `aer_dev_fatal`/`aer_dev_nonfatal` inspection in `check_gpu()` bounded by the parent bridge's `max_link_width` and gated on `power/runtime_status != "suspended"` (D3cold/ASPM-safe), emitting `PCIE_LINK_DEGRADED` on true link width degradation or fatal/non-fatal AER errors.
+- **Multi-Kernel NVIDIA Driver Coverage & ABI Mismatch Detection (`_query_alpm_nv_pkgs`, `_audit_nvidia_kernel_coverage`, `_check_nvidia_abi_mismatch`, `check_gpu`, `run_guarded_upgrade` Gate 5, MOD-03/MOD-05/MOD-08, `PATCH-067`)**:
+  - Audits physical `nvidia.ko*` presence across every installed kernel (`/usr/lib/modules/*/pkgbase`) and detects conflicting NVIDIA kernel-module packages (`nvidia-open` vs `nvidia-open-dkms`, legacy vs modern, open vs closed) while allowing valid dual-prebuilt pairs (`nvidia` + `nvidia-lts`, `nvidia-open` + `nvidia-open-lts`) and ignoring non-module utilities (`nvidia-settings`, `nvidia*-utils`), emitting `NVIDIA_MULTI_KERNEL_COVERAGE_GAP` and blocking conflicting variants in Gate 5.
+  - Added shared `_check_nvidia_abi_mismatch()` comparing `/proc/driver/nvidia/version` (supporting both Closed and Open Kernel Module version headers) against installed `nvidia*-utils` packages, surfacing `NVIDIA_ABI_MISMATCH_REBOOT_REQUIRED` ahead of `GPU_PHANTOM_DRIVER` when NVML fails prior to reboot and warning in Gate 5.
+- **Hermetic Regression Tests (`dev-tools/test-suite.sh`)**:
+  - Added Fixtures `5.11–5.14`, `9.9`, and `22.5–22.7` (`161/161` tests passing) covering cross-boot `Xid 79`/AER/`amdgpu` forensics, slot-safe Xid classification, PCIe link degradation with parent-bridge cap and D3cold tolerance, multi-kernel NVIDIA coverage/conflicts, and Closed/Open NVIDIA ABI mismatch detection.
+
 ## [2.63] - 2026-11-17
 
-### Fixed & Hardened (EOS-SRE Architectural Audit - Partial-Run Telemetry Protection & Selective Mirror Refresh / PATCH-059)
+### Fixed & Hardened (SRE Architectural Audit - Partial-Run Telemetry Protection & Selective Mirror Refresh / PATCH-059)
 - **Partial-Run `summary.json` Preservation & Atomic Write (`generate_summary_json`, `run_guarded_upgrade`, MOD-08, `PATCH-059`)**:
   - Added per-probe execution flags (`*_CHECK_RAN`) and `_reset_partial_run_telemetry_state()` so partial workflows such as `run_guarded_upgrade()` update `timestamp`, `run_id`, `environment`, and `gpu` while preserving previously audited `checks.desktop_indexers`, `checks.journal_rate_limit`, `checks.mirrors`, `checks.standalone_software`, `security`, `firmware`, `firewall`, `gaming`, `status`/`counts`/`flagged`/`actionable_remediations`, and `dynamic_sample` instead of overwriting them with `"unknown"` / `false`.
   - Replaced direct `> "$SUMMARY_FILE"` redirection with atomic temp-file writes (`${SUMMARY_FILE}.tmp.$$` + `mv -f`) to eliminate truncated JSON reads by external watchers.
