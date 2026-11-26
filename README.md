@@ -1,14 +1,14 @@
 # Arch System Health & Diagnostics (`sys-health`)
 
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-Compatible-blue?logo=archlinux)](https://archlinux.org/)
-[![Version: 2.63](https://img.shields.io/badge/Version-2.63-orange.svg)](CHANGELOG.md)
-[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-150%2F150%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
+[![Version: 2.64](https://img.shields.io/badge/Version-2.64-orange.svg)](CHANGELOG.md)
+[![Hermetic SRE Tests](https://img.shields.io/badge/SRE%20Tests-161%2F161%20Passing-brightgreen.svg)](dev-tools/test-suite.sh)
 [![Changelog](https://img.shields.io/badge/Changelog-Keep%20a%20Changelog-brightgreen.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 An interactive TUI diagnostic suite, deterministic system health auditor, guarded upgrade engine, and AI-assisted telemetry bridge for **Arch Linux and Arch-based distributions** (EndeavourOS, CachyOS, Manjaro, etc.).
 
-> **Disclaimer:** This is an independent, unofficial open-source community project. It is **not** developed, maintained, or endorsed by the EndeavourOS team or Arch Linux. It is designed to assist users in understanding, inspecting, and maintaining their systems safely.
+> **Disclaimer:** This is an independent, unofficial open-source community project. It is **not** developed, maintained, or endorsed by the EndeavourOS team or Arch Linux. It is designed to assist users in understanding, inspecting, and maintaining their systems safely..
 
 ---
 
@@ -74,14 +74,14 @@ sys-health AI Session:
 * **ESP & Mount Topology Integrity:** Inspects `/etc/fstab` and `findmnt` to ensure the EFI System Partition (`/efi`, `/boot/efi`, or `/boot`) is actively mounted and writable, with sufficient free headroom (> 100 MB).
 * **Multi-Kernel & DKMS Synchronization:** Audits every installed kernel series (`linux`, `linux-lts`, `linux-zen`), ensuring matching kernel headers, module directories, and compiled DKMS modules exist for each.
 * **Accurate Pending Reboot Detection:** Inspects physical kernel module directories (`/usr/lib/modules/$(uname -r)`), eliminating false positives from upstream package timestamp preservation.
-* **Crash, Unclean Shutdown & ACPI S5 Spurious Wakeup Forensics (`check_previous_boot`):** Inspects previous boot journals and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, kernel panics, or hard system freezes. Employs a zero-false-positive *Gated Forensic Trigger* model to detect spurious power-on loops (near-instant wakeups $\le 30$s occurring after clean `System Power Off`), capturing contextual drill-down forensics on armed `/proc/acpi/wakeup` devices (USB XHC, PCIe PME), unprivileged sysfs Wake-on-LAN states, and Dual-Boot Windows Fast Startup collisions.
+* **Crash, Unclean Shutdown, Cross-Boot GPU/PCIe & ACPI S5 Wakeup Forensics (`check_previous_boot`):** Inspects previous boot journals (`-b -1`) and `systemd-fsck` recovery flags to detect dirty unmounts, power loss, kernel panics, hard GPU/PCIe crashes (`NVRM: Xid 79/48/61/62`, `GPU has fallen off the bus`, `pcieport` Uncorrected/Fatal AER, `amdgpu`/`i915`/`xe` hangs), and spurious power-on loops (near-instant wakeups $\le 30$s occurring after clean `System Power Off`), capturing contextual forensics on `/proc/acpi/wakeup`, Wake-on-LAN, and Dual-Boot Windows Fast Startup collisions.
 * **Runtime CPU Early Microcode Verification (`check_cpu_microcode`):** Interrogates `/sys/devices/system/cpu/cpu0/microcode/version` and early kernel logs (`journalctl -b 0 -k`), detecting runtime early microcode injection (e.g. `Intel early update: 0x1e ➔ 0x28`) and unpatched BIOS states. Gracefully accommodates virtual machines (`KVM`, `QEMU`, `Proxmox`, `VMware`) and containers (`PASS ✔ [VM guest - host managed]`).
 * **Hardened Hardware, Thermals & GPU Diagnostics (`check_gpu`, `check_gpu_errors`, `check_dkms`, `check_smart`, `check_power`, `check_cpu_governor`, `check_fstrim`):**
   * Proactive CPU scaling governor and power daemon verification across all online cores (`check_cpu_governor`), detecting legacy configuration drift (`/etc/default/cpupower` vs `cpupower-service.conf`), inactive enabled services, runtime desync, and conflicting power managers (`power-profiles-daemon`, `tlp`, `auto-cpufreq`).
   * Universal 4-digit PCI domain delimitation (`0000:xx:xx.x`), preventing audio/network controller leakage into GPU driver states.
-  * Real-time GPU driver telemetry (NVIDIA proprietary/legacy, AMD RADV, Intel Arc Xe with GuC initialization noise immunity).
+  * Real-time GPU driver telemetry (NVIDIA proprietary/open/legacy, AMD RADV, Intel Arc Xe with GuC initialization noise immunity), hardware-vs-driver `Xid` classification (`GPU_BUS_DROP_HW_SUSPECT` vs `GPU_DRIVER_OR_LOG_STALL`), and unprivileged `sysfs` PCIe link width & AER audit (`PCIE_LINK_DEGRADED`, parent-bridge capped and D3cold-safe).
   * Freshness-guarded Xorg fliplock inspection validated against current system boot time (`btime`).
-  * Multi-kernel DKMS headers audit across all installed kernel directories (`/usr/lib/modules/*/pkgbase`).
+  * Multi-kernel DKMS headers, `nvidia.ko*` module coverage, package-conflict, and kernel-vs-userspace ABI mismatch (`NVIDIA_ABI_MISMATCH_REBOOT_REQUIRED`) auditing across all installed kernel directories (`/usr/lib/modules/*/pkgbase`).
   * Low-power HDD spin-down standby preservation (`smartctl -n standby`) and graceful VirtIO block device degradation (`/dev/vda`).
   * Hybrid SSD + HDD storage awareness for TRIM timer validation, ignoring spinning mechanical disks lacking discard.
   * Multi-battery laptop power telemetry (e.g. ThinkPad Power Bridge BAT0 + BAT1).
@@ -112,7 +112,7 @@ Eliminates rolling-release upgrade friction through a disciplined 3-phase workfl
   4. *Package Manager Safety Gate (Gate 2):* Verifies no background daemons hold `db.lck` and checks database consistency (`pacman -Dk`).
   5. *Network & Mirror Resilience Gate (Gate 3):* Verifies control-plane TLS/DNS connectivity via a multi-endpoint high-availability fallback pool (`archlinux.org`, `1.1.1.1`, `cloudflare.com`), probes primary mirror reachability, and triggers smart self-healing ranking (`reflector` / `rate-mirrors` / `eos-rankmirrors`) if the primary mirror is dead (preventing fatal socket timeouts), if the mirrorlist is empty/corrupt, if cross-continental latency exceeds 800ms, or if lists are older than 30 days. Employs 100% dynamic universalism across distribution ecosystems (Arch x86_64, EndeavourOS, CachyOS multi-file transactions, Manjaro, Artix, ALARM ARM-gate) with atomic staging and unique per-run backup rollback protection (`.sys-health-bak.$$.$RANDOM`).
   6. *Smart Arch News Correlator Gate (Gate 4):* Automatically correlates upstream manual intervention alerts with locally installed packages (`pacman -Qq`). Advisories for uninstalled software are transparently acknowledged without halting the workflow, reserving interactive prompts exclusively for actionable system threats.
-  7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants across legacy branches (Maxwell, Kepler, `nvidia-580xx`, `nvidia-470xx`, `nvidia-390xx` vs modern open/proprietary drivers), kernel header completeness across all installed kernels, and pending reboots.
+  7. *Hardware & DKMS Gate (Gate 5):* Checks GPU driver invariants across legacy branches (Maxwell, Kepler, `nvidia-580xx`, `nvidia-470xx`, `nvidia-390xx` vs modern open/proprietary drivers), multi-kernel `nvidia.ko*` coverage and conflicting driver variants, NVIDIA kernel/userspace ABI mismatches, kernel header completeness across all installed kernels, and pending reboots.
 * **Phase 2: Distribution Upgrade:**
   Executes the canonical distribution package manager (`eos-update`, `yay`, `paru`, or `pacman`).
 * **Phase 3: Post-Flight Integrity Verification:**
@@ -278,11 +278,10 @@ SKIP_INTEGRITY=0
 
 ---
 
-## Change Tracking & Roadmap
+## Change Tracking & Verification
 
 * Detailed release history and version migration notes are maintained in [CHANGELOG.md](CHANGELOG.md).
-* Authoritative SRE subsystem certifications, vulnerability hit-lists, and testing matrices are tracked in [AUDIT_MATRIX.md](AUDIT_MATRIX.md).
-* Upcoming proposals, community backlog, and architectural discussions are tracked in [DEVELOPMENT_PROPOSALS.md](DEVELOPMENT_PROPOSALS.md) (also available as [pending-patches.md](pending-patches.md)).
+* Automated universalism, systemd `SD_MESSAGE_*` contracts, remediation coverage, duplicate function guards, and OPSEC boundaries are enforced by [dev-tools/lint-universalism.sh](dev-tools/lint-universalism.sh) and [dev-tools/verify-bash.sh](dev-tools/verify-bash.sh).
 
 ### Hermetic SRE Regression Suite (`dev-tools/test-suite.sh`)
 Every release, bugfix, and patch blueprint must pass the hermetic test suite before merge:
@@ -290,7 +289,7 @@ Every release, bugfix, and patch blueprint must pass the hermetic test suite bef
 ./dev-tools/test-suite.sh
 ```
 * **100% Mocked Roots:** Executes in isolated sandboxes (`SYS_HEALTH_ROOT`) without host mutations.
-* **Coverage:** 123 deterministic assertions across 22 test suites covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, ALPM Orphan Cascade Protection, checkupdates error resilience & core package parity, Universal Multi-GPU Gaming Readiness, Host Firewall detection, Arch Audit CVEs, Hardware Firmware (fwupd) updates, and Previous Session Shutdown & Spurious ACPI S5 Wakeup Forensics.
+* **Coverage:** 161 deterministic assertions across 25 test suites covering Arch canonical paths, Manjaro versioned kernels, multi-initrd microcodes, systemd-boot (BLS Type #1), UKI (Type #2), Dracut, Booster, DAC permission boundaries, Safe Deep Clean, ALPM Orphan Cascade Protection, checkupdates error resilience & core package parity, Universal Multi-GPU Gaming Readiness, Host Firewall detection, Arch Audit CVEs, Hardware Firmware (fwupd) updates, Previous Session Shutdown & Cross-Boot GPU/PCIe Forensics, Xid/AER Classification & PCIe Link Audit, Multi-Kernel NVIDIA Coverage & ABI Mismatch Detection, Standalone Software Telemetry & Selective Post-Update Sync, Partial-Run `summary.json` Preservation, Remediation Code Coverage & Scope Anti-Poisoning, and Axis 7/8 + Parallel Full-Monolith `SC2154`/`SC2155` & README Sync Verification Tooling.
 
 ---
 
