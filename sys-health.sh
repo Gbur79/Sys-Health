@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch System Health & Diagnostics v2.63
+# Arch System Health & Diagnostics v2.64
 # Read-only health audit + AI Agent report generator + optional maintenance
 # Arch Linux & derivatives (EndeavourOS, Manjaro, CachyOS, etc.)
 # Unofficial community project - Not affiliated with EndeavourOS or Arch Linux
@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-VERSION="2.63"
+VERSION="2.64"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/system-health"
 LOG_FILE="$STATE_DIR/system-health.log"
 SUMMARY_FILE="$STATE_DIR/summary.json"
@@ -56,9 +56,27 @@ ARCH_AUDIT_CHECK_RAN=false
 FIRMWARE_CHECK_RAN=false
 FIREWALL_CHECK_RAN=false
 GAMING_CHECK_RAN=false
+ROOT_SKIPPED_CHECKS=()
+
+_sudo_nonint_available() {
+    (( EUID == 0 )) && return 1
+    command -v sudo >/dev/null 2>&1 || return 1
+    sudo -n true </dev/null >/dev/null 2>&1
+}
+
+_record_root_skipped_check() {
+    local chk="$1"
+    local item
+    [[ -n "$chk" ]] || return 0
+    for item in "${ROOT_SKIPPED_CHECKS[@]}"; do
+        [[ "$item" == "$chk" ]] && return 0
+    done
+    ROOT_SKIPPED_CHECKS+=("$chk")
+}
 
 _reset_partial_run_telemetry_state() {
     AUDIT_FULL_RAN=false
+    ROOT_SKIPPED_CHECKS=()
     DESKTOP_INDEXER_CHECK_RAN=false
     JOURNAL_CHECK_RAN=false
     MIRROR_CHECK_RAN=false
@@ -80,6 +98,7 @@ _reset_partial_run_telemetry_state() {
     ERRORS=0
     WARNINGS=0
     INFO_COUNT=0
+    ROOT_SKIPPED_CHECKS=()
 }
 
 mkdir -p "$STATE_DIR" "$RAW_DIR" 2>/dev/null || true
@@ -139,9 +158,9 @@ Configuration:
     SKIP_INTEGRITY=0                (set to 1 to skip time-consuming pacman -Qk)
 
 Exit codes (in --audit/--batch mode):
-  0: ALL_CLEAR (no errors or warnings)
+  0: ALL_CLEAR (no errors, warnings, or skipped root-required checks)
   1: ACTION_REQUIRED (one or more errors detected)
-  2: REVIEW_WARNINGS (warnings detected, no errors)
+  2: REVIEW_WARNINGS / PARTIAL_AUDIT (warnings or skipped root-required checks, no errors)
 EOF
 }
 
@@ -352,7 +371,7 @@ EOF
         if ! $has_systemd && grep -qE '^HEALTH systemd(_user)?_failed=(WARN|FAIL)' "$log_file" 2>/dev/null; then
             has_systemd=true
         fi
-        if ! $has_gpu && grep -qE '^HEALTH (gpu|gpu_errors|dkms)=(WARN|FAIL)' "$log_file" 2>/dev/null; then
+        if ! $has_gpu && grep -qE '^HEALTH (gpu|gpu_errors|dkms)=(WARN|FAIL)|^HEALTH previous_boot=(WARN|FAIL).*gpu_crash=YES' "$log_file" 2>/dev/null; then
             has_gpu=true
         fi
         if ! $has_boot && grep -qE '^HEALTH (kernel_modules|initramfs|efi|bootloader_sync)=(WARN|FAIL)' "$log_file" 2>/dev/null; then
@@ -462,7 +481,7 @@ fi
 # Sudo credentials management (interactive prompts vs batch best-effort)
 HAVE_SUDO=0
 if [[ "$ACTION" != "sample" && "$ACTION" != "software" && "$ACTION" != "report" && "$ACTION" != "test" && "$ACTION" != "gaming" ]]; then
-    if sudo -n true 2>/dev/null; then
+    if sudo -n true </dev/null >/dev/null 2>&1; then
         HAVE_SUDO=1
     elif [[ "$ACTION" == "interactive" ]]; then
         if sudo -v; then
@@ -471,14 +490,14 @@ if [[ "$ACTION" != "sample" && "$ACTION" != "software" && "$ACTION" != "report" 
             echo "Authentication failed or aborted." >&2
             exit 1
         fi
-    elif [[ -t 0 ]] && [[ -t 1 ]] && sudo -v 2>/dev/null; then
+    elif [[ "$ACTION" != "audit" ]] && [[ -t 0 ]] && [[ -t 1 ]] && sudo -v 2>/dev/null; then
         HAVE_SUDO=1
     fi
 
     if [[ "$HAVE_SUDO" -eq 1 ]]; then
         (
             while true; do
-                sudo -n true 2>/dev/null || exit
+                sudo -n true </dev/null >/dev/null 2>&1 || exit
                 sleep 45
                 kill -0 "$$" 2>/dev/null || exit
             done
@@ -955,7 +974,7 @@ detect_active_bootloader() {
     fi
 
     if command -v bootctl &>/dev/null; then
-        if sudo -n bootctl is-installed &>/dev/null || bootctl is-installed &>/dev/null; then
+        if { _sudo_nonint_available && sudo -n bootctl is-installed </dev/null &>/dev/null; } || bootctl is-installed &>/dev/null; then
             echo "systemd-boot"
             return 0
         fi
@@ -3863,10 +3882,8 @@ _boot_dir_searchable() {
     [[ -z "$dir" ]] && return 1
     [[ -d "$dir" && -x "$dir" ]] && return 0
     (( EUID == 0 )) && return 1
-    if _path_ancestor_restricted "$dir"; then
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            sudo -n test -d "$dir" -a -x "$dir" 2>/dev/null && return 0
-        fi
+    if _path_ancestor_restricted "$dir" && _sudo_nonint_available; then
+        sudo -n test -d "$dir" -a -x "$dir" </dev/null 2>/dev/null && return 0
     fi
     return 1
 }
@@ -3876,10 +3893,8 @@ _boot_file_test() {
     [[ -z "$file" ]] && return 1
     [[ -f "$file" ]] && return 0
     (( EUID == 0 )) && return 1
-    if _path_ancestor_restricted "$file"; then
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            sudo -n test -f "$file" 2>/dev/null && return 0
-        fi
+    if _path_ancestor_restricted "$file" && _sudo_nonint_available; then
+        sudo -n test -f "$file" </dev/null 2>/dev/null && return 0
     fi
     return 1
 }
@@ -3888,8 +3903,8 @@ _boot_file_size() {
     local file="$1"
     local sz
     sz="$(stat -c %s "$file" 2>/dev/null || true)"
-    if [[ -z "$sz" || "$sz" -eq 0 ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sz="$(sudo -n stat -c %s "$file" 2>/dev/null || echo 0)"
+    if [[ -z "$sz" || "$sz" -eq 0 ]] && _sudo_nonint_available; then
+        sz="$(sudo -n stat -c %s "$file" </dev/null 2>/dev/null || echo 0)"
     fi
     echo "${sz:-0}"
 }
@@ -3898,8 +3913,8 @@ _boot_file_mtime() {
     local file="$1"
     local mt
     mt="$(stat -c %Y "$file" 2>/dev/null || true)"
-    if [[ -z "$mt" || "$mt" -eq 0 ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        mt="$(sudo -n stat -c %Y "$file" 2>/dev/null || echo 0)"
+    if [[ -z "$mt" || "$mt" -eq 0 ]] && _sudo_nonint_available; then
+        mt="$(sudo -n stat -c %Y "$file" </dev/null 2>/dev/null || echo 0)"
     fi
     echo "${mt:-0}"
 }
@@ -3935,10 +3950,10 @@ _resolve_kernel_and_initramfs() {
         for u_cand in "${bdir}/EFI/Linux"/*.efi "${bdir}/EFI/BOOT"/*.efi "${bdir}"/*.efi; do
             [[ -f "$u_cand" ]] && u_cands+=("$u_cand")
         done
-        if (( ${#u_cands[@]} == 0 )) && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        if (( ${#u_cands[@]} == 0 )) && _sudo_nonint_available; then
             while IFS= read -r f; do
                 [[ -n "$f" ]] && u_cands+=("$f")
-            done < <(sudo -n find "${bdir}/EFI/Linux" "${bdir}/EFI/BOOT" "$bdir" -maxdepth 1 -name "*.efi" 2>/dev/null || true)
+            done < <(sudo -n find "${bdir}/EFI/Linux" "${bdir}/EFI/BOOT" "$bdir" -maxdepth 1 -name "*.efi" </dev/null 2>/dev/null || true)
         fi
         for u_cand in "${u_cands[@]}"; do
             local bname="${u_cand%.efi}"
@@ -3962,10 +3977,10 @@ _resolve_kernel_and_initramfs() {
             for entry in "${bdir}"/loader/entries/*.conf; do
                 [[ -f "$entry" ]] && bls_entries+=("$entry")
             done
-            if (( ${#bls_entries[@]} == 0 )) && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            if (( ${#bls_entries[@]} == 0 )) && _sudo_nonint_available; then
                 while IFS= read -r f; do
                     [[ -n "$f" ]] && bls_entries+=("$f")
-                done < <(sudo -n find "${bdir}/loader/entries" -maxdepth 1 -name "*.conf" 2>/dev/null || true)
+                done < <(sudo -n find "${bdir}/loader/entries" -maxdepth 1 -name "*.conf" </dev/null 2>/dev/null || true)
             fi
             # Pass 1: Exact kver or exact pkgbase match
             for entry in "${bls_entries[@]}"; do
@@ -4478,6 +4493,7 @@ check_kernel() {
         ((ERRORS++))
         log "HEALTH kernel_modules=FAIL missing='${missing_components[*]}' booted=$running_k"
     elif $has_inaccessible_boot; then
+        _record_root_skipped_check "kernel_modules"
         add_row "Kernel & modules" "INFO ℹ (${installed_kernels[*]} | boot partition permissions 0700; run with sudo to audit boot images | booted: $running_disp)" "BOOT"
         ((INFO_COUNT++)) || :
         log "HEALTH kernel_modules=INFO installed='${installed_kernels[*]}' booted=$running_k reason=boot_permissions_0700"
@@ -4537,6 +4553,7 @@ check_initramfs() {
 
     if [[ -z "$k_initrd" ]] || ! _boot_file_test "$k_initrd"; then
         if (( k_inaccessible )); then
+            _record_root_skipped_check "initramfs"
             add_row "Initramfs ($pkgbase)" "INFO ℹ (boot partition permissions 0700; run with sudo to audit initramfs)" "BOOT"
             ((INFO_COUNT++)) || :
             log "HEALTH initramfs=INFO unverified pkgbase=$pkgbase reason=boot_permissions_0700"
@@ -4560,30 +4577,32 @@ check_initramfs() {
     # Unprivileged-safe content validation: verify structure when readable or with passwordless sudo
     local parse_ok=true
     local parse_error=""
-    if [[ -r "$k_initrd" ]] || sudo -n test -r "$k_initrd" &>/dev/null; then
+    local have_sudo_nonint=false
+    _sudo_nonint_available && have_sudo_nonint=true
+    if [[ -r "$k_initrd" ]] || { $have_sudo_nonint && sudo -n test -r "$k_initrd" </dev/null &>/dev/null; }; then
         if [[ "$k_mode" == "uki" ]]; then
             local magic
-            magic="$(head -c 2 "$k_initrd" 2>/dev/null || sudo -n head -c 2 "$k_initrd" 2>/dev/null || true)"
+            magic="$(head -c 2 "$k_initrd" 2>/dev/null || { $have_sudo_nonint && sudo -n head -c 2 "$k_initrd" </dev/null 2>/dev/null; } || true)"
             if [[ "$magic" != "MZ" ]]; then
                 parse_ok=false
                 parse_error="invalid UKI PE header"
             fi
         elif [[ "$k_mode" == "booster" ]] && command -v booster &>/dev/null; then
-            if ! (booster ls "$k_initrd" &>/dev/null || sudo -n booster ls "$k_initrd" &>/dev/null); then
+            if ! { booster ls "$k_initrd" &>/dev/null || { $have_sudo_nonint && sudo -n booster ls "$k_initrd" </dev/null &>/dev/null; }; }; then
                 parse_ok=false
                 parse_error="booster parser failed"
             fi
         elif command -v lsinitrd &>/dev/null && detect_initramfs_generator | grep -q "dracut"; then
             local magic
-            magic="$(head -c 6 "$k_initrd" 2>/dev/null || sudo -n head -c 6 "$k_initrd" 2>/dev/null || true)"
+            magic="$(head -c 6 "$k_initrd" 2>/dev/null || { $have_sudo_nonint && sudo -n head -c 6 "$k_initrd" </dev/null 2>/dev/null; } || true)"
             if [[ "$magic" != "070701" && "$magic" != "070702" ]]; then
-                if ! (file "$k_initrd" 2>/dev/null || sudo -n file "$k_initrd" 2>/dev/null) | grep -qiE 'cpio|gzip|zstandard|zstd|archive|data'; then
+                if ! { file "$k_initrd" 2>/dev/null || { $have_sudo_nonint && sudo -n file "$k_initrd" </dev/null 2>/dev/null; }; } | grep -qiE 'cpio|gzip|zstandard|zstd|archive|data'; then
                     parse_ok=false
                     parse_error="dracut parser failed"
                 fi
             fi
         elif command -v lsinitcpio &>/dev/null && detect_initramfs_generator | grep -q "mkinitcpio"; then
-            if ! (lsinitcpio -a "$k_initrd" &>/dev/null || sudo -n lsinitcpio -a "$k_initrd" &>/dev/null); then
+            if ! { lsinitcpio -a "$k_initrd" &>/dev/null || { $have_sudo_nonint && sudo -n lsinitcpio -a "$k_initrd" </dev/null &>/dev/null; }; }; then
                 parse_ok=false
                 parse_error="lsinitcpio parser failed"
             fi
@@ -4739,7 +4758,20 @@ _previous_boot_audit_wakeup() {
     return 0
 }
 
-# [SRE-AUDIT: CERTIFIED | Argon v2.60 | PATCH-053 | Fixtures: test-suite.sh Part 22]
+_classify_gpu_pcie_fault() {
+    local line="$1"
+    local re_bus='GPU has fallen off the bus|NVRM: Xid:?[[:space:]]*(\([^)]+\):?)?[[:space:]]*(48|61|62|79)([^0-9]|$)'
+    local re_aer='pcieport.*AER.*(Uncorrected|Fatal)'
+    if [[ "$line" =~ $re_bus ]]; then
+        printf 'bus_drop_hw\n'
+    elif [[ "$line" =~ $re_aer ]]; then
+        printf 'pcie_aer\n'
+    else
+        printf 'driver_fault\n'
+    fi
+}
+
+# [SRE-AUDIT: CERTIFIED | Neon v2.64 | PATCH-053/PATCH-066 | Fixtures: test-suite.sh Part 22]
 check_previous_boot() {
     local has_prev_boot=false
     if journalctl --list-boots --no-pager 2>/dev/null | grep -qE -- '^[[:space:]]*-1[[:space:]]'; then
@@ -4758,7 +4790,30 @@ check_previous_boot() {
     kernel_panic="$(LC_ALL=C journalctl -b -1 -k -p 0..2 --no-pager 2>/dev/null | grep -im 1 -E "Kernel panic|BUG: unable to handle|Oops:|watchdog: BUG: soft lockup" || true)"
     last_shutdown="$(LC_ALL=C journalctl -b -1 -n 150 --no-pager 2>/dev/null | grep -im 1 -E "systemd-shutdown|Reached target (System Reboot|System Power Off|System Shutdown)|systemd\[1\]: Shutting down|Journal stopped" || true)"
 
-    if [[ -n "$journal_unclean" || -n "$fsck_recovery" || -n "$kernel_panic" ]]; then
+    local prev_klog=""
+    local prev_gpu_pcie_crash=""
+    prev_klog="$(LC_ALL=C journalctl -b -1 -k --no-pager 2>/dev/null | grep -iE 'NVRM: Xid|GPU has fallen off the bus|pcieport.*AER|amdgpu.*(ring.*timeout|GPU reset|job_timedout)|i915.*GPU HANG|\bxe\b.*GPU HANG' | tail -n 200 || true)"
+    prev_gpu_pcie_crash="$(printf '%s\n' "$prev_klog" | grep -iE 'NVRM: Xid:?[[:space:]]*(\([^)]+\):?)?[[:space:]]*(48|61|62|79)([^0-9]|$)|GPU has fallen off the bus|pcieport.*AER.*(Uncorrected|Fatal)' | tail -n 1 || true)"
+    if [[ -z "$prev_gpu_pcie_crash" ]]; then
+        prev_gpu_pcie_crash="$(printf '%s\n' "$prev_klog" | grep -iE 'NVRM: Xid|amdgpu.*(ring.*timeout|GPU reset|job_timedout)|i915.*GPU HANG|\bxe\b.*GPU HANG' | tail -n 1 || true)"
+    fi
+
+    if [[ -n "$prev_gpu_pcie_crash" ]]; then
+        local prev_gpu_class=""
+        prev_gpu_class="$(_classify_gpu_pcie_fault "$prev_gpu_pcie_crash")"
+        add_row "Previous session shutdown" "WARN ⚠ (previous boot GPU/PCIe crash: ${prev_gpu_class})"
+        ((WARNINGS++))
+        log "HEALTH previous_boot=WARN gpu_crash=YES fault_class=${prev_gpu_class}"
+        {
+            echo "### PREVIOUS BOOT / GPU & PCIE CRASH FORENSICS (-b -1)"
+            echo "Fault class: $prev_gpu_class"
+            echo "Kernel log (-b -1): $prev_gpu_pcie_crash"
+            [[ -n "$kernel_panic" ]] && echo "Kernel crash in previous boot (-1): $kernel_panic"
+            [[ -n "$journal_unclean" ]] && echo "Journald notice: $journal_unclean"
+            [[ -n "$fsck_recovery" ]] && echo "Filesystem recovery on boot: $fsck_recovery"
+            echo ""
+        } >> "$LOG_FILE"
+    elif [[ -n "$journal_unclean" || -n "$fsck_recovery" || -n "$kernel_panic" ]]; then
         add_row "Previous session shutdown" "WARN ⚠ (unclean shutdown / crash detected)"
         ((WARNINGS++))
         log "HEALTH previous_boot=WARN unclean=YES"
@@ -4938,8 +4993,8 @@ boot_sync_cat() {
         return 0
     fi
 
-    if command -v sudo >/dev/null 2>&1; then
-        sudo -n cat -- "$path" 2>/dev/null
+    if _sudo_nonint_available; then
+        sudo -n cat -- "$path" </dev/null 2>/dev/null
         return
     fi
 
@@ -5209,24 +5264,27 @@ _boot_sync_audit() {
     mapfile -t refind_configs < <(boot_sync_collect_paths refind)
     mapfile -t refind_dirs < <(boot_sync_collect_paths refind-dir)
 
+    local have_sudo_nonint=false
+    _sudo_nonint_available && have_sudo_nonint=true
+
     for dir in "${loader_dirs[@]}"; do
         local -a find_cmd=(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.conf")
-        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        if $have_sudo_nonint; then
             find_cmd=(sudo -n "${find_cmd[@]}")
         fi
         while IFS= read -r f; do
             [[ -n "$f" ]] && loader_files+=("$f")
-        done < <("${find_cmd[@]}" 2>/dev/null || true)
+        done < <("${find_cmd[@]}" </dev/null 2>/dev/null || true)
     done
 
     for dir in "${uki_dirs[@]}"; do
         local -a find_cmd=(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name "*.efi")
-        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        if $have_sudo_nonint; then
             find_cmd=(sudo -n "${find_cmd[@]}")
         fi
         while IFS= read -r f; do
             [[ -n "$f" ]] && uki_files+=("$f")
-        done < <("${find_cmd[@]}" 2>/dev/null || true)
+        done < <("${find_cmd[@]}" </dev/null 2>/dev/null || true)
     done
 
     if boot_sync_systemd_boot_active; then
@@ -5276,6 +5334,7 @@ _boot_sync_audit() {
             done
 
             if (( ! readable )); then
+                _record_root_skipped_check "bootloader_sync"
                 boot_sync_report "grub" "INFO" "grub.cfg permissions 0600; run with sudo to audit boot entries" "$emit_row"
                 return 0
             fi
@@ -5296,8 +5355,8 @@ _boot_sync_audit() {
             bootctl_list=""
             if command -v bootctl >/dev/null 2>&1; then
                 bootctl_list=$(bootctl --no-pager list 2>/dev/null || :)
-                if [[ -z "$bootctl_list" ]] && (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                    bootctl_list=$(sudo -n bootctl --no-pager list 2>/dev/null || :)
+                if [[ -z "$bootctl_list" ]] && $have_sudo_nonint; then
+                    bootctl_list=$(sudo -n bootctl --no-pager list </dev/null 2>/dev/null || :)
                 fi
             fi
 
@@ -5336,6 +5395,7 @@ _boot_sync_audit() {
             done
 
             if (( ! readable )) && [[ -z "$bootctl_list" ]] && (( ${#uki_files[@]} == 0 )); then
+                _record_root_skipped_check "bootloader_sync"
                 boot_sync_report "systemd-boot" "INFO" "loader entries are not readable; run with sudo to audit boot entries" "$emit_row"
                 return 0
             fi
@@ -5357,6 +5417,7 @@ _boot_sync_audit() {
             done
 
             if (( ! readable )); then
+                _record_root_skipped_check "bootloader_sync"
                 boot_sync_report "limine" "INFO" "limine configuration not readable; run with sudo to audit entries" "$emit_row"
                 return 0
             fi
@@ -5551,7 +5612,152 @@ check_cpu_microcode() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Sol v2.45 | PATCH-037 | Fixtures: test-suite.sh Part 5]
+_query_alpm_nv_pkgs() {
+    local root="${1:-}"
+    local re_nv='^(nvidia|nvidia-lts|nvidia-dkms|nvidia-open|nvidia-open-lts|nvidia-open-dkms|nvidia-[0-9]+xx|nvidia-[0-9]+xx-dkms|nvidia-[0-9]+xx-lts|nvidia-utils|nvidia-[0-9]+xx-utils)$'
+    if [[ -n "$root" ]]; then
+        [[ -d "${root}/var/lib/pacman/local" ]] || return 0
+        local d="" base="" no_rel="" pkg_ver="" pkg_name=""
+        for d in "${root}/var/lib/pacman/local"/*; do
+            [[ -d "$d" ]] || continue
+            base="${d##*/}"
+            no_rel="${base%-*}"
+            pkg_ver="${no_rel##*-}"
+            pkg_name="${no_rel%-*}"
+            pkg_ver="${pkg_ver#*:}"
+            if [[ "$pkg_name" =~ $re_nv ]]; then
+                printf '%s\t%s\n' "$pkg_name" "$pkg_ver"
+            fi
+        done
+    elif command -v pacman &>/dev/null; then
+        local pkg_name="" pkg_ver=""
+        while read -r pkg_name pkg_ver; do
+            [[ -n "$pkg_name" ]] || continue
+            pkg_ver="${pkg_ver#*:}"
+            pkg_ver="${pkg_ver%-*}"
+            if [[ "$pkg_name" =~ $re_nv ]]; then
+                printf '%s\t%s\n' "$pkg_name" "$pkg_ver"
+            fi
+        done < <(LC_ALL=C pacman -Q 2>/dev/null || true)
+    fi
+}
+
+_audit_nvidia_kernel_coverage() {
+    local root="${1:-}"
+    local -a kernel_dirs=()
+    local k_file=""
+    for k_file in "${root}/usr/lib/modules"/*/pkgbase; do
+        [[ -f "$k_file" ]] || continue
+        kernel_dirs+=("$k_file")
+    done
+    (( ${#kernel_dirs[@]} > 0 )) || { printf 'OK|\n'; return 0; }
+
+    local -a mod_pkgs=()
+    local has_legacy=false has_modern_open=false has_modern_closed=false
+    local has_dkms_pkg=false has_prebuilt_pkg=false
+    local pkg_name="" pkg_ver=""
+    local re_legacy='^nvidia-[0-9]+xx(-dkms|-lts)?$'
+    local re_open='^nvidia-open(-lts|-dkms)?$'
+    local re_closed='^nvidia(-lts|-dkms)?$'
+
+    while IFS=$'\t' read -r pkg_name pkg_ver; do
+        [[ -n "$pkg_name" ]] || continue
+        if [[ "$pkg_name" =~ $re_legacy ]]; then
+            mod_pkgs+=("$pkg_name")
+            has_legacy=true
+            if [[ "$pkg_name" == *-dkms ]]; then
+                has_dkms_pkg=true
+            else
+                has_prebuilt_pkg=true
+            fi
+        elif [[ "$pkg_name" =~ $re_open ]]; then
+            mod_pkgs+=("$pkg_name")
+            has_modern_open=true
+            if [[ "$pkg_name" == *-dkms ]]; then
+                has_dkms_pkg=true
+            else
+                has_prebuilt_pkg=true
+            fi
+        elif [[ "$pkg_name" =~ $re_closed ]]; then
+            mod_pkgs+=("$pkg_name")
+            has_modern_closed=true
+            if [[ "$pkg_name" == *-dkms ]]; then
+                has_dkms_pkg=true
+            else
+                has_prebuilt_pkg=true
+            fi
+        fi
+    done < <(_query_alpm_nv_pkgs "$root")
+
+    if { $has_legacy && { $has_modern_open || $has_modern_closed; }; } || \
+       { $has_modern_open && $has_modern_closed; } || \
+       { $has_dkms_pkg && $has_prebuilt_pkg; }; then
+        printf 'CONFLICT|conflicting NVIDIA driver packages installed (%s) — unify on a single DKMS or prebuilt branch\n' "${mod_pkgs[*]}"
+        return 0
+    fi
+
+    local any_ko_found=false
+    local -a missing_kernels=()
+    for k_file in "${kernel_dirs[@]}"; do
+        local mod_tree="${k_file%/pkgbase}"
+        local k_ver="${mod_tree##*/}"
+        local pkgb=""
+        pkgb="$(< "$k_file")"
+        pkgb="${pkgb//[[:space:]]/}"
+        [[ -z "$pkgb" ]] && pkgb="linux"
+        local found_ko=""
+        found_ko="$(find -L "$mod_tree" -maxdepth 4 -name 'nvidia.ko*' -print -quit 2>/dev/null || true)"
+        if [[ -n "$found_ko" ]]; then
+            any_ko_found=true
+        else
+            missing_kernels+=("${pkgb}:${k_ver}")
+        fi
+    done
+
+    if (( ${#mod_pkgs[@]} == 0 )) && ! $any_ko_found; then
+        printf 'OK|\n'
+        return 0
+    fi
+
+    if (( ${#missing_kernels[@]} > 0 )); then
+        local hint=""
+        if $has_legacy; then
+            hint="missing nvidia.ko* for ${missing_kernels[*]} — ensure <kernel>-headers are installed and run sudo dkms autoinstall"
+        elif $has_dkms_pkg; then
+            hint="missing nvidia.ko* for ${missing_kernels[*]} — install matching <kernel>-headers and rebuild DKMS"
+        else
+            hint="missing nvidia.ko* for ${missing_kernels[*]} — switch to unified nvidia-open-dkms (or nvidia-dkms) + kernel headers, or install matching kernel module package"
+        fi
+        printf 'MISSING_MODULES|%s\n' "$hint"
+        return 0
+    fi
+
+    printf 'OK|\n'
+}
+
+_check_nvidia_abi_mismatch() {
+    local root="${1:-}"
+    local proc_file="${root}/proc/driver/nvidia/version"
+    [[ -r "$proc_file" ]] || { printf 'OK|\n'; return 0; }
+    local nv_proc_ver=""
+    nv_proc_ver="$(grep -m1 '^NVRM version:' "$proc_file" 2>/dev/null | grep -oE '(^|[[:space:]])[0-9]{3,}\.[0-9]+(\.[0-9]+)*([[:space:]]|$)' | head -n 1 | tr -d '[:space:]' || true)"
+    [[ -n "$nv_proc_ver" ]] || { printf 'OK|\n'; return 0; }
+    local nv_utils_ver=""
+    local pkg_name="" pkg_ver=""
+    while IFS=$'\t' read -r pkg_name pkg_ver; do
+        if [[ "$pkg_name" =~ ^nvidia(-[0-9]+xx)?-utils$ ]]; then
+            nv_utils_ver="$pkg_ver"
+            break
+        fi
+    done < <(_query_alpm_nv_pkgs "$root")
+    if [[ -n "$nv_utils_ver" && "$nv_proc_ver" != "$nv_utils_ver" ]]; then
+        printf 'MISMATCH|%s|%s\n' "$nv_proc_ver" "$nv_utils_ver"
+    else
+        printf 'OK|%s\n' "$nv_proc_ver"
+    fi
+}
+
+# [SRE-AUDIT: CERTIFIED | Neon v2.64 | PATCH-037/PATCH-066/PATCH-067 | Fixtures: test-suite.sh Part 5]
 check_gpu() {
     local lspci_out
     lspci_out="$(lspci -k 2>/dev/null || true)"
@@ -5596,6 +5802,7 @@ check_gpu() {
     local has_driver_missing=false
     local missing_model=""
     local has_phantom_driver=false phantom_model=""
+    local has_pcie_degraded=false pcie_degraded_model="" pcie_degraded_desc=""
     local has_nvidia=false primary_model="" primary_driver="" primary_temp=""
     local root="${SYS_HEALTH_ROOT:-}"
 
@@ -5623,6 +5830,57 @@ check_gpu() {
 
         [[ -z "$primary_model" ]] && primary_model="$dev_model"
         [[ -z "$primary_driver" ]] && primary_driver="$dev_driver"
+
+        # PCIe link width & fatal/non-fatal AER audit (sysfs, zero sudo, D3cold-safe, parent-bridge capped)
+        if [[ -n "$pci_slot" ]]; then
+            local pci_dir="${root}/sys/bus/pci/devices/${pci_slot}"
+            local pci_rt_status=""
+            if [[ -r "${pci_dir}/power/runtime_status" ]]; then
+                read -r pci_rt_status < "${pci_dir}/power/runtime_status" 2>/dev/null || true
+            fi
+            local is_display_pci=true
+            if [[ -r "${pci_dir}/class" ]]; then
+                local pci_cls=""
+                read -r pci_cls < "${pci_dir}/class" 2>/dev/null || true
+                [[ "$pci_cls" == 0x03* ]] || is_display_pci=false
+            fi
+            if $is_display_pci && [[ "$pci_rt_status" != "suspended" ]]; then
+                if [[ -r "${pci_dir}/current_link_width" && -r "${pci_dir}/max_link_width" ]]; then
+                    local cur_w="" max_w="" cur_s="" max_s=""
+                    read -r cur_w < "${pci_dir}/current_link_width" 2>/dev/null || true
+                    read -r max_w < "${pci_dir}/max_link_width" 2>/dev/null || true
+                    cur_w="${cur_w//[^0-9]/}"
+                    max_w="${max_w//[^0-9]/}"
+                    [[ -r "${pci_dir}/current_link_speed" ]] && read -r cur_s < "${pci_dir}/current_link_speed" 2>/dev/null || true
+                    [[ -r "${pci_dir}/max_link_speed" ]] && read -r max_s < "${pci_dir}/max_link_speed" 2>/dev/null || true
+                    local effective_max_w="$max_w"
+                    local parent_max_w=""
+                    if [[ -r "${pci_dir}/../max_link_width" ]]; then
+                        read -r parent_max_w < "${pci_dir}/../max_link_width" 2>/dev/null || true
+                        if [[ "$parent_max_w" =~ ^[0-9]+$ ]] && (( parent_max_w > 0 && parent_max_w < 255 && parent_max_w < effective_max_w )); then
+                            effective_max_w="$parent_max_w"
+                        fi
+                    fi
+                    if [[ "$cur_w" =~ ^[0-9]+$ && "$effective_max_w" =~ ^[0-9]+$ ]] && \
+                       (( cur_w > 0 && cur_w < 255 && effective_max_w > 0 && effective_max_w < 255 && cur_w < effective_max_w )); then
+                        has_pcie_degraded=true
+                        pcie_degraded_model="$dev_model"
+                        pcie_degraded_desc="${dev_model}: PCIe link degraded x${cur_w} < x${effective_max_w} (${cur_s:-unknown} / ${max_s:-unknown})"
+                    fi
+                fi
+                local aer_file="" aer_cnt=0
+                for aer_file in "${pci_dir}/aer_dev_fatal" "${pci_dir}/aer_dev_nonfatal"; do
+                    if [[ -r "$aer_file" ]]; then
+                        aer_cnt="$(awk '/^TOTAL_ERR_(FATAL|NONFATAL)[[:space:]]+[0-9]+/ {v=$2} /^[0-9]+$/ {v=$1} END {print v+0}' "$aer_file" 2>/dev/null || echo 0)"
+                        if (( aer_cnt > 0 )); then
+                            has_pcie_degraded=true
+                            pcie_degraded_model="$dev_model"
+                            pcie_degraded_desc="${pcie_degraded_desc:+${pcie_degraded_desc}; }${dev_model}: ${aer_file##*/}=${aer_cnt}"
+                        fi
+                    fi
+                done
+            fi
+        fi
 
         if [[ -z "$dev_driver" ]]; then
             has_driver_missing=true
@@ -5689,7 +5947,35 @@ check_gpu() {
     local combined_desc="${gpu_descs[*]}"
     IFS="$old_ifs"
 
-    if $has_driver_missing; then
+    local has_nvidia_abi_mismatch=false abi_running="" abi_installed=""
+    local abi_res=""
+    abi_res="$(_check_nvidia_abi_mismatch "$root")"
+    if [[ "$abi_res" == MISMATCH\|* ]]; then
+        has_nvidia_abi_mismatch=true
+        local abi_rest="${abi_res#MISMATCH|}"
+        abi_running="${abi_rest%%|*}"
+        abi_installed="${abi_rest#*|}"
+    fi
+
+    local has_nvidia_cov_gap=false nv_cov_detail=""
+    if $has_nvidia || $has_driver_missing || [[ -n "$abi_running" ]] || [[ "$combined_desc" == *"NVIDIA"* ]]; then
+        local cov_res=""
+        cov_res="$(_audit_nvidia_kernel_coverage "$root")"
+        if [[ "$cov_res" == CONFLICT\|* || "$cov_res" == MISSING_MODULES\|* ]]; then
+            has_nvidia_cov_gap=true
+            nv_cov_detail="${cov_res#*|}"
+        fi
+    fi
+
+    if $has_nvidia_abi_mismatch; then
+        add_row "GPU runtime (NVIDIA)" "WARN ⚠ (ABI mismatch: loaded ${abi_running} != installed ${abi_installed} — reboot required)" "HW"
+        ((WARNINGS++))
+        log "HEALTH gpu=WARN nvidia_abi_mismatch running='${abi_running}' installed='${abi_installed}' details='$combined_desc'"
+    elif $has_nvidia_cov_gap; then
+        add_row "GPU runtime (NVIDIA)" "WARN ⚠ ($nv_cov_detail)" "HW"
+        ((WARNINGS++))
+        log "HEALTH gpu=WARN nvidia_kernel_coverage detail='${nv_cov_detail}' details='$combined_desc'"
+    elif $has_driver_missing; then
         add_row "GPU runtime" "WARN ⚠ (No kernel driver in use for $missing_model)" "HW"
         ((WARNINGS++))
         log "HEALTH gpu=WARN no_kernel_driver model='$missing_model'"
@@ -5701,6 +5987,10 @@ check_gpu() {
         add_row "GPU runtime" "WARN ⚠ (Software rendering fallback active: $sw_renderer)" "HW"
         ((WARNINGS++))
         log "HEALTH gpu=WARN software_rendering renderer='$sw_renderer' details='$combined_desc'"
+    elif $has_pcie_degraded; then
+        add_row "GPU runtime" "WARN ⚠ ($pcie_degraded_desc)" "HW"
+        ((WARNINGS++))
+        log "HEALTH gpu=WARN pcie_degraded model='$pcie_degraded_model' detail='$pcie_degraded_desc' details='$combined_desc'"
     elif $has_nvidia; then
         add_row "GPU runtime (NVIDIA)" "PASS ✔ ($combined_desc)" "HW"
         log "HEALTH gpu=NVIDIA driver=nvidia model='$primary_model' temp='${primary_temp:-suspended}' details='$combined_desc'"
@@ -5710,7 +6000,7 @@ check_gpu() {
     fi
 }
 
-# [SRE-AUDIT: CERTIFIED | Argon v2.58 | PATCH-049 | Fixtures: test-suite.sh Part 5]
+# [SRE-AUDIT: CERTIFIED | Neon v2.64 | PATCH-049/PATCH-066 | Fixtures: test-suite.sh Part 5]
 check_gpu_errors() {
     local root="${SYS_HEALTH_ROOT:-}"
     local vga_info drivers_in_use
@@ -5733,6 +6023,7 @@ check_gpu_errors() {
 
     local -a detected_errors=()
     local -a detected_notes=()
+    local fault_class=""
 
     local klog=""
     klog="$(journalctl -b 0 -k --no-pager 2>/dev/null || dmesg 2>/dev/null || true)"
@@ -5827,10 +6118,16 @@ check_gpu_errors() {
 
     # --- NVIDIA Diagnostics ---
     if [[ "$drivers_in_use" == *"nvidia"* ]]; then
-        local nv_xid
-        nv_xid="$(printf '%s\n' "$klog" | grep -im 1 "NVRM: Xid" || true)"
+        local nv_xid=""
+        nv_xid="$(printf '%s\n' "$klog" | grep -iE 'NVRM: Xid:?[[:space:]]*(\([^)]+\):?)?[[:space:]]*(48|61|62|79)([^0-9]|$)|GPU has fallen off the bus' | head -n 1 || true)"
+        if [[ -z "$nv_xid" ]]; then
+            nv_xid="$(printf '%s\n' "$klog" | grep -im 1 "NVRM: Xid" || true)"
+        fi
         if [[ -n "$nv_xid" ]]; then
             detected_errors+=("NVIDIA Xid error in kernel log: $nv_xid")
+            local xid_cls=""
+            xid_cls="$(_classify_gpu_pcie_fault "$nv_xid")"
+            [[ "$xid_cls" == "bus_drop_hw" ]] && fault_class="bus_drop_hw"
         fi
 
         local nv_drm_err
@@ -5894,12 +6191,20 @@ check_gpu_errors() {
         fi
     fi
 
+    # --- PCIe AER Uncorrected / Fatal Diagnostics ---
+    local pcie_aer_err=""
+    pcie_aer_err="$(printf '%s\n' "$klog" | grep -iE 'pcieport.*AER.*(Uncorrected|Fatal)' | head -n 1 || true)"
+    if [[ -n "$pcie_aer_err" ]]; then
+        detected_errors+=("PCIe AER uncorrected/fatal error in kernel log: $pcie_aer_err")
+        [[ -z "$fault_class" ]] && fault_class="pcie_aer"
+    fi
+
     # --- Status Evaluation ---
     local log_out="${LOG_FILE:-/tmp/sys-health.log}"
     if (( ${#detected_errors[@]} > 0 )); then
         add_row "GPU errors & lockups" "WARN ⚠ (${detected_errors[0]})" "HW"
         ((WARNINGS++)) || true
-        log "HEALTH gpu_errors=WARN count=${#detected_errors[@]}"
+        log "HEALTH gpu_errors=WARN count=${#detected_errors[@]}${fault_class:+ fault_class=$fault_class}"
         {
             echo "### GPU HARDWARE / DRIVER ERRORS"
             for err in "${detected_errors[@]}"; do
@@ -6106,11 +6411,14 @@ check_smart() {
         return
     fi
 
+    local have_sudo_nonint=false
+    _sudo_nonint_available && have_sudo_nonint=true
+
     local failed=0 passed=0 no_perm=0 unsupported=0 total="${#disks[@]}"
     for dev in "${disks[@]}"; do
         local result
-        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            result="$(sudo -n smartctl -n standby -H "$dev" 2>&1 || true)"
+        if (( EUID != 0 )) && $have_sudo_nonint; then
+            result="$(sudo -n smartctl -n standby -H "$dev" </dev/null 2>&1 || true)"
         else
             result="$(smartctl -n standby -H "$dev" 2>&1 || true)"
         fi
@@ -6138,11 +6446,13 @@ check_smart() {
         ((INFO_COUNT++))
         log "HEALTH smart=INFO reason=unsupported_storage"
     elif (( no_perm > 0 && passed == 0 )); then
+        _record_root_skipped_check "smart"
         add_row "SMART disk health" "INFO ℹ (root required)" "HW"
         ((INFO_COUNT++))
         log "HEALTH smart=INFO root_required"
     elif (( passed < smart_capable )); then
         local unverified=$(( smart_capable - passed ))
+        (( no_perm > 0 )) && _record_root_skipped_check "smart"
         add_row "SMART disk health" "WARN ⚠ ($passed/$smart_capable OK; $unverified unverified/standby)" "HW"
         ((WARNINGS++))
         log "HEALTH smart=WARN passed=$passed capable=$smart_capable total=$total"
@@ -7538,7 +7848,7 @@ check_pacman_lock() {
     fi
 
     if pgrep -x "pacman|yay|paru|pikaur|makepkg|pamac-daemon|packagekitd|eos-update" &>/dev/null || \
-       sudo -n fuser "$lock_file" &>/dev/null 2>&1 || \
+       { _sudo_nonint_available && sudo -n fuser "$lock_file" </dev/null &>/dev/null 2>&1; } || \
        fuser "$lock_file" &>/dev/null 2>&1 || \
        lsof "$lock_file" &>/dev/null 2>&1; then
         add_row "Pacman DB lock" "INFO ℹ (package manager is active)" "SYS"
@@ -7566,8 +7876,21 @@ check_package_integrity() {
     fi
 
     local integrity_file="$RUN_RAW/pacman-integrity.txt"
-    spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
-        bash -c 'LC_ALL=C sudo -n pacman -Qk > "$1" 2>&1 || LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    local have_root_access=false
+    if (( EUID == 0 )) || _sudo_nonint_available; then
+        have_root_access=true
+    fi
+
+    if (( EUID == 0 )); then
+        spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
+            bash -c 'LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    elif $have_root_access; then
+        spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
+            bash -c 'LC_ALL=C sudo -n env LC_ALL=C pacman -Qk </dev/null > "$1" 2>&1 || LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    else
+        spinner "Checking package file integrity (filtering ephemeral tmpfs)..." \
+            bash -c 'LC_ALL=C pacman -Qk > "$1" 2>&1 || true' _ "$integrity_file"
+    fi
     PACMAN_INTEGRITY_TEXT="$(cat "$integrity_file" 2>/dev/null || true)"
 
     # Identify candidate packages reporting missing files (matches singular '1 missing file' and plural 'N missing files')
@@ -7584,7 +7907,7 @@ check_package_integrity() {
             missing_crit="$(pacman -Ql "$pkg" 2>/dev/null | while read -r _ f; do
                 if [[ ! -e "$f" && ! -L "$f" && ! "$f" =~ ^/(var|run|tmp|dev|proc|sys)/ ]]; then
                     # Double-check elevated existence if unprivileged to avoid false alarms on restricted directories
-                    if [[ "$EUID" -ne 0 ]] && { sudo -n test -e "$f" 2>/dev/null || sudo -n test -L "$f" 2>/dev/null; }; then
+                    if $have_root_access && [[ "$EUID" -ne 0 ]] && { sudo -n test -e "$f" </dev/null 2>/dev/null || sudo -n test -L "$f" </dev/null 2>/dev/null; }; then
                         continue
                     fi
                     local pdir
@@ -7603,9 +7926,21 @@ check_package_integrity() {
         done
     fi
 
+    local perm_denied_count
+    perm_denied_count="$(awk '/Permission denied/ {c++} END {print c+0}' "$integrity_file" 2>/dev/null || echo 0)"
+    if ! $have_root_access && (( perm_denied_count > 0 )); then
+        _record_root_skipped_check "package_integrity"
+    fi
+
     if (( ${#real_problems[@]} == 0 )); then
-        add_row "Package file integrity" "PASS ✔" "SYS"
-        log "HEALTH package_integrity=PASS"
+        if ! $have_root_access && (( perm_denied_count > 0 )); then
+            add_row "Package file integrity" "INFO ℹ (partial: $perm_denied_count restricted path(s) skipped; root required)" "SYS"
+            ((INFO_COUNT++)) || true
+            log "HEALTH package_integrity=INFO partial_root_required skipped_paths=$perm_denied_count"
+        else
+            add_row "Package file integrity" "PASS ✔" "SYS"
+            log "HEALTH package_integrity=PASS"
+        fi
     else
         local prob_str="${real_problems[*]}"
         add_row "Package file integrity" "WARN ⚠ (Corrupt: ${real_problems[0]})" "SYS"
@@ -9239,6 +9574,7 @@ run_gaming_check() {
     ERRORS=0
     WARNINGS=0
     INFO_COUNT=0
+    ROOT_SKIPPED_CHECKS=()
 
     check_gaming 1
 
@@ -9306,11 +9642,27 @@ generate_summary_json() {
         fi
     fi
 
+    local root_skipped_json="[]" audit_complete_json="true"
+    if (( ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
+        audit_complete_json="false"
+        if command -v jq &>/dev/null; then
+            root_skipped_json="$(printf '%s\n' "${ROOT_SKIPPED_CHECKS[@]}" | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+        else
+            local rs_item rs_joined=""
+            for rs_item in "${ROOT_SKIPPED_CHECKS[@]}"; do
+                rs_joined="${rs_joined:+$rs_joined, }\"${rs_item}\""
+            done
+            root_skipped_json="[${rs_joined}]"
+        fi
+    fi
+
     local status_str="ALL_CLEAR"
     if (( ERRORS > 0 )); then
         status_str="ACTION_REQUIRED"
     elif (( WARNINGS > 0 )); then
         status_str="REVIEW_WARNINGS"
+    elif (( ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
+        status_str="PARTIAL_AUDIT"
     fi
 
     local warn_list_json="[]"
@@ -9364,6 +9716,21 @@ generate_summary_json() {
                         summary="Spurious power-on detected shortly after clean ACPI S5 power off"
                         fix="Enable ErP in UEFI BIOS, disable Windows Fast Startup (powercfg /h off), or audit /proc/acpi/wakeup"
                         risk="MEDIUM"
+                    elif [[ "$rest" =~ fault_class=bus_drop_hw ]]; then
+                        code="GPU_BUS_DROP_HW_SUSPECT"
+                        summary="Previous boot logged critical GPU bus drop or hardware Xid fault (Xid 79/48/61/62)"
+                        fix="Inspect GPU PCIe power cables and PSU rails, reseat GPU in PCIe slot, update UEFI/BIOS, and test under another OS to rule out hardware failure"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ fault_class=pcie_aer ]]; then
+                        code="PCIE_AER_ERROR"
+                        summary="Previous boot logged uncorrected PCIe Advanced Error Reporting (AER) fault"
+                        fix="Inspect PCIe slot seating, PSU cables, UEFI/BIOS updates, and check motherboard/riser stability"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ gpu_crash=YES ]]; then
+                        code="PREV_BOOT_GPU_FAULT"
+                        summary="Previous boot logged GPU driver crash or ring timeout before restart"
+                        fix="Inspect previous boot kernel/compositor logs (journalctl -b -1 -k) and verify GPU driver/kernel compatibility"
+                        risk="HIGH"
                     else
                         code="SYS_UNCLEAN_SHUTDOWN"
                         summary="Previous session crashed or was uncleanly stopped"
@@ -9378,7 +9745,17 @@ generate_summary_json() {
                     risk="HIGH"
                     ;;
                 gpu|gpu_errors)
-                    if [[ "$rest" =~ phantom_driver ]]; then
+                    if [[ "$rest" =~ nvidia_abi_mismatch ]]; then
+                        code="NVIDIA_ABI_MISMATCH_REBOOT_REQUIRED"
+                        summary="Loaded NVIDIA kernel module version does not match installed nvidia-utils libraries"
+                        fix="Reboot workstation to load the updated NVIDIA kernel module and resolve ABI mismatch"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ nvidia_kernel_coverage ]]; then
+                        code="NVIDIA_MULTI_KERNEL_COVERAGE_GAP"
+                        summary="Missing NVIDIA kernel module for one or more installed kernels or conflicting driver packages"
+                        fix="Install matching kernel module/headers or unify on a single DKMS branch (e.g. nvidia-open-dkms or nvidia-580xx-dkms + linux*-headers)"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ phantom_driver ]]; then
                         code="GPU_PHANTOM_DRIVER"
                         summary="GPU driver bound in PCI, but KMS/NVML is unresponsive"
                         fix="Review dmesg for DRM init failure (e.g. NvKmsKapiDevice), verify kernel/driver version match, and reinstall GPU drivers"
@@ -9388,6 +9765,21 @@ generate_summary_json() {
                         summary="Desktop session running on CPU software rasterizer (llvmpipe/swrast)"
                         fix="Check GPU driver stack, Vulkan ICD loader, and display server hardware acceleration"
                         risk="MEDIUM"
+                    elif [[ "$rest" =~ pcie_degraded ]]; then
+                        code="PCIE_LINK_DEGRADED"
+                        summary="Discrete GPU PCIe link width is degraded or reporting fatal/non-fatal AER errors"
+                        fix="Reseat GPU in primary PCIe x16 slot, check PSU power connectors, remove unstable risers, and inspect UEFI/BIOS PCIe settings"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ fault_class=bus_drop_hw ]]; then
+                        code="GPU_BUS_DROP_HW_SUSPECT"
+                        summary="Critical NVIDIA hardware/bus-drop Xid error (Xid 79/48/61/62) detected in kernel log"
+                        fix="Inspect GPU PCIe power cables and PSU rails, reseat GPU in PCIe slot, update UEFI/BIOS, and test under another OS to rule out hardware failure"
+                        risk="HIGH"
+                    elif [[ "$rest" =~ fault_class=pcie_aer ]]; then
+                        code="PCIE_AER_ERROR"
+                        summary="Uncorrected PCIe Advanced Error Reporting (AER) error detected in kernel log"
+                        fix="Inspect PCIe slot seating, PSU cables, UEFI/BIOS updates, and check motherboard/riser stability"
+                        risk="HIGH"
                     else
                         code="GPU_DRIVER_OR_LOG_STALL"
                         summary="GPU driver missing or hardware/driver lockup in logs"
@@ -9880,12 +10272,16 @@ generate_summary_json() {
             --argjson keep_gaming "$keep_gaming" \
             --argjson keep_audit_counts "$keep_audit_counts" \
             --argjson mirror_partial_ran "$mirror_partial_ran" \
+            --argjson audit_complete "$audit_complete_json" \
+            --argjson root_skipped "$root_skipped_json" \
             '. as $prev |
             (if ($keep_audit_counts and ($prev | type) == "object") then
                 (if ($prev.flagged? | type) == "array" then $prev.flagged else [] end) as $pf |
                 (if ($prev.actionable_remediations? | type) == "array" then $prev.actionable_remediations else [] end) as $pr |
                 (if ($prev.counts.errors? | type) == "number" then $prev.counts.errors else 0 end) as $pe |
                 (if ($prev.counts.warnings? | type) == "number" then $prev.counts.warnings else 0 end) as $pw |
+                (if ($prev | has("audit_complete")) and ($prev.audit_complete | type) == "boolean" then $prev.audit_complete else true end) as $p_comp |
+                (if ($prev | has("root_skipped_checks")) and ($prev.root_skipped_checks | type) == "array" then $prev.root_skipped_checks else [] end) as $p_skip |
                 (($pf | index("mirrorlist_age")) != null) as $had_m |
                 (if $mirror_partial_ran then
                     (if $m_status == "WARN" then
@@ -9900,7 +10296,9 @@ generate_summary_json() {
                         }]) as $nr |
                         (if $had_m then $pw else ($pw + 1) end) as $nw |
                         {
-                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" else "ALL_CLEAR" end),
+                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" elif ($p_comp == false) then "PARTIAL_AUDIT" else "ALL_CLEAR" end),
+                            audit_complete: $p_comp,
+                            root_skipped_checks: $p_skip,
                             counts: {errors: $pe, warnings: $nw},
                             flagged: $nf,
                             actionable_remediations: $nr
@@ -9910,7 +10308,9 @@ generate_summary_json() {
                         ([ $pr[] | select(.check != "mirrorlist_age") ]) as $nr |
                         (if $had_m then (if $pw > 0 then ($pw - 1) else 0 end) else $pw end) as $nw |
                         {
-                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" else "ALL_CLEAR" end),
+                            status: (if $pe > 0 then "ACTION_REQUIRED" elif $nw > 0 then "REVIEW_WARNINGS" elif ($p_comp == false) then "PARTIAL_AUDIT" else "ALL_CLEAR" end),
+                            audit_complete: $p_comp,
+                            root_skipped_checks: $p_skip,
                             counts: {errors: $pe, warnings: $nw},
                             flagged: $nf,
                             actionable_remediations: $nr
@@ -9919,6 +10319,8 @@ generate_summary_json() {
                 else
                     {
                         status: (if ($prev.status? | type) == "string" then $prev.status else $status end),
+                        audit_complete: $p_comp,
+                        root_skipped_checks: $p_skip,
                         counts: {errors: $pe, warnings: $pw},
                         flagged: $pf,
                         actionable_remediations: $pr
@@ -9927,6 +10329,8 @@ generate_summary_json() {
             else
                 {
                     status: $status,
+                    audit_complete: $audit_complete,
+                    root_skipped_checks: $root_skipped,
                     counts: {errors: $errors, warnings: $warnings},
                     flagged: $flagged,
                     actionable_remediations: $remediations
@@ -9937,6 +10341,8 @@ generate_summary_json() {
                 timestamp: $ts,
                 run_id: $run_id,
                 status: $top_state.status,
+                audit_complete: $top_state.audit_complete,
+                root_skipped_checks: $top_state.root_skipped_checks,
                 counts: $top_state.counts,
                 flagged: $top_state.flagged,
                 actionable_remediations: $top_state.actionable_remediations,
@@ -10023,8 +10429,8 @@ generate_summary_json() {
     else
         if [[ "${AUDIT_FULL_RAN:-false}" == "true" || ! -s "$SUMMARY_FILE" ]]; then
             local tmp_summary="${SUMMARY_FILE}.tmp.$$"
-            if printf '{"status": "%s", "errors": %d, "warnings": %d, "firmware": {"available": %s, "updates_count": %d}, "security": {"high_risk_count": %d}, "firewall": {"active": %s, "backend": "%s"}}\n' \
-                "$status_str" "${ERRORS:-0}" "${WARNINGS:-0}" "${FIRMWARE_AVAILABLE:-false}" "${FIRMWARE_UPDATES_COUNT:-0}" \
+            if printf '{"status": "%s", "audit_complete": %s, "root_skipped_checks": %s, "errors": %d, "warnings": %d, "firmware": {"available": %s, "updates_count": %d}, "security": {"high_risk_count": %d}, "firewall": {"active": %s, "backend": "%s"}}\n' \
+                "$status_str" "$audit_complete_json" "$root_skipped_json" "${ERRORS:-0}" "${WARNINGS:-0}" "${FIRMWARE_AVAILABLE:-false}" "${FIRMWARE_UPDATES_COUNT:-0}" \
                 "${ARCH_AUDIT_HIGH_RISK_COUNT:-0}" "${FIREWALL_ACTIVE:-false}" "${FIREWALL_BACKEND:-none}" > "$tmp_summary" 2>/dev/null && [[ -s "$tmp_summary" ]]; then
                 mv -f "$tmp_summary" "$SUMMARY_FILE" 2>/dev/null || true
             else
@@ -10052,6 +10458,7 @@ run_health_check() {
     ERRORS=0
     WARNINGS=0
     INFO_COUNT=0
+    ROOT_SKIPPED_CHECKS=()
 
     collect_system_snapshot
 
@@ -10110,9 +10517,17 @@ run_health_check() {
         render_audit_section "OTHER CHECKS" "$AUDIT_TABLE_OTHER"
     fi
 
+    local skipped_csv=""
+    if (( ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
+        local rs_tmp=""
+        for rs_tmp in "${ROOT_SKIPPED_CHECKS[@]}"; do
+            skipped_csv="${skipped_csv:+$skipped_csv, }$rs_tmp"
+        done
+    fi
+
     log ""
     log "### END OF REPORT"
-    log "Summary: errors=$ERRORS warnings=$WARNINGS info=$INFO_COUNT"
+    log "Summary: errors=$ERRORS warnings=$WARNINGS info=$INFO_COUNT${skipped_csv:+ root_skipped=$skipped_csv}"
 
     refresh_state_snapshot 1
     generate_summary_json
@@ -10120,7 +10535,14 @@ run_health_check() {
 
     echo ""
     if [[ -t 1 ]] && command -v gum &>/dev/null; then
-        if (( ERRORS == 0 && WARNINGS == 0 )); then
+        if (( ERRORS == 0 && WARNINGS == 0 && ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
+            gum style \
+                --foreground 214 \
+                --border double \
+                --align center \
+                --width "$UI_CARD_WIDTH" \
+                "SYS HEALTH: PARTIAL AUDIT (ROOT REQUIRED) ⚠"
+        elif (( ERRORS == 0 && WARNINGS == 0 )); then
             gum style \
                 --foreground 82 \
                 --border double \
@@ -10144,15 +10566,24 @@ run_health_check() {
         fi
 
         echo ""
+        if [[ -n "$skipped_csv" ]]; then
+            gum style --foreground 214 \
+                "Skipped (root required): $skipped_csv — run with sudo for full audit"
+        fi
         gum style --foreground 244 \
             "Report: $LOG_FILE"
     else
-        if (( ERRORS == 0 && WARNINGS == 0 )); then
+        if (( ERRORS == 0 && WARNINGS == 0 && ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
+            echo "SYS HEALTH: PARTIAL AUDIT (ROOT REQUIRED) ⚠"
+        elif (( ERRORS == 0 && WARNINGS == 0 )); then
             echo "SYS HEALTH: ALL CLEAR ✔"
         elif (( ERRORS == 0 )); then
             echo "SYS HEALTH: REVIEW WARNINGS ⚠"
         else
             echo "SYS HEALTH: ACTION REQUIRED ✖"
+        fi
+        if [[ -n "$skipped_csv" ]]; then
+            echo "Skipped (root required): $skipped_csv — run with sudo for full audit"
         fi
         echo "Report: $LOG_FILE"
     fi
@@ -13385,6 +13816,26 @@ run_guarded_upgrade() {
         fi
     fi
 
+    # 1b. Multi-kernel NVIDIA module coverage, conflict, and ABI guard (PATCH-067)
+    local gate5_nv_cov=""
+    gate5_nv_cov="$(_audit_nvidia_kernel_coverage "")"
+    case "$gate5_nv_cov" in
+        CONFLICT\|*)
+            fail "Pre-Flight Gate 5: ${gate5_nv_cov#CONFLICT|}"
+            preflight_passed=false
+            ;;
+        MISSING_MODULES\|*)
+            warn "Pre-Flight Gate 5: ${gate5_nv_cov#MISSING_MODULES|}"
+            ;;
+    esac
+
+    local gate5_abi=""
+    gate5_abi="$(_check_nvidia_abi_mismatch "")"
+    if [[ "$gate5_abi" == MISMATCH\|* ]]; then
+        local g5_rest="${gate5_abi#MISMATCH|}"
+        warn "Pre-Flight Gate 5: NVIDIA kernel/userspace ABI mismatch (loaded ${g5_rest%%|*} != installed ${g5_rest#*|}) — reboot recommended."
+    fi
+
     # 2. Kernel headers invariant for every installed kernel (if DKMS is in use)
     local dkms_active=false
     if command -v dkms &>/dev/null; then
@@ -14174,7 +14625,7 @@ if [[ "$ACTION" == "audit" ]]; then
     run_health_check
     if (( ERRORS > 0 )); then
         exit 1
-    elif (( WARNINGS > 0 )); then
+    elif (( WARNINGS > 0 || ${#ROOT_SKIPPED_CHECKS[@]} > 0 )); then
         exit 2
     else
         exit 0
